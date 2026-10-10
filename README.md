@@ -50,7 +50,7 @@ zones in Grading, channels in Curves, aspect ratios in Crop) or apply quick pres
 ## Put it on your phone
 
 1. In this repo on GitHub, open **Settings → Pages** and set **Source** to **GitHub Actions**.
-2. Merge to `main`. The `Deploy to GitHub Pages` workflow builds it and publishes it at
+2. Re-run the `Deploy to GitHub Pages` workflow (Actions tab), or push to the default branch. It publishes at
    `https://<your-user>.github.io/<repo>/`.
 3. Open that link on your phone.
    - iPhone (Safari): Share → **Add to Home Screen**.

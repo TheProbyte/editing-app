@@ -6,7 +6,7 @@ import {
 import { makeSpline } from '../curves';
 import { LOOKS, Look } from '../presets';
 import { loadFile, RAW_EXT } from '../io/loader';
-import { CANVAS_LIMIT, renderExport, saveOrShare } from '../io/export';
+import { CANVAS_LIMIT, framed, renderExport, saveOrShare } from '../io/export';
 import { TOOLS, ToolDef, ICONS, Chip } from './tools';
 import { CurveEditor } from './curveEditor';
 import { CropOverlay, fitAspect } from './cropOverlay';
@@ -1108,8 +1108,8 @@ export class App {
           this.refreshPanel();
           this.toast('Edits pasted');
         } else if (a === 'savePreset') {
-          const name = prompt('Name this look', 'My look');
-          if (!name) return;
+          const n = this.userLooks().length + 1;
+          const name = prompt('Name this look', `My look ${n}`) || `My look ${n}`;
           const d = defaultValues();
           const v: Record<string, number> = {};
           for (const [k, x] of Object.entries(this.state.v)) {
@@ -1241,7 +1241,7 @@ export class App {
     $('exHint').textContent = isPng && d.k < 1 && this.exportOpts.size === 'full'
       ? 'PNG is limited to ~16 MP on phones; use JPEG for full resolution.'
       : `${((d.w * d.h) / 1e6).toFixed(1)} MP · all edits applied at full quality`;
-    ($('exGo') as HTMLButtonElement).textContent = /iPhone|iPad|Android/i.test(navigator.userAgent) ? 'Save / Share' : 'Download';
+    ($('exGo') as HTMLButtonElement).textContent = framed ? 'Export' : /iPhone|iPad|Android/i.test(navigator.userAgent) ? 'Save / Share' : 'Download';
   }
 
   private async doExport() {
@@ -1278,7 +1278,8 @@ export class App {
       const base = img.name.replace(/\.[^.]+$/, '');
       const name = `${base}-lumen.${this.exportOpts.format === 'png' ? 'png' : 'jpg'}`;
       const how = await saveOrShare(blob, name);
-      this.toast(how === 'shared' ? 'Shared' : `Saved ${name} (${(blob.size / 1e6).toFixed(1)} MB)`);
+      if (how === 'shown') this.showResult(blob);
+      else this.toast(how === 'shared' ? 'Shared' : `Saved ${name} (${(blob.size / 1e6).toFixed(1)} MB)`);
     } catch (e) {
       if ((e as Error).name !== 'AbortError') {
         console.error(e);
@@ -1290,6 +1291,17 @@ export class App {
       this.pipe.invalidate();
       this.requestRender();
     }
+  }
+
+  private resultUrl = '';
+  /** Show the export so it can be saved with a long-press (when downloads are blocked). */
+  private showResult(blob: Blob) {
+    if (this.resultUrl) URL.revokeObjectURL(this.resultUrl);
+    this.resultUrl = URL.createObjectURL(blob);
+    $<HTMLImageElement>('resultImg').src = this.resultUrl;
+    const sheet = $('resultSheet');
+    sheet.classList.add('on');
+    $('resultDone').onclick = () => sheet.classList.remove('on');
   }
 
   // -----------------------------------------------------------------------------------

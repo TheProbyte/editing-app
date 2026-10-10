@@ -5,7 +5,7 @@ import { App } from './ui/app';
 // can't send the required headers, so the service worker adds them; the first visit
 // reloads once after the worker takes control.
 async function ensureServiceWorker() {
-  if (!('serviceWorker' in navigator) || !import.meta.env.PROD) return;
+  if (!('serviceWorker' in navigator) || !import.meta.env.PROD || window.top !== window) return;
   try {
     const reg = await navigator.serviceWorker.register('./sw.js');
     if (!self.crossOriginIsolated) {

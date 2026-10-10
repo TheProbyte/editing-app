@@ -58,7 +58,17 @@ async function viaStream(o: ExportOptions): Promise<Blob> {
   }
 }
 
-export async function saveOrShare(blob: Blob, name: string): Promise<'shared' | 'downloaded'> {
+/** Embedded in a frame (e.g. a hosted preview) downloads and the share sheet are blocked. */
+export const framed = (() => {
+  try {
+    return window.top !== window;
+  } catch {
+    return true;
+  }
+})();
+
+export async function saveOrShare(blob: Blob, name: string): Promise<'shared' | 'downloaded' | 'shown'> {
+  if (framed) return 'shown';
   const file = new File([blob], name, { type: blob.type });
   const nav = navigator as Navigator & { canShare?: (d: ShareData) => boolean };
   if (nav.canShare && nav.canShare({ files: [file] }) && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {

@@ -218,3 +218,5 @@ input[type=range] { width: 100%; accent-color: var(--accent); }
 @media (min-width: 900px) {
   #panel, #tools { padding-left: max(12px, calc(50% - 400px)); padding-right: max(12px, calc(50% - 400px)); }
 }
+
+#resultImg { display: block; width: 100%; max-height: 62vh; object-fit: contain; border-radius: 12px; margin-top: 12px; background: #000; -webkit-touch-callout: default; user-select: auto; -webkit-user-select: auto; }

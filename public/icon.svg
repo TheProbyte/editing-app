@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b1712"/>
+      <stop offset="1" stop-color="#050505"/>
+    </linearGradient>
+    <radialGradient id="sun" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff4cf"/>
+      <stop offset="0.45" stop-color="#ffc94a"/>
+      <stop offset="0.8" stop-color="#ff6a2b"/>
+      <stop offset="1" stop-color="#ff3d1f" stop-opacity="0"/>
+    </radialGradient>
+    <radialGradient id="halo" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0.55" stop-color="#ff4a1f" stop-opacity="0.45"/>
+      <stop offset="1" stop-color="#ff4a1f" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#bg)"/>
+  <circle cx="256" cy="256" r="200" fill="url(#halo)"/>
+  <circle cx="256" cy="256" r="132" fill="url(#sun)"/>
+  <g fill="none" stroke="#fff" stroke-opacity="0.9" stroke-width="14" stroke-linecap="round">
+    <path d="M256 168 A88 88 0 0 1 332 212"/>
+    <path d="M344 256 A88 88 0 0 1 300 332"/>
+    <path d="M256 344 A88 88 0 0 1 180 300"/>
+    <path d="M168 256 A88 88 0 0 1 212 180"/>
+  </g>
+</svg>

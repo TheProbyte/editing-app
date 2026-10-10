@@ -1,0 +1,20 @@
+{
+  "name": "lumen-photo-editor",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "copy-libraw": "node scripts/copy-libraw.mjs",
+    "dev": "npm run copy-libraw && vite --host",
+    "build": "npm run copy-libraw && tsc --noEmit && vite build",
+    "preview": "vite preview --host",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "libraw-wasm": "1.6.0"
+  },
+  "devDependencies": {
+    "typescript": "5.6.3",
+    "vite": "5.4.11"
+  }
+}

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+    <meta name="theme-color" content="#0a0a0b" />
+    <meta name="mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-capable" content="yes" />
+    <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+    <meta name="apple-mobile-web-app-title" content="Lumen" />
+    <meta name="description" content="Pro photo editor for your phone — RAW, film grain, halation, curves, grading and more." />
+    <link rel="manifest" href="manifest.webmanifest" />
+    <link rel="icon" href="icon.svg" type="image/svg+xml" />
+    <link rel="apple-touch-icon" href="icon-180.png" />
+    <title>Lumen</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="top">
+        <button class="ic" id="btnOpen" aria-label="Open photo"></button>
+        <div class="title" id="title">Lumen</div>
+        <button class="ic" id="btnUndo" aria-label="Undo"></button>
+        <button class="ic" id="btnRedo" aria-label="Redo"></button>
+        <button class="ic" id="btnCompare" aria-label="Hold to compare"></button>
+        <button class="ic" id="btnHist" aria-label="Histogram"></button>
+        <button class="ic" id="btnMore" aria-label="More"></button>
+        <button class="primary" id="btnExport">Export</button>
+      </header>
+
+      <main id="stage">
+        <div id="frame" class="empty">
+          <canvas id="view"></canvas>
+          <div id="cropLayer"></div>
+        </div>
+        <canvas id="hist"></canvas>
+        <div id="hud"><span class="name"></span><span class="val"></span><div class="bar"><i></i></div></div>
+        <div id="menu"></div>
+        <div id="curveWrap"></div>
+        <div id="empty">
+          <img class="logo" src="icon.svg" alt="" />
+          <h1>Lumen</h1>
+          <p>Edit RAW and phone photos with film grain, halation, curves, color grading and more.</p>
+          <button class="primary big" id="btnOpenBig">Open a photo</button>
+          <ul class="tips">
+            <li><b>Swipe ↕</b> on the photo to pick an adjustment</li>
+            <li><b>Swipe ↔</b> to change it</li>
+            <li><b>Double-tap</b> to reset it · <b>press & hold</b> to compare</li>
+            <li><b>Pinch</b> to zoom</li>
+          </ul>
+        </div>
+        <div id="badge"></div>
+        <div id="toast"></div>
+      </main>
+
+      <section id="panel">
+        <div id="chips" class="row"></div>
+        <div id="looks" class="row"></div>
+        <div id="paramBar">
+          <button id="paramName"><span></span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 10l5-5 5 5M7 14l5 5 5-5"/></svg></button>
+          <div id="track"><div class="zero"></div><div class="fill"></div><div class="knob"></div></div>
+          <span id="paramValue"></span>
+        </div>
+      </section>
+      <nav id="tools"></nav>
+    </div>
+
+    <div id="busy"><div class="spin"></div><div class="msg"></div></div>
+
+    <div id="sheet" class="sheet">
+      <div class="sheet-card">
+        <h2>Export</h2>
+        <div class="opt-label">Size</div>
+        <div class="seg" id="exSize"></div>
+        <div class="opt-label">Format</div>
+        <div class="seg" id="exFormat">
+          <button data-v="jpeg" class="on">JPEG</button>
+          <button data-v="png">PNG</button>
+        </div>
+        <div class="opt-label" id="exQLabel">Quality <span id="exQVal">92</span></div>
+        <input type="range" id="exQuality" min="60" max="100" value="92" />
+        <p class="hint" id="exHint"></p>
+        <div class="sheet-actions">
+          <button id="exCancel">Cancel</button>
+          <button class="primary" id="exGo">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="moreSheet" class="sheet">
+      <div class="sheet-card list">
+        <button data-a="open">Open another photo</button>
+        <button data-a="copy">Copy edits</button>
+        <button data-a="paste">Paste edits</button>
+        <button data-a="savePreset">Save edits as a Look</button>
+        <button data-a="resetAll" class="danger">Reset all edits</button>
+        <button data-a="close">Close</button>
+      </div>
+    </div>
+
+    <input type="file" id="file" hidden />
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

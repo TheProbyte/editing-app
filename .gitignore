@@ -1,0 +1,5 @@
+node_modules
+dist
+public/libraw
+*.log
+.DS_Store

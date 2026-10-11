@@ -3,12 +3,12 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
-    <meta name="theme-color" content="#0a0a0b" />
+    <meta name="theme-color" content="#050607" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="Lumen" />
-    <meta name="description" content="Pro photo editor for your phone — RAW, film grain, halation, curves, grading and more." />
+    <meta name="description" content="Pro photo editor for your phone — RAW, masks, film grain, halation, curves, grading and more." />
     <link rel="manifest" href="manifest.webmanifest" />
     <link rel="icon" href="icon.svg" type="image/svg+xml" />
     <link rel="apple-touch-icon" href="icon-180.png" />
@@ -16,9 +16,38 @@
   </head>
   <body>
     <div id="app">
-      <header class="top">
+      <main id="stage">
+        <div id="frame" class="empty">
+          <canvas id="view"></canvas>
+          <div id="cropLayer"></div>
+          <div id="maskLayer"></div>
+        </div>
+        <div id="brushRing"></div>
+        <canvas id="hist" class="glass"></canvas>
+        <div id="hud" class="glass"><span class="name"></span><span class="val"></span><div class="bar"><i></i></div></div>
+        <div id="menu" class="glass"><div class="sel-bar"></div><div class="items"></div></div>
+        <div id="curveWrap"></div>
+        <button id="zoomBadge" class="glass"></button>
+        <div id="badge" class="glass"></div>
+        <div id="toast" class="glass"></div>
+
+        <section id="empty">
+          <img class="logo" src="icon.svg" alt="" />
+          <h1>Lumen</h1>
+          <p>RAW and phone photos. Masks, film grain, halation, curves and color — all on your phone.</p>
+          <button class="primary big" id="btnOpenBig">Open a photo</button>
+          <button class="ghost big" id="btnResume" hidden>Continue editing</button>
+          <ul class="tips">
+            <li><b>Swipe ↕</b> to pick an adjustment</li>
+            <li><b>Swipe ↔</b> to change it</li>
+            <li><b>Double‑tap</b> resets · <b>hold</b> compares · <b>pinch</b> zooms</li>
+          </ul>
+        </section>
+      </main>
+
+      <header class="top glass">
         <button class="ic" id="btnOpen" aria-label="Open photo"></button>
-        <div class="title" id="title">Lumen</div>
+        <div class="title" id="title"></div>
         <button class="ic" id="btnUndo" aria-label="Undo"></button>
         <button class="ic" id="btnRedo" aria-label="Redo"></button>
         <button class="ic" id="btnCompare" aria-label="Hold to compare"></button>
@@ -27,47 +56,29 @@
         <button class="primary" id="btnExport">Export</button>
       </header>
 
-      <main id="stage">
-        <div id="frame" class="empty">
-          <canvas id="view"></canvas>
-          <div id="cropLayer"></div>
-        </div>
-        <canvas id="hist"></canvas>
-        <div id="hud"><span class="name"></span><span class="val"></span><div class="bar"><i></i></div></div>
-        <div id="menu"></div>
-        <div id="curveWrap"></div>
-        <div id="empty">
-          <img class="logo" src="icon.svg" alt="" />
-          <h1>Lumen</h1>
-          <p>Edit RAW and phone photos with film grain, halation, curves, color grading and more.</p>
-          <button class="primary big" id="btnOpenBig">Open a photo</button>
-          <ul class="tips">
-            <li><b>Swipe ↕</b> on the photo to pick an adjustment</li>
-            <li><b>Swipe ↔</b> to change it</li>
-            <li><b>Double-tap</b> to reset it · <b>press & hold</b> to compare</li>
-            <li><b>Pinch</b> to zoom</li>
-          </ul>
-        </div>
-        <div id="badge"></div>
-        <div id="toast"></div>
-      </main>
-
-      <section id="panel">
-        <div id="chips" class="row"></div>
-        <div id="looks" class="row"></div>
-        <div id="paramBar">
-          <button id="paramName"><span></span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 10l5-5 5 5M7 14l5 5 5-5"/></svg></button>
-          <div id="track"><div class="zero"></div><div class="fill"></div><div class="knob"></div></div>
-          <span id="paramValue"></span>
-        </div>
-      </section>
-      <nav id="tools"></nav>
+      <footer id="bottom" class="glass">
+        <section id="panel">
+          <div id="panelBody">
+            <div id="chips" class="row"></div>
+            <div id="chips2" class="row"></div>
+            <div id="looks" class="row"></div>
+            <div id="hint"></div>
+            <div id="paramBar">
+              <button id="paramName"><span></span><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2"><path d="M7 10l5-5 5 5M7 14l5 5 5-5"/></svg></button>
+              <div id="track"><div class="zero"></div><div class="fill"></div><div class="knob"></div></div>
+              <button id="paramValue" aria-label="Type a value"></button>
+              <input id="paramInput" type="text" inputmode="decimal" hidden />
+            </div>
+          </div>
+        </section>
+        <nav id="tools"><div id="toolInd"></div></nav>
+      </footer>
     </div>
 
     <div id="busy"><div class="spin"></div><div class="msg"></div></div>
 
     <div id="sheet" class="sheet">
-      <div class="sheet-card">
+      <div class="sheet-card glass">
         <h2>Export</h2>
         <div class="opt-label">Size</div>
         <div class="seg" id="exSize"></div>
@@ -87,8 +98,9 @@
     </div>
 
     <div id="moreSheet" class="sheet">
-      <div class="sheet-card list">
+      <div class="sheet-card glass list">
         <button data-a="open">Open another photo</button>
+        <button data-a="clip">Show clipping <span class="state" id="clipState">Off</span></button>
         <button data-a="copy">Copy edits</button>
         <button data-a="paste">Paste edits</button>
         <button data-a="savePreset">Save edits as a Look</button>
@@ -98,7 +110,7 @@
     </div>
 
     <div id="resultSheet" class="sheet">
-      <div class="sheet-card">
+      <div class="sheet-card glass">
         <h2>Your photo is ready</h2>
         <p class="hint" id="resultHint">Press and hold the photo, then choose Save to Photos (or Save Image).</p>
         <img id="resultImg" alt="Edited photo" />

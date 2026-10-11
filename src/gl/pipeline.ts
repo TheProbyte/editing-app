@@ -1,7 +1,7 @@
 import { GL, Program, Target } from './glutil';
 import { BLUR, BRIGHT, DEVELOP, DOWNSAMPLE, FINISH, GEOMETRY } from './shaders';
 import { buildCurveLut, isIdentity, LUT_SIZE } from '../curves';
-import { EditState, GRADE_ZONES, HSL_BANDS, Geometry } from '../params';
+import { EditState, GRADE_ZONES, HSL_BANDS, Geometry, MAX_MASKS } from '../params';
 
 export interface Source {
   tex: WebGLTexture;
@@ -58,6 +58,12 @@ export class Pipeline {
   private smallCache = new Map<string, Target>();
   private smallCacheKey = '';
   private black: WebGLTexture;
+  /** Brush mask atlas (two RGBA textures = 8 channels), owned by the app. */
+  brushTex: [WebGLTexture, WebGLTexture] | null = null;
+  /** Index of the mask to tint on screen, or -1. */
+  showMask = -1;
+  /** Highlight clipped highlights/shadows on screen. */
+  clip = false;
 
   constructor(g: GL) {
     this.g = g;
@@ -247,17 +253,13 @@ export class Pipeline {
 
   private developPass(
     A: Target, state: EditState, glb: Globals, full: { w: number; h: number }, tile: Tile,
-    small: ReturnType<Pipeline['smallBlurs']>, dst: Target, rawBase: boolean,
+    small: ReturnType<Pipeline['smallBlurs']>, dst: Target, rawBase: boolean, frameAspect: number, onScreen = false,
   ) {
     const gl = this.g.gl;
     const v = state.v;
     this.updateLut(state);
-    const t = v.temp / 100;
-    const m = v.tint / 100;
-    let wb = [2 ** (t * 0.55 + m * 0.3), 2 ** (-m * 0.35), 2 ** (-t * 0.55 + m * 0.3)];
-    const l = 0.2126 * wb[0] + 0.7152 * wb[1] + 0.0722 * wb[2];
     const ex = 2 ** v.exposure;
-    wb = wb.map((x) => (x / l) * ex);
+    const wb = wbMul(v.temp / 100, v.tint / 100).map((x) => x * ex);
 
     const hslH = HSL_BANDS.map((b) => v[`hsl_${b}_h`] / 100);
     const hslS = HSL_BANDS.map((b) => v[`hsl_${b}_s`] / 100);
@@ -313,6 +315,7 @@ export class Pipeline {
       u1('uFadeWarm', v.fadeWarmth / 100);
       u1('uDiffuse', v.diffuse / 100);
       u1('uRawBase', rawBase ? 1 : 0);
+      this.maskUniforms(p, state, frameAspect, onScreen);
     });
   }
 
@@ -383,7 +386,48 @@ export class Pipeline {
       u1('uGrainSh', v.grainShadows / 100);
       u1('uGrainHi', v.grainHighlights / 100);
       u1('uSeed', 1337);
+      u1('uClip', flipY && this.clip ? 1 : 0);
     });
+  }
+
+  private maskUniforms(p: Program, state: EditState, frameAspect: number, onScreen: boolean) {
+    const gl = this.g.gl;
+    const masks = (state.masks ?? []).slice(0, MAX_MASKS);
+    const n = masks.length;
+    const types = new Int32Array(8);
+    const G0 = new Float32Array(32), G1 = new Float32Array(32), G2 = new Float32Array(32);
+    const A0 = new Float32Array(32), A1 = new Float32Array(32), A2 = new Float32Array(32);
+    masks.forEach((m, i) => {
+      const g = m.g, a = m.a, o = i * 4;
+      types[i] = { radial: 1, linear: 2, brush: 3, luma: 4, color: 5 }[m.type];
+      if (m.type === 'radial') G0.set([g.cx, g.cy, g.rx, g.ry], o);
+      else if (m.type === 'linear') G0.set([g.x0, g.y0, g.x1, g.y1], o);
+      else if (m.type === 'brush') G0.set([i, 0, 0, 0], o);
+      else if (m.type === 'luma') {
+        const lo = g.lo / 100, hi = g.hi / 100, soft = 0.01 + (g.soft / 100) * 0.35;
+        G0.set([Math.min(lo, hi), Math.max(lo, hi), soft, 0], o);
+      } else if (m.type === 'color') G0.set([g.hue / 360, g.range / 360, 0, 0], o);
+      G1.set([g.angle ?? 0, (g.feather ?? 60) / 100, (g.smart ?? 0) / 100, m.invert ? 1 : 0], o);
+      G2.set([g.sr ?? 0.5, g.sg ?? 0.5, g.sb ?? 0.5, (g.amount ?? 100) / 100], o);
+      A0.set([a.exposure / 1, a.contrast / 100, a.highlights / 100, a.shadows / 100], o);
+      const wb = wbMul(a.temp / 100, a.tint / 100).map((x) => Math.pow(x, 1 / 2.2));
+      A1.set([wb[0], wb[1], wb[2], a.saturation / 100], o);
+      A2.set([a.clarity / 100, a.dehaze / 100, 0, 0], o);
+    });
+    gl.uniform1i(p.loc('uMaskCount'), n);
+    gl.uniform1iv(p.loc('uMType'), types);
+    gl.uniform4fv(p.loc('uMG0'), G0);
+    gl.uniform4fv(p.loc('uMG1'), G1);
+    gl.uniform4fv(p.loc('uMG2'), G2);
+    gl.uniform4fv(p.loc('uMA0'), A0);
+    gl.uniform4fv(p.loc('uMA1'), A1);
+    gl.uniform4fv(p.loc('uMA2'), A2);
+    this.g.bindTex(p, 'uBrush0', this.brushTex?.[0] ?? this.black);
+    this.g.bindTex(p, 'uBrush1', this.brushTex?.[1] ?? this.black);
+    const c = state.geo.crop;
+    gl.uniform4f(p.loc('uCrop'), c.x, c.y, c.w, c.h);
+    gl.uniform1f(p.loc('uFrameAspect'), frameAspect);
+    gl.uniform1i(p.loc('uShowMask'), onScreen && this.showMask < n ? this.showMask : -1);
   }
 
   // ---------------------------------------------------------------------------------
@@ -399,7 +443,7 @@ export class Pipeline {
     const tile = { x: 0, y: 0, w, h };
     const small = this.smallBlurs(glb.A, state, Math.min(w, h), cache ? glb.key : null);
     const B = this.g.acquire(w, h);
-    this.developPass(glb.A, state, glb, full, tile, small, B, src.linear);
+    this.developPass(glb.A, state, glb, full, tile, small, B, src.linear, aspectOf(src, state), dst === null);
     const fx = this.effects(B, state);
     this.finishPass(B, [0, 0, 1, 1], state, full, tile, fx, dst, dst === null);
     this.g.release(B);
@@ -453,7 +497,7 @@ export class Pipeline {
     const glb = this.ensureGlobals(analysisSrc, state, aw, ah, false);
     const smallG = this.smallBlurs(glb.A, state, Math.min(aw, ah), null);
     const Bg = g.acquire(aw, ah);
-    this.developPass(glb.A, state, glb, { w: aw, h: ah }, { x: 0, y: 0, w: aw, h: ah }, smallG, Bg, full.linear);
+    this.developPass(glb.A, state, glb, { w: aw, h: ah }, { x: 0, y: 0, w: aw, h: ah }, smallG, Bg, full.linear, aspectOf(full, state));
     const fx = this.effects(Bg, state);
     g.release(Bg);
     g.release(smallG.sharp.t);
@@ -480,7 +524,7 @@ export class Pipeline {
         this.geometryPass(full, state, fullSize, ptile, A);
         const small = this.smallBlurs(A, state, S, null);
         const B = g.acquire(pw, ph);
-        this.developPass(A, state, glb, fullSize, ptile, small, B, full.linear);
+        this.developPass(A, state, glb, fullSize, ptile, small, B, full.linear, aspectOf(full, state));
         g.release(A);
         g.release(small.sharp.t);
         g.release(small.noise.t);
@@ -502,6 +546,18 @@ export class Pipeline {
     this.releaseGlobals(glb);
     g.trim(2048 * 2048);
   }
+}
+
+/** Luminance-neutral white balance multipliers for temperature/tint in -1..1. */
+export function wbMul(t: number, m: number) {
+  const wb = [2 ** (t * 0.55 + m * 0.3), 2 ** (-m * 0.35), 2 ** (-t * 0.55 + m * 0.3)];
+  const l = 0.2126 * wb[0] + 0.7152 * wb[1] + 0.0722 * wb[2];
+  return wb.map((x) => x / l);
+}
+
+function aspectOf(src: { w: number; h: number }, state: EditState) {
+  const f = frameSize(state.geo, src.w, src.h);
+  return f.w / f.h;
 }
 
 /** A zero-luminance color offset for the given hue, used by color grading. */

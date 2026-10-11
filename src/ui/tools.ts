@@ -10,7 +10,7 @@ export interface ToolDef {
   id: string;
   label: string;
   icon: string;
-  kind: 'params' | 'looks' | 'curves' | 'crop';
+  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks';
   subs?: Chip[];
   params: (sub: string) => string[];
   actions?: Chip[];
@@ -33,6 +33,9 @@ export const ICONS = {
   glow: svg('<path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8z"/><path d="M19 16l.8 2.2L22 19l-2.2.8L19 22l-.8-2.2L16 19l2.2-.8z"/>'),
   vignette: svg('<rect x="3" y="4" width="18" height="16" rx="2"/><ellipse cx="12" cy="12" rx="5.5" ry="4.5"/>'),
   film: svg('<rect x="4" y="3" width="16" height="18" rx="1.5"/><path d="M8 3v18M16 3v18M4 7h4M4 11h4M4 15h4M16 7h4M16 11h4M16 15h4"/>'),
+  masks: svg('<circle cx="10" cy="10" r="6.5" stroke-dasharray="3 2.4"/><path d="M14 20l6.5-6.5a1.8 1.8 0 0 0-2.5-2.5L11.5 17.5 11 20.5z"/>'),
+  reset: svg('<path d="M4 12a8 8 0 1 0 2.4-5.7"/><path d="M4 4v4h4"/>'),
+  eye: svg('<path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="2.8"/>'),
   crop: svg('<path d="M6 2v14a2 2 0 0 0 2 2h14"/><path d="M18 22V8a2 2 0 0 0-2-2H2"/>'),
   open: svg('<rect x="3" y="4" width="18" height="16" rx="2"/><circle cx="9" cy="10" r="2"/><path d="M21 16l-5-5-9 9"/>'),
   undo: svg('<path d="M9 14L4 9l5-5"/><path d="M4 9h10a6 6 0 0 1 0 12h-3"/>'),
@@ -57,6 +60,7 @@ export const TOOLS: ToolDef[] = [
     params: list('temp', 'tint', 'vibrance', 'saturation'),
     actions: [{ id: 'autowb', label: '✦ Auto WB' }],
   },
+  { id: 'masks', label: 'Masks', icon: ICONS.masks, kind: 'masks', params: () => [] },
   {
     id: 'detail', label: 'Detail', icon: ICONS.detail, kind: 'params',
     params: list('sharpen', 'sharpenRadius', 'sharpenMask', 'texture', 'clarity', 'dehaze', 'denoise', 'colorDenoise'),

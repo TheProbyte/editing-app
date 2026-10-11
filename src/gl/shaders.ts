@@ -156,6 +156,20 @@ uniform float uCgBlend, uCgBalance;
 uniform float uFade, uFadeWarm, uDiffuse;
 uniform float uRawBase;
 
+// masks (local adjustments)
+uniform int uMaskCount;
+uniform int uMType[8];
+uniform vec4 uMG0[8];   // shape: radial cx,cy,rx,ry | linear x0,y0,x1,y1 | luma lo,hi,soft | color hue,range | brush slot
+uniform vec4 uMG1[8];   // radial angle, feather, smart, - | all: .w = invert
+uniform vec4 uMG2[8];   // smart reference color (perceptual) rgb, amount
+uniform vec4 uMA0[8];   // exposure, contrast, highlights, shadows
+uniform vec4 uMA1[8];   // white balance multiplier rgb (perceptual), saturation
+uniform vec4 uMA2[8];   // clarity, dehaze
+uniform sampler2D uBrush0, uBrush1;
+uniform vec4 uCrop;      // crop rect in frame coords
+uniform float uFrameAspect;
+uniform int uShowMask;
+
 const float CENTERS[9] = float[9](0.0, 30.0, 60.0, 120.0, 180.0, 225.0, 270.0, 315.0, 360.0);
 
 void bandWeights(float hueDeg, out float w[8]) {
@@ -179,6 +193,44 @@ vec3 contrastCurve(vec3 x, float k) {
   return mix(r, x, step(1.0, x)); // leave out-of-range highlights alone
 }
 
+float maskWeight(int i, vec2 f, vec3 p0) {
+  int t = uMType[i];
+  vec4 g0 = uMG0[i], g1 = uMG1[i];
+  float w = 0.0;
+  if (t == 1) {
+    vec2 d = (f - g0.xy) * vec2(uFrameAspect, 1.0);
+    float c = cos(-g1.x), s = sin(-g1.x);
+    d = mat2(c, s, -s, c) * d;
+    float e = length(d / max(g0.zw, vec2(1e-4)));
+    w = 1.0 - smoothstep(1.0 - max(g1.y, 0.01), 1.0, e);
+    if (g1.z > 0.0) {
+      float sig = mix(0.5, 0.05, g1.z);
+      vec3 dc = p0 - uMG2[i].rgb;
+      w *= exp(-dot(dc, dc) / (2.0 * sig * sig));
+    }
+  } else if (t == 2) {
+    vec2 asp = vec2(uFrameAspect, 1.0);
+    vec2 dir = (g0.zw - g0.xy) * asp;
+    float tt = dot((f - g0.xy) * asp, dir) / max(dot(dir, dir), 1e-6);
+    w = 1.0 - smoothstep(0.0, 1.0, tt);
+  } else if (t == 3) {
+    int slot = int(g0.x + 0.5);
+    vec4 m = slot < 4 ? texture(uBrush0, f) : texture(uBrush1, f);
+    int ch = slot - (slot < 4 ? 0 : 4);
+    w = ch == 0 ? m.r : ch == 1 ? m.g : ch == 2 ? m.b : m.a;
+  } else if (t == 4) {
+    float y = clamp(luma(p0), 0.0, 1.0);
+    w = smoothstep(g0.x - g0.z, g0.x + 0.001, y) * (1.0 - smoothstep(g0.y - 0.001, g0.y + g0.z, y));
+  } else if (t == 5) {
+    vec3 hsv = rgb2hsv(clamp(p0, 0.0, 1.0));
+    float dh = abs(hsv.x - g0.x);
+    dh = min(dh, 1.0 - dh);
+    w = (1.0 - smoothstep(g0.y * 0.55, g0.y, dh)) * smoothstep(0.06, 0.25, hsv.y) * smoothstep(0.02, 0.1, hsv.z);
+  }
+  if (g1.w > 0.5) w = 1.0 - w;
+  return clamp(w, 0.0, 1.0) * uMG2[i].a;
+}
+
 void main() {
   vec2 gUv = (uTile.xy + vUv * uTile.zw) / uFull;
   vec3 lin = texture(uA, vUv).rgb * uWB;
@@ -190,6 +242,7 @@ void main() {
     p = max(yb + (p - yb) * 1.08, 0.0);
   }
   float y0 = luma(p);
+  vec3 p0 = p; // reference color for masks (before any tonal edits)
 
   vec3 pTex = toPerc(texture(uTexB, gUv).rgb * uWB);
   float yTex = luma(pTex);
@@ -282,6 +335,41 @@ void main() {
   p += dSharp * uSharpen * 1.6 * sharpM;
   p = max(p, 0.0);
 
+  // --- masks (local adjustments) ----------------------------------------------------
+  float overlay = 0.0;
+  if (uMaskCount > 0) {
+    vec2 f = uCrop.xy + gUv * uCrop.zw;
+    for (int i = 0; i < 8; i++) {
+      if (i >= uMaskCount) break;
+      float w = maskWeight(i, f, p0);
+      if (i == uShowMask) overlay = w;
+      if (w < 0.002) continue;
+      vec4 a0 = uMA0[i], a1 = uMA1[i], a2 = uMA2[i];
+      p *= mix(vec3(1.0), a1.rgb, w);
+      if (a0.x != 0.0) p *= exp2(a0.x * w / 2.2);
+      if (a0.y != 0.0) p = mix(p, contrastCurve(p, a0.y * 0.85), w);
+      if (a0.z != 0.0 || a0.w != 0.0) {
+        float yl = luma(p);
+        float mS = pow(1.0 - smoothstep(0.0, 0.55, yl), 2.0);
+        float mH = pow(smoothstep(0.45, 1.0, yl), 1.5);
+        p *= exp2((a0.w * mS * 1.4 + a0.z * mH * (a0.z < 0.0 ? 0.8 : 0.5)) * w);
+      }
+      if (a2.y > 0.0) {
+        float dark = min(pLarge.r, min(pLarge.g, pLarge.b));
+        float t = max(1.0 - a2.y * 0.85 * dark, 0.12);
+        p = mix(p, max(1.0 - (1.0 - p) / t, 0.0), w);
+      } else if (a2.y < 0.0) {
+        p = mix(p, vec3(max(0.75, yLarge)), -a2.y * 0.36 * w);
+      }
+      if (a2.x != 0.0) p += dClar * a2.x * 1.2 * w;
+      if (a1.w != 0.0) {
+        float yb = luma(p);
+        p = yb + (p - yb) * max(0.0, 1.0 + a1.w * w);
+      }
+      p = max(p, 0.0);
+    }
+  }
+
   // --- curves -----------------------------------------------------------------------
   if (uUseLut > 0.5) {
     vec3 c = clamp(p, 0.0, 1.0);
@@ -370,6 +458,7 @@ void main() {
     p = lift * tint + p * (1.0 - lift - uFade * 0.05);
   }
 
+  if (uShowMask >= 0) p = mix(p, vec3(0.15, 0.9, 1.0), overlay * 0.55);
   outColor = vec4(min(toLin(p), vec3(16.0)), 1.0);
 }`;
 
@@ -391,6 +480,7 @@ uniform vec3 uGlowColor;
 uniform float uVig, uVigMid, uVigRound, uVigFeather, uVigHi;
 uniform float uGrain, uGrainCell, uGrainRough, uGrainColor, uGrainSh, uGrainHi;
 uniform float uSeed;
+uniform float uClip;
 
 vec2 gradDir(ivec2 c, uint seed) {
   float a = rnd(c, seed) * 6.2831853;
@@ -484,6 +574,10 @@ void main() {
   }
 
   vec3 outc = linToSrgb(toLin(p));
+  if (uClip > 0.5) {
+    if (min(outc.r, min(outc.g, outc.b)) >= 0.99) outc = vec3(1.0, 0.54, 0.24);
+    else if (max(outc.r, max(outc.g, outc.b)) <= 0.004) outc = vec3(0.24, 0.9, 1.0);
+  }
   float dither = (rnd(ivec2(px), 777u) + rnd(ivec2(px) + 31, 999u) - 1.0) / 255.0;
   outColor = vec4(outc + dither, 1.0);
 }`;

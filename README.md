@@ -7,13 +7,15 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 
 | Gesture | What it does |
 | --- | --- |
-| **Swipe up / down** on the photo | Pick the adjustment (Exposure, Contrast, …) |
+| **Swipe up / down** on the photo | Move through the adjustments (swipe up = next one down the list) |
 | **Swipe left / right** on the photo | Decrease / increase it |
 | **Double-tap** the photo | Reset the current adjustment |
 | **Press & hold** the photo (or the compare button) | Show the original |
 | **Pinch** | Zoom in to check grain and detail |
 | Tap the adjustment name | Pick from a list |
 | Drag the slider | Set a value directly |
+| Tap the value | Type an exact number |
+| Swipe slowly | Finer control |
 
 Tools live in the bar at the bottom; chips above the slider switch sub-sections (colors in HSL,
 zones in Grading, channels in Curves, aspect ratios in Crop) or apply quick presets.
@@ -23,6 +25,11 @@ zones in Grading, channels in Curves, aspect ratios in Crop) or apply quick pres
 - **Formats:** JPEG, HEIC (Safari), PNG, WebP, and **RAW** — DNG, CR2, CR3, NEF, ARW, RAF, ORF,
   RW2, PEF and more, decoded with LibRaw (WebAssembly) in 16-bit linear. If full RAW decoding
   isn't possible on a device, the camera's embedded full-size JPEG is used instead.
+- **Masks & selective edits:** up to 8 per photo — Radial, Gradient, Brush (paint/erase with size,
+  hardness, flow), Selective point (Snapseed-style, follows similar colors), Light range and Color
+  range (tap the photo to pick). Each has Exposure, Contrast, Highlights, Shadows, Temperature,
+  Tint, Saturation, Clarity and Dehaze, plus invert, strength, duplicate and a cyan overlay to see
+  exactly what's selected.
 - **Looks:** 17 film-style presets (Portra, CineStill 800T, Tri-X, Velvia, Chrome, Matte, Teal &
   Orange, …) with a strength slider; save your own edits as a Look.
 - **Light:** Exposure, Contrast, Brightness, Highlights, Shadows, Whites, Blacks, one-tap Auto.
@@ -45,7 +52,8 @@ zones in Grading, channels in Curves, aspect ratios in Crop) or apply quick pres
 - Undo/redo, histogram, copy/paste edits, **full-resolution export** (JPEG/PNG, tiled rendering
   plus a streaming JPEG encoder, so even 40+ MP files export on a phone), Share sheet to save to
   Photos.
-- Works offline once loaded.
+- Works offline once loaded, and autosaves — reopen the app and tap **Continue editing**.
+- Clipping warnings, per-tool Reset, zoom badge (tap to fit).
 
 ## Put it on your phone
 

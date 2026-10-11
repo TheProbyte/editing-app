@@ -55,6 +55,7 @@ svg { display: block; }
 #view.pixelated, #detail { image-rendering: pixelated; }
 #detail { position: absolute; display: none; pointer-events: none; }
 #detail.on { display: block; }
+#gridCanvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
 #pixgrid {
   position: absolute; inset: 0; pointer-events: none; display: none; --line: 1px;
   background-image:
@@ -103,6 +104,9 @@ svg { display: block; }
 /* ---------------------------------------------------------------- frosted fades */
 .ui { transition: opacity 0.24s var(--ease), transform 0.24s var(--ease); }
 #app.ui-off .ui { opacity: 0; pointer-events: none; }
+#app.live .top::before, #app.live #dock::before { -webkit-backdrop-filter: none; backdrop-filter: none; }
+#app.live .top::before { background: linear-gradient(to bottom, rgba(11,10,9,.94), rgba(11,10,9,.6) 60%, rgba(11,10,9,0)); }
+#app.live #dock::before { background: linear-gradient(to top, rgba(11,10,9,.96), rgba(11,10,9,.8) 55%, rgba(11,10,9,0)); }
 #app.ui-off .top { transform: translateY(-14px); }
 #app.ui-off #dock { transform: translateY(18px); }
 
@@ -161,17 +165,17 @@ svg { display: block; }
 
 #menu {
   position: absolute; left: 50%; top: calc(var(--top-h) + (100% - var(--top-h) - var(--bot-h)) / 2); z-index: 6;
-  width: 250px; height: 232px; border-radius: 26px; overflow: hidden;
+  width: 250px; height: 220px; border-radius: 0; overflow: hidden;
   background: rgba(11, 10, 9, 0.74); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
   opacity: 0; pointer-events: none; transform: translate(-50%, -50%) scale(0.97); transition: opacity 0.1s, transform 0.12s var(--ease);
-  -webkit-mask-image: linear-gradient(transparent, #000 22%, #000 78%, transparent); mask-image: linear-gradient(transparent, #000 22%, #000 78%, transparent);
 }
 #menu.on { opacity: 1; transform: translate(-50%, -50%) scale(1); }
-#menu .items { position: relative; padding: 0 6px; transition: transform 0.13s cubic-bezier(0.3, 1.45, 0.5, 1); will-change: transform; }
-#menu .sel-bar { position: absolute; left: 6px; right: 6px; top: 50%; height: 44px; margin-top: -22px; border-radius: 15px; background: var(--tile-hi); }
+#menu .items { position: relative; padding: 0; transition: transform 0.09s cubic-bezier(0.25, 1.3, 0.5, 1); will-change: transform; }
+#menu .sel-bar { position: absolute; left: 0; right: 0; top: 50%; height: 44px; margin-top: -22px; background: var(--tile-hi); box-shadow: inset 3px 0 0 var(--orange); }
 #menu .it { position: relative; display: flex; justify-content: space-between; gap: 22px; padding: 0 14px; height: 44px; align-items: center; width: 100%; text-align: left; color: var(--muted); font-weight: 600; transition: opacity 0.12s; }
 #menu .it .v { font-family: var(--mono); font-size: 13px; color: var(--faint); }
 #menu .it.changed .v { color: var(--orange); }
+#menu .it.maskset span:first-child::before { content: 'MASK · '; font: 8px var(--display); letter-spacing: 0.1em; color: var(--faint); }
 #menu .it.sel { color: var(--ink); }
 #menu .it.bump { animation: bump 0.16s var(--ease); }
 #menu .group { padding: 10px 14px 2px; height: 30px; font: 9px var(--display); letter-spacing: 0.14em; color: var(--faint); text-transform: uppercase; }
@@ -184,11 +188,12 @@ svg { display: block; }
 .curve-editor.removing { opacity: 0.5; }
 
 #zoomBadge {
-  position: absolute; right: 14px; top: calc(var(--top-h) + 6px); z-index: 4; border-radius: 999px; padding: 7px 12px;
-  font: 700 11px var(--mono); background: rgba(11, 10, 9, 0.6); color: var(--ink);
-  opacity: 0; pointer-events: none; transform: scale(0.9); transition: opacity 0.15s, transform 0.15s var(--ease);
+  position: absolute; left: 50%; bottom: calc(var(--bot-h) + 12px); z-index: 6; border-radius: 999px; padding: 7px 14px;
+  font: 700 11px var(--mono); background: rgba(11, 10, 9, 0.66); color: var(--ink);
+  opacity: 0; pointer-events: none; transform: translateX(-50%) scale(0.9); transition: opacity 0.15s, transform 0.15s var(--ease);
 }
-#zoomBadge.on { opacity: 1; pointer-events: auto; transform: scale(1); }
+#zoomBadge.on { opacity: 1; pointer-events: auto; transform: translateX(-50%) scale(1); }
+#app.ui-off #zoomBadge { bottom: calc(var(--safe-b) + 18px); }
 #badge {
   position: absolute; left: 50%; top: calc(var(--top-h) + 8px); transform: translateX(-50%); z-index: 4;
   font: 10px var(--display); letter-spacing: 0.16em; padding: 7px 12px; border-radius: 999px; background: var(--ink); color: var(--bg);
@@ -196,7 +201,7 @@ svg { display: block; }
 }
 #badge.on { opacity: 1; }
 #toast {
-  position: absolute; left: 50%; bottom: calc(var(--bot-h) + 8px); max-width: 86%; z-index: 7;
+  position: absolute; left: 50%; bottom: calc(var(--bot-h) + 56px); max-width: 86%; z-index: 7;
   padding: 10px 16px; border-radius: 16px; font-size: 14px; text-align: center; background: rgba(28, 26, 23, 0.92);
   opacity: 0; transform: translate(-50%, 8px); transition: opacity 0.2s, transform 0.2s var(--ease); pointer-events: none;
 }

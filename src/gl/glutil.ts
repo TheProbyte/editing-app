@@ -63,6 +63,7 @@ export class GL {
       premultipliedAlpha: false,
       preserveDrawingBuffer: false,
       powerPreference: 'high-performance',
+      desynchronized: true, // low-latency canvas on Android Chrome
     }) as WebGL2RenderingContext | null;
     if (!gl) throw new Error('WebGL2 is not available on this device/browser.');
     this.gl = gl;

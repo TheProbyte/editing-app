@@ -354,8 +354,12 @@ export class App {
       this.detailKey = '';
     }
     clearTimeout(this.detailTimer);
-    this.detailTimer = window.setTimeout(() => this.renderDetail(), changed ? 260 : 140);
-    this.updatePixelGrid();
+    // nothing to do at normal zoom — skip the timer entirely
+    if (this.zoom.s <= 1.01 && !det.classList.contains('on')) return;
+    this.detailTimer = window.setTimeout(() => {
+      this.renderDetail();
+      this.updatePixelGrid();
+    }, changed ? 260 : 140);
   }
 
   private renderDetail() {
@@ -396,22 +400,41 @@ export class App {
     }
   }
 
-  /** A faint pixel grid once each pixel is big on screen. */
+  /**
+   * Pixel grid, drawn in screen space from the photo's exact on-screen rectangle so the lines
+   * sit on real pixel edges at any zoom. It follows whatever is shown: the full-res detail
+   * tile when it's up, otherwise the preview's own pixels.
+   */
   private updatePixelGrid() {
-    const grid = $('pixgrid');
-    if (!this.img) return grid.classList.remove('on');
-    const per = this.pxPerOut() * this.zoom.s; // screen px per image pixel
-    const on = per >= 10 && this.kind() !== 'crop';
-    grid.classList.toggle('on', on);
-    this.canvas.classList.toggle('pixelated', per >= 3);
-    if (!on) return;
-    const { w: W } = this.outFull();
-    const fw = parseFloat(this.frame.style.width) || 1;
-    const pitch = fw / W; // frame CSS px per image pixel
-    const line = 1 / (this.view.base * this.zoom.s); // one screen px
-    grid.style.backgroundSize = `${pitch}px ${pitch}px`;
-    grid.style.setProperty('--line', line + 'px');
-    grid.style.opacity = String(Math.min(1, (per - 10) / 10));
+    const gc = $<HTMLCanvasElement>('gridCanvas');
+    const ctx = gc.getContext('2d')!;
+    const dpr = window.devicePixelRatio || 1;
+    const sw = this.stage.clientWidth, sh = this.stage.clientHeight;
+    if (gc.width !== Math.round(sw * dpr) || gc.height !== Math.round(sh * dpr)) {
+      gc.width = Math.round(sw * dpr);
+      gc.height = Math.round(sh * dpr);
+    }
+    ctx.clearRect(0, 0, gc.width, gc.height);
+    if (!this.img || this.kind() === 'crop' || this.compare) return;
+    const fr = this.frame.getBoundingClientRect();
+    const det = $('detail').classList.contains('on');
+    const srcW = det ? this.outFull().w : this.canvas.width;
+    const srcH = det ? this.outFull().h : this.canvas.height;
+    const cell = fr.width / srcW; // CSS px per shown pixel
+    this.canvas.classList.toggle('pixelated', cell >= 3);
+    if (cell < 10) return;
+    const st = this.stage.getBoundingClientRect();
+    const ox = fr.left - st.left, oy = fr.top - st.top;
+    const cellY = fr.height / srcH;
+    ctx.globalAlpha = Math.min(1, (cell - 10) / 10) * 0.32;
+    ctx.fillStyle = '#efe9df';
+    const x0 = Math.max(0, Math.ceil(-ox / cell)), x1 = Math.min(srcW, Math.floor((sw - ox) / cell));
+    const y0 = Math.max(0, Math.ceil(-oy / cellY)), y1 = Math.min(srcH, Math.floor((sh - oy) / cellY));
+    const top = Math.max(0, oy) * dpr, bottom = Math.min(sh, oy + fr.height) * dpr;
+    const left = Math.max(0, ox) * dpr, right = Math.min(sw, ox + fr.width) * dpr;
+    for (let i = x0; i <= x1; i++) ctx.fillRect(Math.round((ox + i * cell) * dpr), top, 1, bottom - top);
+    for (let j = y0; j <= y1; j++) ctx.fillRect(left, Math.round((oy + j * cellY) * dpr), right - left, 1);
+    ctx.globalAlpha = 1;
   }
 
   private scheduleHist() {
@@ -469,6 +492,7 @@ export class App {
       this.animTimer = window.setTimeout(() => {
         this.frame.classList.remove('anim');
         this.redrawOverlays();
+        this.updatePixelGrid();
       }, 280);
     }
     this.frame.style.transform = `translate(${V.cx + z.x}px, ${V.cy + z.y}px) scale(${V.base * z.s}) translate(-50%, -50%)`;
@@ -476,7 +500,10 @@ export class App {
     b.classList.toggle('on', z.s > 1.01);
     if (z.s > 1.01) b.textContent = this.img && this.pxPerOut() * z.s >= 1 ? `${Math.round(this.pxPerOut() * z.s * 100)}%` : Math.round(z.s * 100) + '%';
     this.redrawOverlays();
-    if (this.img) this.scheduleDetail();
+    if (this.img) {
+      this.updatePixelGrid();
+      this.scheduleDetail();
+    }
   }
 
   private redrawOverlays() {
@@ -683,6 +710,7 @@ export class App {
     $('badge').textContent = 'ORIGINAL';
     $('badge').classList.toggle('on', on);
     this.requestRender();
+    this.updatePixelGrid();
   }
 
   private updateChrome() {
@@ -893,16 +921,10 @@ export class App {
     items.innerHTML = '';
     const cur = Math.min(ps.length - 1, this.paramIdx[this.tool.id] ?? 0);
     ps.forEach((id, i) => {
-      if (id.startsWith('mg.') && !ps[i - 1]?.startsWith('mg.')) {
-        const g = document.createElement('div');
-        g.className = 'group';
-        g.textContent = 'Mask';
-        items.appendChild(g);
-      }
       const b = document.createElement('button');
       const d = this.def(id);
       const changed = id !== 'lookAmt' && Math.abs(this.get(id) - d.def) > 1e-6;
-      b.className = 'it' + (i === cur ? ' sel' : '') + (changed ? ' changed' : '');
+      b.className = 'it' + (i === cur ? ' sel' : '') + (changed ? ' changed' : '') + (id.startsWith('mg.') ? ' maskset' : '');
       b.dataset.i = String(i);
       b.innerHTML = `<span>${d.label}</span><span class="v">${this.fmt(id)}</span>`;
       b.onpointerup = (e) => {
@@ -992,7 +1014,7 @@ export class App {
     let curVal = 0, lastX = 0, lastT = 0, lastNotch = 0;
     let pinch0 = { d: 1, mx: 0, my: 0, s: 1, x: 0, y: 0 };
     let pan0 = { x: 0, y: 0 };
-    let wheelPos = 0;
+    let anchorY = 0;
     let holdTimer = 0, tapTimer = 0;
     let lastTap = { t: 0, x: 0, y: 0 };
 
@@ -1078,6 +1100,9 @@ export class App {
     st.addEventListener('pointermove', (e) => {
       if (!pts.has(e.pointerId)) return;
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      // while something is being dragged, the glass bars skip their live blur (it would be
+      // recomputed every frame over the changing photo)
+      if (mode !== 'pending' && mode !== 'none' && mode !== 'compare' && !this.appEl.classList.contains('live')) this.appEl.classList.add('live');
       if (mode === 'pinch' && pts.size >= 2) {
         const [a, b] = [...pts.values()];
         const d = Math.hypot(a.x - b.x, a.y - b.y);
@@ -1140,7 +1165,7 @@ export class App {
           mode = 'menu';
           startIdx = this.paramIdx[this.tool!.id] ?? 0;
           lastStep = startIdx;
-          wheelPos = startIdx;
+          anchorY = e.clientY;
           this.showMenu(true);
         } else mode = 'none';
       }
@@ -1171,13 +1196,21 @@ export class App {
         if (this.kind() === 'blur') this.blurOv.draw();
       } else if (mode === 'menu') {
         const n = this.params().length;
-        // detents: a fixed step with hysteresis, so each row clicks into place;
-        // swiping up moves down the list
-        const step = 24;
-        wheelPos = Math.max(-0.4, Math.min(n - 0.6, startIdx - (e.clientY - sy) / step));
+        // detents: every 30px of travel moves exactly one row (at most one per event),
+        // measured from where the list opened; swiping up moves down the list
+        const STEP = 30;
+        let d = anchorY - e.clientY;
         let i = lastStep;
-        if (wheelPos > lastStep + 0.6) i = Math.min(n - 1, Math.floor(wheelPos + 0.4));
-        else if (wheelPos < lastStep - 0.6) i = Math.max(0, Math.ceil(wheelPos - 0.4));
+        if (d >= STEP && i < n - 1) {
+          i++;
+          anchorY -= STEP;
+        } else if (d <= -STEP && i > 0) {
+          i--;
+          anchorY += STEP;
+        }
+        // at either end, re-anchor so reversing responds straight away
+        d = anchorY - e.clientY;
+        if ((i === n - 1 && d > 0) || (i === 0 && d < 0)) anchorY = e.clientY;
         if (i !== lastStep) {
           lastStep = i;
           tick(true);
@@ -1191,6 +1224,7 @@ export class App {
     const up = (e: PointerEvent) => {
       if (!pts.has(e.pointerId)) return;
       pts.delete(e.pointerId);
+      if (pts.size === 0) this.appEl.classList.remove('live');
       clearTimeout(holdTimer);
       if (mode === 'pinch') {
         if (pts.size === 0) mode = 'none';

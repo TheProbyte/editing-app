@@ -5,16 +5,20 @@ import {
   EditState, PARAM_MAP, ParamDef, CurvePoint, Curves, cloneState, defaultState, defaultValues, LINEAR, plain,
   Mask, MaskType, MASK_ADJ, MASK_SETTINGS, MASK_TYPE_SETTINGS, MASK_LABEL, MAX_MASKS, Stroke,
 } from '../params';
-import { loadSession, saveFile, saveState } from '../io/session';
-import { MaskOverlay } from './maskOverlay';
 import { makeSpline } from '../curves';
 import { LOOKS, Look } from '../presets';
 import { loadFile, RAW_EXT } from '../io/loader';
 import { CANVAS_LIMIT, framed, renderExport, saveOrShare } from '../io/export';
-import { TOOLS, ToolDef, ICONS, Chip } from './tools';
+import { loadSession, saveFile, saveState } from '../io/session';
+import { TOOLS, ToolDef, Chip } from './tools';
+import { ICONS } from './icons';
 import { CurveEditor } from './curveEditor';
 import { CropOverlay, fitAspect } from './cropOverlay';
+import { MaskOverlay } from './maskOverlay';
+import { BlurOverlay } from './blurOverlay';
+import { Loupe } from './loupe';
 import { drawHistogram } from './histogram';
+import { tick } from './haptics';
 
 interface Img {
   full: Source;
@@ -27,22 +31,21 @@ interface Img {
 }
 
 const MASK_ADJ_MAP: Record<string, ParamDef> = Object.fromEntries(MASK_ADJ.map((d) => [d.id, d]));
-const MASK_GLYPH: Record<MaskType, string> = { radial: '◎', linear: '▤', brush: '✎', luma: '◐', color: '◉' };
-
 const LOOK_AMT: ParamDef = { id: 'lookAmt', label: 'Strength', min: 0, max: 100, def: 100, fmt: plain };
 const ASPECTS: Record<string, number | null> = {
   free: null, orig: -1, '1:1': 1, '4:5': 4 / 5, '5:4': 5 / 4, '3:2': 3 / 2, '2:3': 2 / 3,
   '16:9': 16 / 9, '9:16': 9 / 16, '1.85': 1.85, '2.39': 2.39,
 };
+const MASK_KINDS: { kind: string; label: string; desc: string; icon: string }[] = [
+  { kind: 'radial', label: 'Radial', desc: 'An oval area', icon: ICONS.mRadial },
+  { kind: 'linear', label: 'Gradient', desc: 'Fade across, like a sky', icon: ICONS.mLinear },
+  { kind: 'brush', label: 'Brush', desc: 'Paint it in', icon: ICONS.mBrush },
+  { kind: 'point', label: 'Point', desc: 'A spot + similar colors', icon: ICONS.mPoint },
+  { kind: 'luma', label: 'Light', desc: 'By brightness', icon: ICONS.mLuma },
+  { kind: 'color', label: 'Color', desc: 'By color', icon: ICONS.mColor },
+];
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
-const buzz = (ms = 6) => {
-  try {
-    navigator.vibrate?.(ms);
-  } catch {
-    /* not supported */
-  }
-};
 
 export class App {
   private g!: GL;
@@ -50,6 +53,7 @@ export class App {
   private canvas = $<HTMLCanvasElement>('view');
   private stage = $('stage');
   private frame = $('frame');
+  private appEl = $('app');
   private img: Img | null = null;
   private file: File | null = null;
 
@@ -57,32 +61,38 @@ export class App {
   private history: string[] = [];
   private hIdx = -1;
 
-  private tool: ToolDef = TOOLS[1];
+  /** null = tool bar showing; otherwise the open section */
+  private tool: ToolDef | null = null;
   private paramIdx: Record<string, number> = {};
   private sub: Record<string, string> = {};
   private aspectId = 'free';
 
   private compare = false;
   private showHist = false;
-  private zoom = { s: 1, x: 0, y: 0 };
+  private uiOff = false;
+  zoom = { s: 1, x: 0, y: 0 };
+  private view = { cx: 0, cy: 0, base: 1 };
   private raf = 0;
   private histTimer = 0;
 
   private look: { base: EditState | null; idx: number; amt: number } = { base: null, idx: -1, amt: 100 };
   private thumbsKey = '';
+  private thumbCache: ImageData[] = [];
 
   private curve!: CurveEditor;
   private crop!: CropOverlay;
   private maskOv!: MaskOverlay;
+  private blurOv!: BlurOverlay;
+  private loupe = new Loupe($<HTMLCanvasElement>('loupe'));
   private atlas!: BrushAtlas;
-  /** selected mask index, or -1 */
   private maskSel = -1;
-  private maskAdding = false;
   private brushMode: 'paint' | 'erase' | 'swipe' = 'paint';
+  private pickMode: 'pick' | 'swipe' = 'pick';
   private maskOverlayOn = false;
   private maskInteracting = false;
   private analysisCache: { key: string; px: Float32Array; w: number; h: number } | null = null;
   private saveTimer = 0;
+  private animTimer = 0;
 
   constructor() {
     try {
@@ -94,42 +104,42 @@ export class App {
     this.curve = new CurveEditor($('curveWrap'), () => this.state.curves, (c, commit) => {
       this.state.curves = c;
       this.requestRender();
-      if (commit) this.commit();
+      if (commit) this.commitAndRefresh();
     });
     this.crop = new CropOverlay($('cropLayer'), () => this.state.geo.crop, (r, commit) => {
       this.state.geo.crop = r;
-      if (commit) this.commit();
+      if (commit) this.commitAndRefresh();
     }, () => this.aspectNorm());
     this.maskOv = new MaskOverlay($('maskLayer'), () => ({ mask: this.selMask(), frame: this.frameInfo() }), (m, commit) => {
       this.state.masks[this.maskSel] = m;
       this.maskInteracting = !commit;
       if (commit) {
         this.updateSmartRef(m);
-        this.commit();
+        this.commitAndRefresh();
       }
       this.requestRender();
+    });
+    this.blurOv = new BlurOverlay($('blurLayer'), () => {
+      const v = this.state.v;
+      return {
+        type: Math.round(v.blurType), x: v.blurX, y: v.blurY,
+        size: (v.blurSize / 100) * 0.6, feather: 0.02 + (v.blurFeather / 100) * 0.5, angle: (v.blurAngle * Math.PI) / 180,
+      };
+    }, (x, y, commit) => {
+      this.state.v.blurX = x;
+      this.state.v.blurY = y;
+      this.requestRender();
+      if (commit) this.commit();
     });
     this.bindChrome();
     this.bindGestures();
     this.buildTools();
-    this.selectTool(TOOLS[1]);
+    this.setMode(null);
     this.commit();
     this.updateChrome();
     new ResizeObserver(() => this.layout()).observe(this.stage);
-    new ResizeObserver(() => this.layout()).observe($('bottom'));
+    new ResizeObserver(() => this.layout()).observe($('dock'));
     this.offerResume();
-  }
-
-  /** Show "Continue editing" when there's an autosaved session. */
-  private async offerResume() {
-    const s = await loadSession();
-    if (!s || this.img) return;
-    const b = $<HTMLButtonElement>('btnResume');
-    b.hidden = false;
-    b.textContent = `Continue editing ${s.file.name.length > 22 ? s.file.name.slice(0, 20) + '…' : s.file.name}`;
-    b.onclick = async () => {
-      await this.open(s.file, false, s.state);
-    };
   }
 
   private initGL() {
@@ -151,18 +161,26 @@ export class App {
 
   private fatal(msg: string) {
     const e = $('empty');
-    e.innerHTML = `<h1>Can’t start</h1><p>${msg}</p><p>Try the latest Safari or Chrome.</p>`;
+    e.innerHTML = `<h1>LUMEN</h1><p>${msg}</p><p>Try the latest Safari or Chrome.</p>`;
+  }
+
+  private async offerResume() {
+    const s = await loadSession();
+    if (!s || this.img) return;
+    const b = $<HTMLButtonElement>('btnResume');
+    b.hidden = false;
+    b.onclick = () => this.open(s.file, false, s.state);
   }
 
   // -----------------------------------------------------------------------------------
   // Opening images
 
   async open(file: File, keepState = false, restoreState = '') {
-    this.busy('Opening…');
+    this.busy('Opening');
     try {
       const maxDim = Math.min(this.g.maxTex, 8192);
-      const L = await loadFile(file, maxDim, (s) => this.busy(s));
-      this.busy('Preparing…');
+      const L = await loadFile(file, maxDim, (s) => this.busy(s.replace('…', '')));
+      this.busy('Preparing');
       await new Promise((r) => setTimeout(r, 0));
       const g = this.g;
       const gl = g.gl;
@@ -219,17 +237,16 @@ export class App {
         this.aspectId = 'free';
         this.zoom = { s: 1, x: 0, y: 0 };
         this.maskSel = this.state.masks.length ? 0 : -1;
-        this.maskAdding = false;
         this.commit();
       }
       this.analysisCache = null;
       this.syncAtlasSize();
-      $('btnResume').hidden = true;
       this.thumbsKey = '';
+      $('btnResume').hidden = true;
       $('empty').classList.add('hidden');
       this.frame.classList.remove('empty');
       $('title').textContent = L.info;
-      this.selectTool(this.tool);
+      this.setMode(null);
       this.layout();
       this.requestRender();
       this.toast(L.note ?? L.info, L.note ? 5000 : 1800);
@@ -264,15 +281,17 @@ export class App {
     });
   }
 
-  /** What's on screen: the edit, the original (compare), or the uncropped frame (crop tool). */
+  private kind() {
+    return this.tool?.kind ?? null;
+  }
+
+  /** What's on screen: the edit, the original (compare), or the uncropped frame (crop section). */
   private viewState(): EditState {
     let s = this.state;
     if (this.compare) {
       s = { v: { ...defaultValues(), straighten: s.v.straighten }, curves: defaultState().curves, geo: s.geo, masks: [] };
     }
-    if (this.tool.kind === 'crop') {
-      s = { ...s, geo: { ...s.geo, crop: { x: 0, y: 0, w: 1, h: 1 } } };
-    }
+    if (this.kind() === 'crop') s = { ...s, geo: { ...s.geo, crop: { x: 0, y: 0, w: 1, h: 1 } } };
     return s;
   }
 
@@ -287,14 +306,16 @@ export class App {
     }
     this.atlas.sync(st.masks);
     this.pipe.brushTex = this.atlas.tex;
-    this.pipe.showMask = this.tool.kind === 'masks' && (this.maskOverlayOn || this.maskInteracting) ? this.maskSel : -1;
+    this.pipe.showMask = this.kind() === 'masks' && (this.maskOverlayOn || this.maskInteracting) ? this.maskSel : -1;
     try {
       this.pipe.render(this.img.preview, st, w, h, null);
     } catch (e) {
       console.error(e);
       this.toast('Render error: ' + (e as Error).message, 4000);
     }
-    if (this.showHist || this.tool.kind === 'curves') this.scheduleHist();
+    // the loupe copies from the canvas while its frame is still current
+    if (this.loupe.pos) this.loupe.draw(this.canvas, this.stage.getBoundingClientRect());
+    if (this.showHist || this.kind() === 'curves') this.scheduleHist();
   }
 
   private scheduleHist() {
@@ -304,46 +325,75 @@ export class App {
       const st = this.viewState();
       const { w, h } = outputSize(st, this.img.thumb.w, this.img.thumb.h);
       const px = this.pipe.renderPixels(this.img.thumb, st, w, h);
-      const l = drawHistogram($<HTMLCanvasElement>('hist'), px);
-      this.curve.hist = l;
-      if (this.tool.kind === 'curves') this.curve.draw();
+      this.curve.hist = drawHistogram($<HTMLCanvasElement>('hist'), px);
+      if (this.kind() === 'curves') this.curve.draw();
     }, 90);
   }
 
-  /** The photo sits between the floating top bar and bottom panel. */
+  /** Space left for the photo between the floating top bar and the dock. */
   private region() {
-    const top = (document.querySelector('.top') as HTMLElement).offsetHeight;
-    const bot = $('bottom').offsetHeight;
     const sw = this.stage.clientWidth;
     const sh = this.stage.clientHeight;
-    return { top, bot, sw, sh, cx: sw / 2, cy: top + (sh - top - bot) / 2, ah: Math.max(60, sh - top - bot) };
+    if (this.uiOff) return { top: 0, bot: 0, sw, sh };
+    const topEl = document.querySelector('.top') as HTMLElement;
+    const top = topEl.offsetHeight - 16;
+    const dock = $('dock');
+    const tools = $('tools'), section = $('section');
+    const active = this.tool ? section : tools;
+    const bot = dock.offsetHeight - Math.max(tools.offsetHeight, section.offsetHeight) + active.offsetHeight - 14;
+    return { top, bot, sw, sh };
   }
 
-  private layout() {
+  private layout(animate = false) {
     const R = this.region();
-    document.documentElement.style.setProperty('--top-h', R.top + 'px');
-    document.documentElement.style.setProperty('--bot-h', R.bot + 'px');
+    const root = document.documentElement.style;
+    if (!this.uiOff) {
+      root.setProperty('--top-h', R.top + 'px');
+      root.setProperty('--bot-h', R.bot + 'px');
+    }
     const cw = this.canvas.width || 1;
     const ch = this.canvas.height || 1;
-    const m = 12;
-    const k = Math.min((R.sw - m * 2) / cw, (R.ah - m * 2) / ch);
-    this.frame.style.width = Math.max(1, cw * k) + 'px';
-    this.frame.style.height = Math.max(1, ch * k) + 'px';
-    this.frame.style.top = R.cy + 'px';
-    this.applyZoom();
-    if (this.tool.kind === 'crop') this.crop.update();
-    if (this.tool.kind === 'curves') this.curve.draw();
-    if (this.tool.kind === 'masks') this.maskOv.draw();
-    this.moveToolIndicator();
+    // the photo element is sized for full screen; the UI-visible fit is a transform on top
+    const full = Math.min(R.sw / cw, R.sh / ch);
+    this.frame.style.width = Math.max(1, cw * full) + 'px';
+    this.frame.style.height = Math.max(1, ch * full) + 'px';
+    const fit = Math.min((R.sw - 12) / cw, (R.sh - R.top - R.bot - 10) / ch);
+    this.view = { cx: R.sw / 2, cy: R.top + (R.sh - R.top - R.bot) / 2, base: Math.min(1, Math.max(0.2, fit / full)) };
+    this.applyZoom(animate);
+    if (this.kind() === 'crop') this.crop.update();
+    if (this.kind() === 'curves') this.curve.draw();
   }
 
-  private applyZoom() {
+  private applyZoom(animate = false) {
     const z = this.zoom;
-    this.frame.style.transform = `translate(${z.x}px, ${z.y}px) scale(${z.s}) translate(-50%, -50%)`;
+    const V = this.view;
+    if (animate) {
+      this.frame.classList.add('anim');
+      clearTimeout(this.animTimer);
+      this.animTimer = window.setTimeout(() => {
+        this.frame.classList.remove('anim');
+        this.redrawOverlays();
+      }, 280);
+    }
+    this.frame.style.transform = `translate(${V.cx + z.x}px, ${V.cy + z.y}px) scale(${V.base * z.s}) translate(-50%, -50%)`;
     const b = $('zoomBadge');
     b.classList.toggle('on', z.s > 1.01);
     if (z.s > 1.01) b.textContent = Math.round(z.s * 100) + '%';
-    if (this.tool.kind === 'masks') this.maskOv.draw();
+    this.redrawOverlays();
+  }
+
+  private redrawOverlays() {
+    const k = this.kind();
+    if (k === 'masks') this.maskOv.draw();
+    if (k === 'blur') this.blurOv.draw();
+  }
+
+  /** Tap the photo: fade all controls away (or back). */
+  private toggleUI(force?: boolean) {
+    this.uiOff = force ?? !this.uiOff;
+    this.appEl.classList.toggle('ui-off', this.uiOff);
+    this.showMenu(false);
+    this.layout(true);
   }
 
   // -----------------------------------------------------------------------------------
@@ -363,6 +413,11 @@ export class App {
     }
   }
 
+  private commitAndRefresh() {
+    this.commit();
+    this.updateSecBar();
+  }
+
   private restore(i: number) {
     if (i < 0 || i >= this.history.length) return;
     this.hIdx = i;
@@ -373,15 +428,14 @@ export class App {
     this.look.base = null;
     this.look.idx = -1;
     this.requestRender();
-    this.refreshPanel();
+    this.refreshSection();
     this.updateChrome();
   }
 
   // -----------------------------------------------------------------------------------
-  // Params
+  // Params. Plain ids are global; 'lookAmt' = look strength; 'ma.x' / 'mg.x' = selected
+  // mask's adjustments / mask settings.
 
-  // Param ids: plain ids are global sliders, 'lookAmt' is the look strength,
-  // 'ma.<id>' / 'mg.<id>' are the selected mask's adjustments / mask settings.
   private def(id: string): ParamDef {
     if (id === 'lookAmt') return LOOK_AMT;
     if (id.startsWith('ma.')) return MASK_ADJ_MAP[id.slice(3)];
@@ -409,110 +463,110 @@ export class App {
       if (id.startsWith('mg.')) this.maskOv.draw();
     } else {
       this.state.v[id] = v;
+      if (id.startsWith('blur')) this.blurOv.draw();
     }
     this.requestRender();
   }
 
-  private params() {
-    if (this.tool.kind === 'masks') {
+  private params(): string[] {
+    const t = this.tool;
+    if (!t) return [];
+    if (t.kind === 'masks') {
       const m = this.selMask();
-      if (!m || this.maskAdding) return [];
+      if (!m) return [];
       return [...MASK_ADJ.map((d) => 'ma.' + d.id), ...MASK_TYPE_SETTINGS[m.type].map((k) => 'mg.' + k)];
     }
-    return this.tool.params(this.sub[this.tool.id] ?? this.tool.subs?.[0].id ?? '');
+    if (t.kind === 'blur') return t.params(String(Math.round(this.state.v.blurType)));
+    if (t.kind === 'looks') return this.look.idx > 0 ? ['lookAmt'] : [];
+    return t.params(this.sub[t.id] ?? t.subs?.[0].id ?? '');
   }
   private currentParam(): string | null {
     const ps = this.params();
-    if (!ps.length) return null;
-    const i = Math.min(ps.length - 1, this.paramIdx[this.tool.id] ?? 0);
-    return ps[i];
+    if (!ps.length || !this.tool) return null;
+    return ps[Math.min(ps.length - 1, this.paramIdx[this.tool.id] ?? 0)];
   }
-
   private fmt(id: string, v = this.get(id)) {
-    const d = this.def(id);
-    return (d.fmt ?? plain)(v);
+    return (this.def(id).fmt ?? plain)(v);
   }
-
   private isModified(ids: string[]) {
     return ids.some((id) => id !== 'lookAmt' && Math.abs(this.get(id) - this.def(id).def) > 1e-6);
   }
-
   private toolModified(t: ToolDef) {
-    if (t.kind === 'looks') return false;
-    if (t.kind === 'masks') return this.state.masks.length > 0;
-    if (t.kind === 'curves') return JSON.stringify(this.state.curves) !== JSON.stringify(defaultState().curves);
-    if (t.kind === 'crop') {
-      const g = this.state.geo;
-      return g.quarter !== 0 || g.flipH || g.flipV || g.crop.w < 1 || g.crop.h < 1 || this.state.v.straighten !== 0;
+    const v = this.state.v;
+    switch (t.kind) {
+      case 'looks':
+        return this.look.base !== null && this.look.idx > 0;
+      case 'masks':
+        return this.state.masks.length > 0;
+      case 'curves':
+        return JSON.stringify(this.state.curves) !== JSON.stringify(defaultState().curves);
+      case 'crop': {
+        const g = this.state.geo;
+        return g.quarter !== 0 || g.flipH || g.flipV || g.crop.w < 0.999 || g.crop.h < 0.999 || v.straighten !== 0;
+      }
+      case 'blur':
+        return v.blurType > 0;
+      default: {
+        const subs = t.subs ? t.subs.map((s) => s.id) : [''];
+        return subs.some((s) => t.params(s).some((p) => Math.abs(v[p] - PARAM_MAP[p].def) > 1e-6));
+      }
     }
-    const subs = t.subs ? t.subs.map((s) => s.id) : [''];
-    return subs.some((s) => this.isModified(t.params(s)));
   }
 
   // -----------------------------------------------------------------------------------
-  // Chrome (top bar, tools, panel)
+  // Chrome
 
   private bindChrome() {
-    const setIcon = (id: string, svg: string) => ($(id).innerHTML = svg);
-    setIcon('btnOpen', ICONS.open);
-    setIcon('btnUndo', ICONS.undo);
-    setIcon('btnRedo', ICONS.redo);
-    setIcon('btnCompare', ICONS.compare);
-    setIcon('btnHist', ICONS.hist);
-    setIcon('btnMore', ICONS.more);
+    $('btnOpen').innerHTML = ICONS.open;
+    $('btnUndo').innerHTML = ICONS.undo;
+    $('btnRedo').innerHTML = ICONS.redo;
+    $('btnMore').innerHTML = ICONS.more;
+    $('secReset').innerHTML = ICONS.reset;
+    $('secDone').innerHTML = ICONS.check;
 
+    // image/* lets Android show its photo picker, which includes Google Photos
     const input = $<HTMLInputElement>('file');
-    input.accept = 'image/*,' + RAW_EXT.map((e) => '.' + e).join(',');
-    const pick = () => {
-      input.value = '';
-      input.click();
+    const rawInput = $<HTMLInputElement>('fileRaw');
+    rawInput.accept = RAW_EXT.map((e) => '.' + e).join(',') + ',image/*';
+    const pick = (el: HTMLInputElement) => () => {
+      el.value = '';
+      el.click();
     };
-    input.onchange = () => {
-      const f = input.files?.[0];
-      if (f) this.open(f);
-    };
-    $('btnOpen').onclick = pick;
-    $('btnOpenBig').onclick = pick;
+    for (const el of [input, rawInput]) {
+      el.onchange = () => {
+        const f = el.files?.[0];
+        if (f) this.open(f);
+      };
+    }
+    $('btnOpen').onclick = pick(input);
+    $('btnOpenBig').onclick = pick(input);
+    $('btnOpenRaw').onclick = pick(rawInput);
     $('btnUndo').onclick = () => this.restore(this.hIdx - 1);
     $('btnRedo').onclick = () => this.restore(this.hIdx + 1);
-    $('btnHist').onclick = () => {
-      this.showHist = !this.showHist;
-      $('hist').classList.toggle('on', this.showHist);
-      $('btnHist').classList.toggle('on', this.showHist);
-      if (this.showHist) this.scheduleHist();
+    $('secDone').onclick = () => {
+      tick();
+      this.setMode(null);
     };
-    const cmp = $('btnCompare');
-    const on = (e: Event) => {
-      e.preventDefault();
-      this.setCompare(true);
+    $('secReset').onclick = () => {
+      tick(true);
+      this.resetSection();
     };
-    const off = () => this.setCompare(false);
-    cmp.addEventListener('pointerdown', on);
-    cmp.addEventListener('pointerup', off);
-    cmp.addEventListener('pointerleave', off);
-    cmp.addEventListener('pointercancel', off);
-    cmp.addEventListener('contextmenu', (e) => e.preventDefault());
-
-    // drag & drop (desktop)
+    $('paramName').onclick = () => this.showMenu(true, true);
+    $('zoomBadge').onclick = () => {
+      this.zoom = { s: 1, x: 0, y: 0 };
+      this.applyZoom(true);
+    };
     window.addEventListener('dragover', (e) => e.preventDefault());
     window.addEventListener('drop', (e) => {
       e.preventDefault();
       const f = e.dataTransfer?.files?.[0];
       if (f) this.open(f);
     });
-
-    // param name button opens a tap-to-pick list
-    $('paramName').onclick = () => this.showMenu(true, true);
-    $('zoomBadge').onclick = () => {
-      this.zoom = { s: 1, x: 0, y: 0 };
-      this.frame.style.transition = 'transform .2s cubic-bezier(.2,.8,.2,1)';
-      this.applyZoom();
-      setTimeout(() => (this.frame.style.transition = ''), 220);
-    };
     this.bindValueInput();
-    this.bindTrack();
     this.bindExport();
     this.bindMore();
+    this.bindPresets();
+    this.bindMaskSheet();
     this.bindKeys();
   }
 
@@ -529,8 +583,6 @@ export class App {
     ($('btnUndo') as HTMLButtonElement).disabled = !has || this.hIdx <= 0;
     ($('btnRedo') as HTMLButtonElement).disabled = !has || this.hIdx >= this.history.length - 1;
     ($('btnExport') as HTMLButtonElement).disabled = !has;
-    ($('btnCompare') as HTMLButtonElement).disabled = !has;
-    $('panel').style.display = has ? '' : 'none';
     $('tools').classList.toggle('disabled', !has);
     document.querySelectorAll<HTMLButtonElement>('#tools button').forEach((b) => {
       const t = TOOLS.find((x) => x.id === b.dataset.id)!;
@@ -540,171 +592,160 @@ export class App {
 
   private buildTools() {
     const nav = $('tools');
-    nav.querySelectorAll('button').forEach((b) => b.remove());
+    nav.innerHTML = '';
     for (const t of TOOLS) {
       const b = document.createElement('button');
       b.dataset.id = t.id;
       b.innerHTML = `${t.icon}<span>${t.label}</span>`;
-      b.onclick = () => this.selectTool(t);
+      b.onclick = () => {
+        tick();
+        this.setMode(t);
+      };
       nav.appendChild(b);
     }
   }
 
-  private selectTool(t: ToolDef) {
+  /** Open a section (focused controls) or go back to the tool bar (null). */
+  private setMode(t: ToolDef | null) {
     const prev = this.tool;
-    if (prev.kind === 'crop' && t.kind !== 'crop') this.zoom = { s: 1, x: 0, y: 0 };
-    if (prev.kind === 'looks' && t.kind !== 'looks') {
+    if (prev?.kind === 'looks' && t?.kind !== 'looks') {
       this.look.base = null;
       this.look.idx = -1;
     }
+    if (prev && !t) this.commit();
     this.tool = t;
-    if (t.kind === 'crop') this.zoom = { s: 1, x: 0, y: 0 };
-    document.querySelectorAll<HTMLButtonElement>('#tools button').forEach((b) => b.classList.toggle('on', b.dataset.id === t.id));
-    const btn = document.querySelector<HTMLElement>(`#tools button[data-id="${t.id}"]`);
-    btn?.scrollIntoView({ inline: 'nearest', block: 'nearest', behavior: 'smooth' });
-    if (t.kind === 'curves' && !this.sub.curves) this.sub.curves = 'rgb';
+    this.showMenu(false);
+    this.loupe.hide();
+    this.appEl.dataset.mode = t ? 'section' : 'tools';
+    $('title').textContent = t ? t.label : this.img?.info ?? '';
+    if (prev?.kind === 'crop' || t?.kind === 'crop') this.zoom = { s: 1, x: 0, y: 0 };
+    if (t?.kind === 'curves' && !this.sub.curves) this.sub.curves = 'rgb';
     this.curve.channel = (this.sub.curves ?? 'rgb') as keyof Curves;
-    this.curve.show(t.kind === 'curves' && !!this.img);
-    this.crop.show(t.kind === 'crop' && !!this.img);
-    this.maskAdding = t.kind === 'masks' && !this.state.masks.length;
-    this.maskOv.show(t.kind === 'masks' && !!this.img);
-    if (t !== prev) {
-      const body = $('panelBody');
-      body.classList.remove('swap');
-      void body.offsetWidth; // restart the animation
-      body.classList.add('swap');
-    }
-    this.refreshPanel();
-    this.layout();
+    this.curve.show(t?.kind === 'curves' && !!this.img);
+    this.crop.show(t?.kind === 'crop' && !!this.img);
+    this.maskOv.show(t?.kind === 'masks' && !!this.img);
+    this.blurOv.show(t?.kind === 'blur' && !!this.img);
+    if (t?.kind === 'masks' && this.maskSel < 0 && this.state.masks.length) this.maskSel = 0;
+    this.refreshSection();
+    // wait for the dock to settle, then refit the photo smoothly
+    requestAnimationFrame(() => this.layout(true));
     this.requestRender();
-    if (t.kind === 'looks') this.buildThumbs();
+    if (t?.kind === 'masks' && !this.state.masks.length && this.img) setTimeout(() => this.openMaskSheet(), 180);
   }
 
-  /** Glide the cyan indicator under the active tool. */
-  private moveToolIndicator() {
-    const btn = document.querySelector<HTMLElement>(`#tools button[data-id="${this.tool.id}"]`);
-    const ind = $('toolInd');
-    if (!btn) return;
-    ind.style.transform = `translateX(${btn.offsetLeft + btn.offsetWidth / 2 - 14}px)`;
+  private refreshSection() {
+    if (!this.tool) {
+      this.updateChrome();
+      return;
+    }
+    this.buildSubs();
+    this.buildActs();
+    this.updateSecBar();
+    if (this.kind() === 'crop') this.crop.update();
+    if (this.kind() === 'curves') this.curve.draw();
+    this.redrawOverlays();
   }
 
-  private refreshPanel() {
-    this.buildChips();
-    this.updateParamBar();
-    const looks = $('looks');
-    looks.style.display = this.tool.kind === 'looks' ? '' : 'none';
-    if (this.tool.kind === 'looks') this.markLooks();
-    this.updateChrome();
-    if (this.tool.kind === 'crop') this.crop.update();
-    if (this.tool.kind === 'curves') this.curve.draw();
-    if (this.tool.kind === 'masks') this.maskOv.draw();
-    const hint = $('hint');
-    const showHint = this.tool.kind === 'masks' && !this.selMask() && !this.maskAdding;
-    hint.classList.toggle('on', showHint);
-    if (showHint) hint.textContent = 'Add a mask to edit just part of the photo.';
-  }
-
-  private buildChips() {
-    const row = $('chips');
-    row.innerHTML = '';
-    $('chips2').innerHTML = '';
+  private updateSecBar() {
     const t = this.tool;
-    if (t.kind === 'masks') return this.buildMaskChips();
-    const mk = (c: Chip, cls: string, onClick: () => void, selected = false, modified = false, target = row) => {
-      const b = document.createElement('button');
-      b.className = `chip ${cls}${selected ? ' on' : ''}`;
-      if (c.color) {
-        const dot = document.createElement('span');
-        dot.className = 'dot' + (c.color === 'conic' ? ' conic' : '') + (modified ? ' mod' : '');
-        if (c.color !== 'conic') dot.style.background = c.color;
-        b.appendChild(dot);
-      }
-      b.appendChild(document.createTextNode(c.label));
-      b.onclick = onClick;
-      target.appendChild(b);
-      return b;
+    this.updateChrome();
+    if (!t) return;
+    $('secReset').classList.toggle('gone', !this.toolModified(t));
+    const id = this.currentParam();
+    $('pill').classList.toggle('gone', !id);
+    if (id) {
+      $('paramName').textContent = this.def(id).label;
+      $('paramValue').textContent = this.fmt(id);
+    }
+  }
+
+  // ---- section rows
+
+  private chip(row: HTMLElement, c: Chip, on: boolean, onClick: () => void) {
+    const b = document.createElement('button');
+    b.className = 'chip' + (on ? ' on' : '');
+    b.innerHTML = (c.icon ?? '') + `<span>${escapeHtml(c.label)}</span>`;
+    b.onclick = () => {
+      tick();
+      onClick();
     };
-    if (t.subs) {
-      const cur = t.kind === 'crop' ? this.aspectId : this.sub[t.id] ?? t.subs[0].id;
-      for (const s of t.subs) {
-        const mod = t.kind === 'params' && this.isModified(t.params(s.id).filter((p) => !p.startsWith('cg_b')));
-        mk(s, 'sel', () => {
-          if (t.kind === 'crop') this.setAspect(s.id);
-          else {
-            this.sub[t.id] = s.id;
-            if (t.kind === 'curves') {
-              this.curve.channel = s.id as keyof Curves;
-              this.curve.draw();
-            }
-          }
-          this.refreshPanel();
-        }, s.id === cur, mod);
+    row.appendChild(b);
+    return b;
+  }
+
+  private tile(row: HTMLElement, icon: string, label: string, cls: string, onClick: () => void) {
+    const b = document.createElement('button');
+    b.className = 'tile ' + cls;
+    b.innerHTML = `<span class="b">${icon}</span><small>${escapeHtml(label)}</small>`;
+    b.onclick = () => {
+      tick();
+      onClick();
+    };
+    row.appendChild(b);
+    return b;
+  }
+
+  private buildSubs() {
+    const row = $('subs');
+    row.innerHTML = '';
+    const t = this.tool!;
+    if (t.kind === 'looks') return this.buildLooks();
+    if (t.kind === 'masks') return this.buildMaskList();
+    if (!t.subs) return;
+    const cur = t.kind === 'crop' ? this.aspectId : t.kind === 'blur' ? String(Math.round(this.state.v.blurType)) : this.sub[t.id] ?? t.subs[0].id;
+    for (const s of t.subs) {
+      const on = s.id === cur;
+      if (s.color) {
+        // color dots (HSL bands, curve channels)
+        const b = document.createElement('button');
+        const mod = t.kind === 'params' && this.isModified(t.params(s.id));
+        b.className = 'dotchip' + (on ? ' on' : '') + (mod ? ' mod' : '');
+        b.setAttribute('aria-label', s.label);
+        b.innerHTML = `<i style="background:${s.color}"></i>`;
+        b.onclick = () => {
+          tick();
+          this.pickSub(s.id);
+        };
+        row.appendChild(b);
+      } else {
+        this.chip(row, s, on, () => this.pickSub(s.id));
       }
     }
-    for (const a of t.actions ?? []) mk(a, 'act', () => this.action(a.id));
-    if (t.kind === 'params' && this.toolModified(t)) mk({ id: 'reset', label: 'Reset' }, 'act hot', () => this.action('resetTool'));
   }
 
-  private updateParamBar() {
-    const id = this.currentParam();
-    const bar = $('paramBar');
-    bar.classList.toggle('hidden', !id || (this.tool.kind === 'looks' && this.look.idx < 1));
-    if (!id) return;
-    const d = this.def(id);
-    const v = this.get(id);
-    ($('paramName').firstElementChild as HTMLElement).textContent = d.label;
-    $('paramValue').textContent = this.fmt(id);
-    const track = $('track');
-    track.classList.toggle('hue', !!d.hue);
-    const pos = (x: number) => ((x - d.min) / (d.max - d.min)) * 100;
-    const z = pos(d.def);
-    const p = pos(v);
-    (track.querySelector('.zero') as HTMLElement).style.left = z + '%';
-    const fill = track.querySelector('.fill') as HTMLElement;
-    fill.style.left = Math.min(z, p) + '%';
-    fill.style.width = Math.abs(p - z) + '%';
-    (track.querySelector('.knob') as HTMLElement).style.left = p + '%';
-    const knob = track.querySelector('.knob') as HTMLElement;
-    knob.style.background = d.hue ? `hsl(${v}, 90%, 55%)` : '#fff';
-    this.updateBrushRingSize();
-  }
-
-  private bindTrack() {
-    const track = $('track');
-    let active = -1;
-    const setFrom = (e: PointerEvent) => {
-      const id = this.currentParam();
-      if (!id) return;
-      const d = this.def(id);
-      const r = track.getBoundingClientRect();
-      const f = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
-      let v = d.min + f * (d.max - d.min);
-      // snap to default near it
-      if (Math.abs(v - d.def) < (d.max - d.min) * 0.015) v = d.def;
-      this.set(id, v);
-      this.updateParamBar();
-      this.showHud(id);
-    };
-    track.addEventListener('pointerdown', (e) => {
-      active = e.pointerId;
-      track.classList.add('active');
-      track.setPointerCapture(e.pointerId);
-      setFrom(e);
-    });
-    track.addEventListener('pointermove', (e) => {
-      if (e.pointerId === active) setFrom(e);
-    });
-    const end = (e: PointerEvent) => {
-      if (e.pointerId !== active) return;
-      active = -1;
-      track.classList.remove('active');
+  private pickSub(id: string) {
+    const t = this.tool!;
+    if (t.kind === 'crop') this.setAspect(id);
+    else if (t.kind === 'blur') {
+      const v = this.state.v;
+      if (v.blurType === 0 && id !== '0') {
+        v.blurX = 0.5;
+        v.blurY = 0.5;
+      }
+      v.blurType = +id;
+      this.paramIdx.blur = 0;
       this.commit();
-      this.hideHudSoon();
-      this.updateChrome();
-      this.buildChips();
-    };
-    track.addEventListener('pointerup', end);
-    track.addEventListener('pointercancel', end);
+      this.requestRender();
+      if (id !== '0') this.toast('Drag the orange dot to place the focus', 2400);
+    } else {
+      this.sub[t.id] = id;
+      if (t.kind === 'curves') {
+        this.curve.channel = id as keyof Curves;
+        this.curve.draw();
+      }
+    }
+    this.refreshSection();
+  }
+
+  private buildActs() {
+    const row = $('acts');
+    row.innerHTML = '';
+    const t = this.tool!;
+    if (t.kind === 'masks') return this.buildMaskActs();
+    for (const a of t.actions ?? []) {
+      if (a.icon) this.tile(row, a.icon, a.label, '', () => this.action(a.id));
+      else this.chip(row, a, false, () => this.action(a.id));
+    }
   }
 
   // -----------------------------------------------------------------------------------
@@ -717,24 +758,24 @@ export class App {
     (hud.querySelector('.name') as HTMLElement).textContent = d.label;
     (hud.querySelector('.val') as HTMLElement).textContent = this.fmt(id);
     const pos = (x: number) => ((x - d.min) / (d.max - d.min)) * 100;
-    const z = pos(d.def);
-    const p = pos(this.get(id));
-    const bar = hud.querySelector('.bar i') as HTMLElement;
+    const z = pos(d.def), p = pos(this.get(id));
+    const bar = hud.querySelector('.ruler i') as HTMLElement;
     bar.style.left = Math.min(z, p) + '%';
-    bar.style.width = Math.max(1, Math.abs(p - z)) + '%';
+    bar.style.width = Math.abs(p - z) + '%';
+    (hud.querySelector('.ruler b') as HTMLElement).style.left = p + '%';
     hud.classList.add('on');
     clearTimeout(this.hudTimer);
   }
-  private hideHudSoon() {
+  private hideHudSoon(ms = 650) {
     clearTimeout(this.hudTimer);
-    this.hudTimer = window.setTimeout(() => $('hud').classList.remove('on'), 700);
+    this.hudTimer = window.setTimeout(() => $('hud').classList.remove('on'), ms);
   }
 
   private menuTap = false;
   private showMenu(on: boolean, tapMode = false) {
     const menu = $('menu');
     const ps = this.params();
-    if (!on || ps.length < 2) {
+    if (!on || ps.length < 2 || !this.tool) {
       menu.classList.remove('on');
       this.menuTap = false;
       return;
@@ -759,9 +800,10 @@ export class App {
       b.onpointerup = (e) => {
         if (!this.menuTap) return;
         e.stopPropagation();
-        this.paramIdx[this.tool.id] = i;
+        this.paramIdx[this.tool!.id] = i;
+        tick();
         this.showMenu(false);
-        this.updateParamBar();
+        this.updateSecBar();
         this.showHud(id);
         this.hideHudSoon();
       };
@@ -780,12 +822,11 @@ export class App {
       el.classList.toggle('sel', on);
       if (on) target = el;
     });
-    const bar = menu.querySelector('.sel-bar') as HTMLElement;
     if (!target) return;
     const t = target as HTMLElement;
+    const bar = menu.querySelector('.sel-bar') as HTMLElement;
     bar.style.transition = instant ? 'none' : '';
     bar.style.transform = `translateY(${t.offsetTop}px)`;
-    // keep the highlighted row visible in long lists
     const top = t.offsetTop, bottom = top + t.offsetHeight;
     if (top < menu.scrollTop) menu.scrollTop = top - 6;
     else if (bottom > menu.scrollTop + menu.clientHeight) menu.scrollTop = bottom - menu.clientHeight + 12;
@@ -815,8 +856,7 @@ export class App {
       if (apply && id && Number.isFinite(n)) {
         this.set(id, n);
         this.commit();
-        this.updateParamBar();
-        this.buildChips();
+        this.refreshSection();
       }
     };
     input.onkeydown = (e) => {
@@ -827,25 +867,24 @@ export class App {
   }
 
   // -----------------------------------------------------------------------------------
-  // Gestures on the photo:
-  //   vertical swipe   → choose adjustment     horizontal swipe → change it
-  //   double tap       → reset adjustment      press & hold     → show original
-  //   pinch            → zoom / pan
+  // Gestures on the photo
+  //   swipe ↔ change the adjustment (with haptic ticks)   swipe ↕ choose the adjustment
+  //   tap: hide/show controls   double tap: reset adjustment   hold: original   pinch: zoom
 
   private bindGestures() {
     const st = this.stage;
     const pts = new Map<number, { x: number; y: number }>();
-    let mode: 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' = 'none';
+    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur';
+    let mode: Mode = 'none';
     let sx = 0, sy = 0, startIdx = 0, lastStep = 0;
-    let curVal = 0, lastX = 0, lastT = 0;
+    let curVal = 0, lastX = 0, lastT = 0, lastNotch = 0;
     let pinch0 = { d: 1, mx: 0, my: 0, s: 1, x: 0, y: 0 };
-    let holdTimer = 0;
+    let holdTimer = 0, tapTimer = 0;
     let lastTap = { t: 0, x: 0, y: 0 };
 
-    const center = () => {
+    const stageXY = (cx: number, cy: number) => {
       const r = st.getBoundingClientRect();
-      const R = this.region();
-      return { cx: r.left + R.cx, cy: r.top + R.cy };
+      return { x: cx - r.left, y: cy - r.top };
     };
 
     st.addEventListener('pointerdown', (e) => {
@@ -856,36 +895,51 @@ export class App {
       }
       st.setPointerCapture(e.pointerId);
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
-      if (pts.size === 2 && this.tool.kind !== 'crop') {
+      if (pts.size === 2 && this.kind() !== 'crop') {
         clearTimeout(holdTimer);
+        clearTimeout(tapTimer);
         if (mode === 'value' || mode === 'menu') this.finishSwipe(mode);
         if (mode === 'paint') this.cancelStroke();
         if (mode === 'mask') this.maskOv.cancel();
+        if (mode === 'pick') this.endPick(false);
         this.hideBrushRing();
         this.setCompare(false);
         const [a, b] = [...pts.values()];
-        pinch0 = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2, ...this.zoom };
+        const m = stageXY((a.x + b.x) / 2, (a.y + b.y) / 2);
+        pinch0 = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: m.x, my: m.y, ...this.zoom };
         mode = 'pinch';
         return;
       }
       if (pts.size > 1) return;
       sx = e.clientX;
       sy = e.clientY;
-      if (this.tool.kind === 'crop' && this.cropGrab(e)) {
+      const k = this.kind();
+      if (k === 'crop' && this.cropGrab(e)) {
         mode = 'crop';
         return;
       }
-      if (this.tool.kind === 'masks' && !this.maskAdding) {
+      if (k === 'blur' && this.blurOv.start(e)) {
+        mode = 'blur';
+        tick();
+        return;
+      }
+      if (k === 'masks') {
         const m = this.selMask();
         if (m && this.maskOv.start(e)) {
           mode = 'mask';
           this.maskInteracting = true;
+          tick();
           this.requestRender();
           return;
         }
         if (m && m.type === 'brush' && this.brushMode !== 'swipe') {
           mode = 'paint';
           this.startStroke(e);
+          return;
+        }
+        if (m && (m.type === 'luma' || m.type === 'color') && this.pickMode === 'pick') {
+          mode = 'pick';
+          this.pickAt(e);
           return;
         }
       }
@@ -895,9 +949,9 @@ export class App {
         if (mode === 'pending') {
           mode = 'compare';
           this.setCompare(true);
-          buzz(10);
+          tick(true);
         }
-      }, 420);
+      }, 380);
     });
 
     st.addEventListener('pointermove', (e) => {
@@ -906,30 +960,34 @@ export class App {
       if (mode === 'pinch' && pts.size >= 2) {
         const [a, b] = [...pts.values()];
         const d = Math.hypot(a.x - b.x, a.y - b.y);
-        const mx = (a.x + b.x) / 2, my = (a.y + b.y) / 2;
-        const s = Math.min(10, Math.max(1, (pinch0.s * d) / pinch0.d));
-        const { cx, cy } = center();
-        const px = (pinch0.mx - cx - pinch0.x) / pinch0.s;
-        const py = (pinch0.my - cy - pinch0.y) / pinch0.s;
-        this.zoom = s === 1 ? { s: 1, x: 0, y: 0 } : { s, x: mx - cx - px * s, y: my - cy - py * s };
+        const m = stageXY((a.x + b.x) / 2, (a.y + b.y) / 2);
+        const s = Math.min(12, Math.max(1, (pinch0.s * d) / pinch0.d));
+        const V = this.view;
+        const E0 = V.base * pinch0.s, E1 = V.base * s;
+        const px = (pinch0.mx - V.cx - pinch0.x) / E0;
+        const py = (pinch0.my - V.cy - pinch0.y) / E0;
+        this.zoom = s === 1 ? { s: 1, x: 0, y: 0 } : { s, x: m.x - V.cx - px * E1, y: m.y - V.cy - py * E1 };
         this.applyZoom();
         return;
       }
-      if (mode === 'crop') {
-        this.crop.move(e);
-        return;
-      }
+      if (mode === 'crop') return this.crop.move(e);
+      if (mode === 'blur') return this.blurOv.moveTo(e);
       if (mode === 'mask') {
         this.maskOv.move(e);
+        const m = this.selMask();
+        if (m && m.type === 'radial' && m.g.smart > 0) {
+          // selective point: show what's under the center while dragging
+          this.updateSmartRef(m);
+          this.loupe.color = rgbCss([m.g.sr, m.g.sg, m.g.sb]);
+          this.loupe.show(e.clientX, e.clientY);
+        }
         return;
       }
-      if (mode === 'paint') {
-        this.continueStroke(e);
-        return;
-      }
+      if (mode === 'paint') return this.continueStroke(e);
+      if (mode === 'pick') return this.pickAt(e);
       const dx = e.clientX - sx;
       const dy = e.clientY - sy;
-      if (mode === 'pending' && Math.hypot(dx, dy) > 9) {
+      if (mode === 'pending' && Math.hypot(dx, dy) > 8) {
         clearTimeout(holdTimer);
         const id = this.currentParam();
         if (!id) {
@@ -941,10 +999,13 @@ export class App {
           curVal = this.get(id);
           lastX = sx;
           lastT = e.timeStamp;
-          if (this.tool.kind === 'crop') this.crop.setGrid(true);
+          const d = this.def(id);
+          lastNotch = Math.floor((curVal - d.min) / ((d.max - d.min) / 50));
+          if (this.kind() === 'crop') this.crop.setGrid(true);
+          if (this.kind() === 'blur') this.blurOv.guides = true;
         } else if (this.params().length > 1) {
           mode = 'menu';
-          startIdx = this.paramIdx[this.tool.id] ?? 0;
+          startIdx = this.paramIdx[this.tool!.id] ?? 0;
           lastStep = startIdx;
           this.showMenu(true);
         } else mode = 'none';
@@ -952,32 +1013,37 @@ export class App {
       if (mode === 'value') {
         const id = this.currentParam()!;
         const d = this.def(id);
-        const range = (d.swipe ?? d.max - d.min) * 0.85;
-        const before = this.get(id);
-        // slow, careful swipes move the value more finely
+        const span = d.max - d.min;
+        const range = (d.swipe ?? span) * 1.15;
         const ddx = e.clientX - lastX;
-        const dt = Math.max(1, e.timeStamp - lastT);
-        const speed = Math.abs(ddx) / dt;
-        const fine = speed < 0.12 ? 0.4 : speed < 0.3 ? 0.7 : 1;
+        const speed = Math.abs(ddx) / Math.max(1, e.timeStamp - lastT);
+        const fine = speed < 0.06 ? 0.6 : 1;
         lastX = e.clientX;
         lastT = e.timeStamp;
+        const before = curVal;
         curVal += (ddx / st.clientWidth) * range * fine;
-        let v = curVal;
-        if (d.hue) v = curVal = ((v % 360) + 360) % 360;
+        if (d.hue) curVal = ((curVal % 360) + 360) % 360;
         else curVal = Math.min(d.max, Math.max(d.min, curVal));
-        this.set(id, v);
-        const after = this.get(id);
-        if ((before - d.def) * (after - d.def) < 0 || ((after === d.min || after === d.max) && before !== after)) buzz(8);
+        this.set(id, curVal);
+        // haptic notches: 50 across the range, a stronger one at the default and the ends
+        const notch = Math.floor((curVal - d.min) / (span / 50));
+        const crossedDefault = (before - d.def) * (curVal - d.def) < 0;
+        const hitEnd = (curVal === d.min || curVal === d.max) && before !== curVal;
+        if (crossedDefault || hitEnd) tick(true);
+        else if (notch !== lastNotch) tick();
+        lastNotch = notch;
         this.showHud(id);
-        this.updateParamBar();
+        $('paramValue').textContent = this.fmt(id);
+        if (this.kind() === 'blur') this.blurOv.draw();
       } else if (mode === 'menu') {
         const n = this.params().length;
-        // swiping up moves down the list (like scrolling content)
-        const i = Math.max(0, Math.min(n - 1, startIdx - Math.round((e.clientY - sy) / 40)));
+        // short steps so one swipe can travel the whole list; swiping up moves down it
+        const step = Math.max(15, Math.min(32, 210 / Math.max(1, n - 1)));
+        const i = Math.max(0, Math.min(n - 1, startIdx - Math.round((e.clientY - sy) / step)));
         if (i !== lastStep) {
           lastStep = i;
-          buzz(4);
-          this.paramIdx[this.tool.id] = i;
+          tick();
+          this.paramIdx[this.tool!.id] = i;
           this.highlightMenu(i);
         }
       }
@@ -993,34 +1059,43 @@ export class App {
       }
       if (mode === 'crop') {
         this.crop.end();
-        this.updateChrome();
+        this.updateSecBar();
+      } else if (mode === 'blur') {
+        this.blurOv.end();
+        this.updateSecBar();
       } else if (mode === 'mask') {
         this.maskOv.end();
         this.maskInteracting = false;
+        this.loupe.hide();
         this.requestRender();
       } else if (mode === 'paint') {
         this.endStroke();
+      } else if (mode === 'pick') {
+        this.endPick(true);
       } else if (mode === 'compare') {
         this.setCompare(false);
       } else if (mode === 'value' || mode === 'menu') {
         this.finishSwipe(mode);
       } else if (mode === 'pending' && e.type === 'pointerup') {
         const now = performance.now();
-        if (now - lastTap.t < 320 && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40) {
+        const near = Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < 40;
+        if (now - lastTap.t < 300 && near) {
+          // double tap: reset the current adjustment (and cancel the pending hide/show)
+          clearTimeout(tapTimer);
           const id = this.currentParam();
           if (id) {
             this.set(id, this.def(id).def);
             this.commit();
             this.showHud(id);
             this.hideHudSoon();
-            this.updateParamBar();
-            this.buildChips();
-            buzz(10);
+            this.refreshSection();
+            tick(true);
           }
           lastTap = { t: 0, x: 0, y: 0 };
         } else {
           lastTap = { t: now, x: e.clientX, y: e.clientY };
-          this.maskTap(e);
+          clearTimeout(tapTimer);
+          tapTimer = window.setTimeout(() => this.toggleUI(), 260);
         }
       }
       mode = 'none';
@@ -1028,35 +1103,36 @@ export class App {
     st.addEventListener('pointerup', up);
     st.addEventListener('pointercancel', up);
     st.addEventListener('contextmenu', (e) => e.preventDefault());
-    // desktop: wheel = zoom
     st.addEventListener('wheel', (e) => {
-      if (!this.img || this.tool.kind === 'crop') return;
+      if (!this.img || this.kind() === 'crop') return;
       e.preventDefault();
-      const { cx, cy } = center();
-      const s = Math.min(10, Math.max(1, this.zoom.s * Math.exp(-e.deltaY * 0.002)));
-      const px = (e.clientX - cx - this.zoom.x) / this.zoom.s;
-      const py = (e.clientY - cy - this.zoom.y) / this.zoom.s;
-      this.zoom = s === 1 ? { s: 1, x: 0, y: 0 } : { s, x: e.clientX - cx - px * s, y: e.clientY - cy - py * s };
+      const m = stageXY(e.clientX, e.clientY);
+      const V = this.view;
+      const s = Math.min(12, Math.max(1, this.zoom.s * Math.exp(-e.deltaY * 0.002)));
+      const E0 = V.base * this.zoom.s, E1 = V.base * s;
+      const px = (m.x - V.cx - this.zoom.x) / E0;
+      const py = (m.y - V.cy - this.zoom.y) / E0;
+      this.zoom = s === 1 ? { s: 1, x: 0, y: 0 } : { s, x: m.x - V.cx - px * E1, y: m.y - V.cy - py * E1 };
       this.applyZoom();
     }, { passive: false });
   }
 
   private finishSwipe(mode: 'value' | 'menu') {
     this.crop.setGrid(false);
+    this.blurOv.guides = false;
+    this.blurOv.draw();
     if (mode === 'value') {
       this.commit();
       this.hideHudSoon();
-      this.buildChips();
     } else {
       this.showMenu(false);
       const id = this.currentParam();
       if (id) {
         this.showHud(id);
-        this.hideHudSoon();
+        this.hideHudSoon(900);
       }
     }
-    this.updateParamBar();
-    this.updateChrome();
+    this.refreshSection();
   }
 
   /** Grab the crop box. With an uncropped frame, a drag in the middle straightens instead. */
@@ -1084,7 +1160,7 @@ export class App {
   private frameInfo() {
     const img = this.img;
     const f = img ? frameSize(this.state.geo, img.full.w, img.full.h) : { w: 1, h: 1 };
-    const crop = this.tool.kind === 'crop' ? { x: 0, y: 0, w: 1, h: 1 } : this.state.geo.crop;
+    const crop = this.kind() === 'crop' ? { x: 0, y: 0, w: 1, h: 1 } : this.state.geo.crop;
     return { crop, aspect: f.w / f.h };
   }
 
@@ -1092,63 +1168,85 @@ export class App {
     if (this.img) this.atlas.resize(this.frameInfo().aspect);
   }
 
-  private buildMaskChips() {
-    const row = $('chips');
-    const row2 = $('chips2');
-    const chip = (label: string, cls: string, onClick: () => void, target = row, html = false) => {
-      const b = document.createElement('button');
-      b.className = 'chip ' + cls;
-      if (html) b.innerHTML = label;
-      else b.textContent = label;
-      b.onclick = onClick;
-      target.appendChild(b);
-      return b;
-    };
-    if (this.maskAdding) {
-      const types: [string, string][] = [
-        ['radial', '◎ Radial'], ['linear', '▤ Gradient'], ['brush', '✎ Brush'], ['point', '⊙ Selective point'],
-        ['luma', '◐ Light range'], ['color', '◉ Color range'],
-      ];
-      for (const [t, label] of types) chip(label, 'act', () => this.addMask(t));
-      if (this.state.masks.length) chip('Cancel', 'act', () => {
-        this.maskAdding = false;
-        this.refreshPanel();
-      });
-      return;
-    }
-    chip('＋ Add', 'act hot', () => {
-      if (this.state.masks.length >= MAX_MASKS) return this.toast(`Up to ${MAX_MASKS} masks`);
-      this.maskAdding = true;
-      this.refreshPanel();
-    });
+  private maskIcon(m: Mask) {
+    if (m.type === 'radial' && m.g.smart > 0) return ICONS.mPoint;
+    return { radial: ICONS.mRadial, linear: ICONS.mLinear, brush: ICONS.mBrush, luma: ICONS.mLuma, color: ICONS.mColor }[m.type];
+  }
+
+  private buildMaskList() {
+    const row = $('subs');
+    this.tile(row, ICONS.plus, 'Add', 'add', () => this.openMaskSheet());
     this.state.masks.forEach((m, i) => {
-      const b = chip(`<span class="glyph">${MASK_GLYPH[m.type]}</span>${escapeHtml(m.name)}`, 'sel' + (i === this.maskSel ? ' on' : ''), () => {
+      this.tile(row, this.maskIcon(m), m.name, i === this.maskSel ? 'on' : '', () => {
         this.maskSel = i;
         this.paramIdx.masks = 0;
-        this.refreshPanel();
+        const t = this.selMask()!.type;
+        if (t === 'luma' || t === 'color') this.pickMode = 'swipe';
+        this.refreshSection();
         this.requestRender();
-      }, row, true);
-      if (m.invert) b.title = 'Inverted';
+      });
     });
+  }
+
+  private buildMaskActs() {
+    const row = $('acts');
     const m = this.selMask();
     if (!m) return;
+    const sep = () => row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
     if (m.type === 'brush') {
-      for (const [mode, label] of [['paint', '✎ Paint'], ['erase', '⌫ Erase'], ['swipe', '↔ Adjust']] as const) {
-        chip(label, 'sel' + (this.brushMode === mode ? ' on' : ''), () => {
-          this.brushMode = mode;
-          this.buildChips();
-        }, row2);
-      }
+      this.tile(row, ICONS.paint, 'Paint', this.brushMode === 'paint' ? 'on' : '', () => this.setBrushMode('paint'));
+      this.tile(row, ICONS.erase, 'Erase', this.brushMode === 'erase' ? 'on' : '', () => this.setBrushMode('erase'));
+      this.tile(row, ICONS.swipe, 'Adjust', this.brushMode === 'swipe' ? 'on' : '', () => this.setBrushMode('swipe'));
+      sep();
+    } else if (m.type === 'luma' || m.type === 'color') {
+      this.tile(row, ICONS.pick, 'Pick', this.pickMode === 'pick' ? 'on' : '', () => {
+        this.pickMode = 'pick';
+        this.toast('Drag on the photo to choose');
+        this.refreshSection();
+      });
+      this.tile(row, ICONS.swipe, 'Adjust', this.pickMode === 'swipe' ? 'on' : '', () => {
+        this.pickMode = 'swipe';
+        this.refreshSection();
+      });
+      sep();
     }
-    chip(ICONS.eye + 'Show', 'act' + (this.maskOverlayOn ? ' hot' : ''), () => {
+    this.tile(row, ICONS.eye, 'Show', this.maskOverlayOn ? 'hot' : '', () => {
       this.maskOverlayOn = !this.maskOverlayOn;
-      this.buildChips();
+      this.refreshSection();
       this.requestRender();
-    }, row2, true);
-    chip(m.invert ? 'Inverted' : 'Invert', 'act' + (m.invert ? ' hot' : ''), () => this.maskAction('invert'), row2);
-    chip('Duplicate', 'act', () => this.maskAction('dup'), row2);
-    chip('Reset', 'act', () => this.maskAction('reset'), row2);
-    chip('Delete', 'danger', () => this.maskAction('delete'), row2);
+    });
+    this.tile(row, ICONS.invert, 'Invert', m.invert ? 'hot' : '', () => this.maskAction('invert'));
+    this.tile(row, ICONS.duplicate, 'Copy', '', () => this.maskAction('dup'));
+    this.tile(row, ICONS.trash, 'Delete', 'danger', () => this.maskAction('delete'));
+  }
+
+  private setBrushMode(m: 'paint' | 'erase' | 'swipe') {
+    this.brushMode = m;
+    this.refreshSection();
+  }
+
+  private bindMaskSheet() {
+    const sheet = $('maskSheet');
+    const grid = $('maskGrid');
+    for (const k of MASK_KINDS) {
+      const b = document.createElement('button');
+      b.className = 'mask-tile';
+      b.innerHTML = `${k.icon}<b>${k.label}</b><span>${k.desc}</span>`;
+      b.onclick = () => {
+        tick();
+        sheet.classList.remove('on');
+        this.addMask(k.kind);
+      };
+      grid.appendChild(b);
+    }
+    sheet.onclick = (e) => {
+      if (e.target === sheet) sheet.classList.remove('on');
+    };
+  }
+
+  private openMaskSheet() {
+    if (this.state.masks.length >= MAX_MASKS) return this.toast(`Up to ${MAX_MASKS} masks per photo`);
+    $('maskSheet').classList.add('on');
   }
 
   private addMask(kind: string) {
@@ -1156,62 +1254,58 @@ export class App {
     const cx = crop.x + crop.w / 2, cy = crop.y + crop.h / 2;
     const type: MaskType = kind === 'point' ? 'radial' : (kind as MaskType);
     const g: Record<string, number> = {};
-    for (const k of MASK_TYPE_SETTINGS[type]) g[k] = MASK_SETTINGS[k].def;
+    for (const key of MASK_TYPE_SETTINGS[type]) g[key] = MASK_SETTINGS[key].def;
     const a: Record<string, number> = Object.fromEntries(MASK_ADJ.map((d) => [d.id, 0]));
     if (type === 'radial') {
-      const r = kind === 'point' ? 0.12 : 0.28 * crop.h;
+      const r = kind === 'point' ? 0.1 : 0.28 * crop.h;
       Object.assign(g, { cx, cy, rx: kind === 'point' ? r : Math.min(r * 1.25, (crop.w * aspect) / 2), ry: r, angle: 0 });
       if (kind === 'point') Object.assign(g, { smart: 55, feather: 75 });
     } else if (type === 'linear') {
       Object.assign(g, { x0: cx, y0: crop.y + crop.h * 0.08, x1: cx, y1: crop.y + crop.h * 0.5 });
     }
-    const n = this.state.masks.filter((m) => m.type === type).length + 1;
-    const name = kind === 'point' ? `Point ${n}` : `${MASK_LABEL[type]} ${n}`;
-    const id = Date.now() % 1e9;
-    const m: Mask = { id, type, name, invert: false, g, a, strokes: [] };
+    const n = this.state.masks.filter((m) => m.type === type && (kind === 'point') === (m.g.smart > 0)).length + 1;
+    const label = kind === 'point' ? 'Point' : MASK_LABEL[type].replace(' range', '');
+    const m: Mask = { id: Date.now() % 1e9, type, name: `${label} ${n}`, invert: false, g, a, strokes: [] };
     this.state.masks.push(m);
     this.maskSel = this.state.masks.length - 1;
-    this.maskAdding = false;
     this.paramIdx.masks = 0;
     if (type === 'radial' && g.smart > 0) this.updateSmartRef(m);
     if (type === 'brush') this.brushMode = 'paint';
+    if (type === 'luma' || type === 'color') this.pickMode = 'pick';
     this.commit();
-    this.refreshPanel();
+    this.refreshSection();
     this.requestRender();
     const tips: Record<string, string> = {
-      radial: 'Drag the center to move it, the white dots to resize and rotate',
-      point: 'Drag the point onto what you want to change — it follows similar colors',
-      linear: 'Drag the dots: full effect at the solid line, fading out to the dashed one',
-      brush: 'Paint over the area · two fingers to zoom · switch to Adjust to swipe values',
-      luma: 'Tap the photo to pick a brightness, or set the range below',
-      color: 'Tap the photo to pick a color',
+      radial: 'Drag the orange dot to move · white dots resize and rotate',
+      point: 'Drag the point onto what you want to change',
+      linear: 'Full effect at the solid line, fading out by the dashed one',
+      brush: 'Paint over the area · two fingers to zoom',
+      luma: 'Drag on the photo to choose a brightness',
+      color: 'Drag on the photo to choose a color',
     };
-    this.toast(tips[kind], 3200);
+    this.toast(tips[kind], 3000);
   }
 
   private maskAction(what: string) {
     const m = this.selMask();
     if (!m) return;
     if (what === 'invert') m.invert = !m.invert;
-    else if (what === 'reset') for (const k of Object.keys(m.a)) m.a[k] = 0;
     else if (what === 'dup') {
-      if (this.state.masks.length >= MAX_MASKS) return this.toast(`Up to ${MAX_MASKS} masks`);
+      if (this.state.masks.length >= MAX_MASKS) return this.toast(`Up to ${MAX_MASKS} masks per photo`);
       const c: Mask = JSON.parse(JSON.stringify(m));
       c.id = (Date.now() + 1) % 1e9;
-      c.name = m.name + ' copy';
+      c.name = m.name + '+';
       this.state.masks.splice(this.maskSel + 1, 0, c);
       this.maskSel++;
     } else if (what === 'delete') {
       this.state.masks.splice(this.maskSel, 1);
       this.maskSel = Math.min(this.maskSel, this.state.masks.length - 1);
-      if (!this.state.masks.length) this.maskAdding = true;
     }
     this.commit();
-    this.refreshPanel();
+    this.refreshSection();
     this.requestRender();
   }
 
-  /** Unedited pixels of the current (cropped) view, cached per geometry. */
   private analysisPixels() {
     const img = this.img!;
     const st = { ...defaultState(), geo: this.state.geo };
@@ -1224,14 +1318,13 @@ export class App {
     return this.analysisCache;
   }
 
-  /** The image color (pre-tone, perceptual) at a frame point — what the shader compares masks against. */
+  /** Image color (pre-tone, perceptual) at a frame point — what the shader compares masks against. */
   private colorAt(fx: number, fy: number): [number, number, number] {
     const A = this.analysisPixels();
     const c = this.state.geo.crop;
     const u = Math.min(1, Math.max(0, (fx - c.x) / c.w));
     const v = Math.min(1, Math.max(0, (fy - c.y) / c.h));
     const x = Math.min(A.w - 1, Math.floor(u * A.w)), y = Math.min(A.h - 1, Math.floor(v * A.h));
-    // average a small neighbourhood for stability
     let r = 0, g = 0, b = 0, n = 0;
     for (let yy = Math.max(0, y - 1); yy <= Math.min(A.h - 1, y + 1); yy++) {
       for (let xx = Math.max(0, x - 1); xx <= Math.min(A.w - 1, x + 1); xx++) {
@@ -1252,37 +1345,46 @@ export class App {
     m.g.sb = b;
   }
 
-  /** Tap with a light/color range mask selected → pick from the photo. */
-  private maskTap(e: PointerEvent) {
+  /** Live picking for light/color range masks, with the loupe above the finger. */
+  private pickAt(e: PointerEvent) {
     const m = this.selMask();
-    if (this.tool.kind !== 'masks' || !m || this.maskAdding || !this.img) return;
-    if (m.type !== 'luma' && m.type !== 'color') return;
+    if (!m || !this.img) return;
     const f = this.maskOv.toFrame(e.clientX, e.clientY);
-    if (f.u < 0 || f.u > 1 || f.v < 0 || f.v > 1) return;
     const [r, g, b] = this.colorAt(f.x, f.y);
     if (m.type === 'color') {
       const mx = Math.max(r, g, b), mn = Math.min(r, g, b), d = mx - mn;
-      if (d < 0.04) return this.toast('That spot has almost no color — pick a more colorful one');
-      let h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
-      h = (h * 60 + 360) % 360;
-      m.g.hue = Math.round(h);
+      if (d > 0.03) {
+        const h = mx === r ? ((g - b) / d) % 6 : mx === g ? (b - r) / d + 2 : (r - g) / d + 4;
+        m.g.hue = Math.round((h * 60 + 360) % 360);
+      }
     } else {
       const y = 0.2126 * r + 0.7152 * g + 0.0722 * b;
-      m.g.lo = Math.max(0, Math.round(y * 100 - 15));
-      m.g.hi = Math.min(100, Math.round(y * 100 + 15));
+      m.g.lo = Math.max(0, Math.round(y * 100 - 14));
+      m.g.hi = Math.min(100, Math.round(y * 100 + 14));
     }
-    buzz(8);
-    this.maskOverlayOn = true;
-    this.commit();
-    this.refreshPanel();
+    this.maskInteracting = true;
+    this.loupe.color = rgbCss([r, g, b]);
+    this.loupe.show(e.clientX, e.clientY);
+    this.requestRender();
+  }
+
+  private endPick(commit: boolean) {
+    this.loupe.hide();
+    this.maskInteracting = false;
+    if (commit) {
+      tick(true);
+      this.pickMode = 'swipe';
+      this.commit();
+      this.refreshSection();
+      this.toast('Swipe ↔ to adjust · Pick to choose again');
+    }
     this.requestRender();
   }
 
   // brush painting
   private stroke: Stroke | null = null;
   private brushRadius() {
-    const m = this.selMask();
-    const size = m?.g.size ?? 25;
+    const size = this.selMask()?.g.size ?? 25;
     return 0.006 + Math.pow(size / 100, 1.5) * 0.22;
   }
   private startStroke(e: PointerEvent) {
@@ -1317,6 +1419,7 @@ export class App {
     this.maskInteracting = false;
     this.hideBrushRing();
     this.commit();
+    this.updateSecBar();
     this.requestRender();
   }
   private cancelStroke() {
@@ -1338,25 +1441,10 @@ export class App {
   private hideBrushRing() {
     $('brushRing').classList.remove('on');
   }
-  /** Preview the brush size in the middle of the photo while changing it. */
-  private updateBrushRingSize() {
-    const id = this.currentParam();
-    if (id !== 'mg.size' || !this.img) return;
-    const ring = $('brushRing');
-    const r = this.brushRadius() * this.maskOv.pxPerFrameH();
-    const R = this.region();
-    ring.style.width = ring.style.height = r * 2 + 'px';
-    ring.style.transform = `translate(${R.cx - r}px, ${R.cy - r}px)`;
-    ring.classList.remove('erase');
-    ring.classList.add('on');
-    clearTimeout(this.ringTimer);
-    this.ringTimer = window.setTimeout(() => this.hideBrushRing(), 700);
-  }
-  private ringTimer = 0;
 
   /** Keep masks on the same content when the frame is rotated or flipped. */
   private transformMasks(kind: 'rot' | 'flipH' | 'flipV') {
-    const aspect = this.frameInfo().aspect; // before the change
+    const aspect = this.frameInfo().aspect;
     for (const m of this.state.masks) {
       const g = m.g;
       const pt = (x: number, y: number): [number, number] =>
@@ -1380,7 +1468,7 @@ export class App {
   }
 
   // -----------------------------------------------------------------------------------
-  // Tool actions
+  // Actions + section reset
 
   private action(id: string) {
     const v = this.state.v;
@@ -1388,15 +1476,6 @@ export class App {
     const setMany = (o: Record<string, number>) => Object.assign(v, o);
     const [kind, arg] = id.split(':');
     switch (kind) {
-      case 'auto':
-        this.autoTone();
-        break;
-      case 'autowb':
-        this.autoWB();
-        break;
-      case 'bw':
-        v.bw = v.bw > 0 ? 0 : 100;
-        break;
       case 'grain':
         setMany({
           fine: { grain: 20, grainSize: 12, grainRough: 25, grainColor: 0, grainShadows: 60, grainHighlights: 30 },
@@ -1440,27 +1519,56 @@ export class App {
         this.transformMasks('flipV');
         g.flipV = !g.flipV;
         break;
-      case 'resetTool': {
-        const t = this.tool;
-        const subs = t.subs ? t.subs.map((x) => x.id) : [''];
-        for (const sub of subs) for (const p of t.params(sub)) if (PARAM_MAP[p]) v[p] = PARAM_MAP[p].def;
-        this.toast(`${t.label} reset`);
+    }
+    this.commit();
+    this.requestRender();
+    this.refreshSection();
+  }
+
+  private resetSection() {
+    const t = this.tool;
+    if (!t) return;
+    const v = this.state.v;
+    const g = this.state.geo;
+    switch (t.kind) {
+      case 'looks':
+        if (this.look.base) {
+          const geo = this.state.geo;
+          const masks = this.state.masks;
+          this.state = cloneState(this.look.base);
+          this.state.geo = geo;
+          this.state.masks = masks;
+        }
+        this.look.idx = 0;
         break;
-      }
-      case 'cropReset':
-        // undo flips/turns on the masks first so they stay on their content
+      case 'masks':
+        this.state.masks = [];
+        this.maskSel = -1;
+        break;
+      case 'curves':
+        this.state.curves = defaultState().curves;
+        break;
+      case 'crop':
         if (g.flipH) this.transformMasks('flipH');
         if (g.flipV) this.transformMasks('flipV');
         for (let q = g.quarter; q % 4 !== 0; q++) this.transformMasks('rot');
         this.state.geo = defaultState().geo;
-        this.syncAtlasSize();
         v.straighten = 0;
         this.aspectId = 'free';
+        this.syncAtlasSize();
         break;
+      case 'blur':
+        for (const p of ['blurType', 'blurAmt', 'blurSize', 'blurFeather', 'blurAngle', 'blurX', 'blurY']) v[p] = PARAM_MAP[p].def;
+        break;
+      default: {
+        const subs = t.subs ? t.subs.map((x) => x.id) : [''];
+        for (const sub of subs) for (const p of t.params(sub)) v[p] = PARAM_MAP[p].def;
+      }
     }
     this.commit();
     this.requestRender();
-    this.refreshPanel();
+    this.refreshSection();
+    this.toast(`${t.label} reset`, 1200);
   }
 
   private aspectNorm(): number | null {
@@ -1480,88 +1588,24 @@ export class App {
     this.requestRender();
   }
 
-  private analysis() {
-    const img = this.img!;
-    const st = { ...defaultState(), geo: this.state.geo };
-    st.v.straighten = this.state.v.straighten;
-    const { w, h } = outputSize(st, img.thumb.w, img.thumb.h);
-    return this.pipe.analysisPixels(img.thumb, st, w, h);
-  }
-
-  private autoTone() {
-    if (!this.img) return;
-    const px = this.analysis();
-    const ys: number[] = [];
-    for (let i = 0; i < px.length; i += 4) ys.push(0.2126 * px[i] + 0.7152 * px[i + 1] + 0.0722 * px[i + 2]);
-    ys.sort((a, b) => a - b);
-    const q = (f: number) => ys[Math.min(ys.length - 1, Math.floor(f * ys.length))];
-    const med = Math.max(1e-4, q(0.5));
-    const ev = Math.max(-2, Math.min(2, Math.log2(0.16 / med) * 0.7));
-    const k = 2 ** ev;
-    const perc = (l: number) => Math.pow(Math.max(0, l * k), 1 / 2.2);
-    const hi = perc(q(0.985));
-    const lo = perc(q(0.02));
-    const v = this.state.v;
-    v.exposure = Math.round(ev * 100) / 100;
-    v.highlights = hi > 0.92 ? -Math.round(Math.min(70, (hi - 0.85) * 220)) : 0;
-    v.whites = hi < 0.86 ? Math.round(Math.min(45, (0.92 - hi) * 140)) : 0;
-    v.shadows = lo < 0.1 ? Math.round(Math.min(45, (0.14 - lo) * 260)) : 0;
-    v.blacks = lo > 0.12 ? -Math.round(Math.min(35, (lo - 0.06) * 110)) : 0;
-    v.contrast = Math.max(v.contrast, 8);
-    v.vibrance = Math.max(v.vibrance, 10);
-    this.toast('Auto adjusted');
-  }
-
-  /**
-   * Estimate white balance from pixels that are probably neutral (stone, cloud, walls):
-   * low saturation, not too dark, not clipped. Falls back to the brightest unclipped pixels.
-   */
-  private autoWB() {
-    if (!this.img) return;
-    const px = this.analysis();
-    const pick = (maxSat: number) => {
-      let R = 0, G = 0, B = 0, n = 0;
-      for (let i = 0; i < px.length; i += 4) {
-        const r = px[i], g = px[i + 1], b = px[i + 2];
-        const mx = Math.max(r, g, b), mn = Math.min(r, g, b);
-        if (mx > 0.97 || mx < 0.03) continue;
-        if ((mx - mn) / mx > maxSat) continue;
-        const w = mx; // brighter neutrals are more reliable
-        R += r * w;
-        G += g * w;
-        B += b * w;
-        n++;
-      }
-      return { R, G, B, n };
-    };
-    const total = px.length / 4;
-    let s = pick(0.18);
-    if (s.n < total * 0.01) s = pick(0.32);
-    if (s.n < total * 0.005) {
-      this.toast('No neutral areas found to set white balance');
-      return;
-    }
-    const A = Math.log2(s.G / Math.max(s.R, 1e-6));
-    const Bb = Math.log2(s.G / Math.max(s.B, 1e-6));
-    // analysis pixels are unedited, so this is an absolute setting
-    const t = (A - Bb) / 1.1;
-    const m = (A + Bb) / 1.3;
-    this.state.v.temp = Math.round(Math.max(-60, Math.min(60, t * 100 * 0.9)));
-    this.state.v.tint = Math.round(Math.max(-50, Math.min(50, m * 100 * 0.9)));
-    this.toast('White balance set');
-  }
-
   // -----------------------------------------------------------------------------------
-  // Looks
+  // Looks + presets
 
-  private allLooks(): Look[] {
-    return [...LOOKS, ...this.userLooks()];
+  private allLooks(): (Look & { user?: boolean })[] {
+    return [...LOOKS, ...this.userLooks().map((l) => ({ ...l, user: true }))];
   }
   private userLooks(): Look[] {
     try {
       return JSON.parse(localStorage.getItem('lumen.looks') || '[]');
     } catch {
       return [];
+    }
+  }
+  private setUserLooks(l: Look[]) {
+    try {
+      localStorage.setItem('lumen.looks', JSON.stringify(l));
+    } catch {
+      this.toast('Could not save presets on this device');
     }
   }
 
@@ -1583,66 +1627,144 @@ export class App {
     if (!L || !this.look.base) return;
     const geo = this.state.geo;
     const straighten = this.state.v.straighten;
+    const masks = this.state.masks;
     this.state = this.lookState(this.look.base, L, this.look.amt / 100);
     this.state.geo = geo;
+    this.state.masks = masks;
     this.state.v.straighten = straighten;
   }
 
-  private buildThumbs() {
+  private buildLooks() {
     if (!this.img) return;
+    const row = $('subs');
     const base = this.look.base ?? this.state;
     const looks = this.allLooks();
-    const key = JSON.stringify([base, looks.length, this.img.name]);
-    const row = $('looks');
-    if (key === this.thumbsKey && row.childElementCount === looks.length) {
-      this.markLooks();
-      return;
-    }
-    this.thumbsKey = key;
-    row.innerHTML = '';
     const img = this.img;
+    const save = document.createElement('button');
+    save.className = 'look save';
+    save.innerHTML = `<span class="th">${ICONS.plus}</span><small>Save</small>`;
+    save.onclick = () => {
+      tick();
+      this.openPresetSheet();
+    };
+    row.appendChild(save);
+    const canvases: HTMLCanvasElement[] = [];
     looks.forEach((L, i) => {
       const b = document.createElement('button');
-      b.className = 'look';
+      b.className = 'look' + (i === this.look.idx ? ' on' : '') + (L.user ? ' user' : '');
       const c = document.createElement('canvas');
       c.className = 'th';
+      canvases.push(c);
       b.appendChild(c);
-      b.appendChild(document.createTextNode(L.name));
+      const label = document.createElement('small');
+      label.textContent = L.name;
+      b.appendChild(label);
+      let press = 0;
+      let long = false;
+      b.onpointerdown = () => {
+        long = false;
+        if (L.user) {
+          press = window.setTimeout(() => {
+            long = true;
+            tick(true);
+            this.confirm(`Delete “${L.name}”?`, 'This removes the preset from this device.', () => {
+              const u = this.userLooks();
+              u.splice(i - LOOKS.length, 1);
+              this.setUserLooks(u);
+              if (this.look.idx === i) this.look.idx = 0;
+              this.thumbsKey = '';
+              this.refreshSection();
+            });
+          }, 550);
+        }
+      };
+      b.onpointerup = b.onpointerleave = () => clearTimeout(press);
       b.onclick = () => {
+        if (long) return;
+        tick();
         if (!this.look.base) this.look.base = cloneState(this.state);
         if (this.look.idx !== i) this.look.amt = 100;
         this.look.idx = i;
+        this.paramIdx.looks = 0;
         this.applyLookValues();
         this.commit();
         this.requestRender();
-        this.refreshPanel();
+        this.refreshSection();
       };
       row.appendChild(b);
     });
-    // render thumbnails progressively so the UI stays responsive
+    // thumbnails render progressively and are cached between rebuilds
+    const key = JSON.stringify([base.v, base.curves, base.geo, looks.length, img.name]);
+    if (key !== this.thumbsKey) {
+      this.thumbsKey = key;
+      this.thumbCache = [];
+    }
     let i = 0;
     const step = () => {
-      if (this.thumbsKey !== key || i >= looks.length || this.img !== img) return;
-      const st = this.lookState(base, looks[i], 1);
-      const { w, h } = outputSize(st, img.thumb.w, img.thumb.h);
-      const px = this.pipe.renderPixels(img.thumb, st, w, h);
-      const c = row.children[i]?.querySelector('canvas') as HTMLCanvasElement | null;
-      if (c) {
-        c.width = w;
-        c.height = h;
-        c.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(px.buffer), w, h), 0, 0);
-        c.style.objectFit = 'cover';
+      if (this.thumbsKey !== key || i >= looks.length || this.img !== img || this.kind() !== 'looks') return;
+      let data = this.thumbCache[i];
+      if (!data) {
+        const st = this.lookState(base, looks[i], 1);
+        const { w, h } = outputSize(st, img.thumb.w, img.thumb.h);
+        data = new ImageData(new Uint8ClampedArray(this.pipe.renderPixels(img.thumb, st, w, h).buffer), w, h);
+        this.thumbCache[i] = data;
+      }
+      const c = canvases[i];
+      if (c && c.isConnected) {
+        c.width = data.width;
+        c.height = data.height;
+        c.getContext('2d')!.putImageData(data, 0, 0);
       }
       i++;
-      requestAnimationFrame(step);
+      if (this.thumbCache[i]) step();
+      else requestAnimationFrame(step);
     };
     requestAnimationFrame(step);
-    this.markLooks();
   }
 
-  private markLooks() {
-    $('looks').querySelectorAll('.look').forEach((el, i) => el.classList.toggle('on', i === this.look.idx));
-    $('paramBar').classList.toggle('hidden', this.look.idx < 1);
+  private bindPresets() {
+    const sheet = $('presetSheet');
+    const input = $<HTMLInputElement>('presetName');
+    $('presetCancel').onclick = () => sheet.classList.remove('on');
+    sheet.onclick = (e) => {
+      if (e.target === sheet) sheet.classList.remove('on');
+    };
+    $('presetSave').onclick = () => {
+      const name = input.value.trim() || `Preset ${this.userLooks().length + 1}`;
+      const d = defaultValues();
+      const v: Record<string, number> = {};
+      for (const [k, x] of Object.entries(this.state.v)) {
+        if (!['straighten', 'distortion', 'blurX', 'blurY'].includes(k) && x !== d[k]) v[k] = x;
+      }
+      const looks = this.userLooks();
+      looks.push({ name, v, curves: this.state.curves });
+      this.setUserLooks(looks);
+      sheet.classList.remove('on');
+      this.thumbsKey = '';
+      tick(true);
+      this.toast(`Saved “${name}” · find it in Looks`);
+      if (this.kind() === 'looks') this.refreshSection();
+    };
+  }
+
+  private openPresetSheet() {
+    if (!this.img) return;
+    const input = $<HTMLInputElement>('presetName');
+    input.value = '';
+    $('presetSheet').classList.add('on');
+    setTimeout(() => input.focus(), 250);
+  }
+
+  private confirm(title: string, text: string, yes: () => void) {
+    const sheet = $('confirmSheet');
+    $('confirmTitle').textContent = title;
+    $('confirmText').textContent = text;
+    sheet.classList.add('on');
+    $('confirmNo').onclick = () => sheet.classList.remove('on');
+    $('confirmYes').onclick = () => {
+      sheet.classList.remove('on');
+      yes();
+    };
   }
 
   // -----------------------------------------------------------------------------------
@@ -1650,6 +1772,11 @@ export class App {
 
   private bindMore() {
     const sheet = $('moreSheet');
+    const setState = (id: string, on: boolean) => {
+      const el = $(id);
+      el.textContent = on ? 'On' : 'Off';
+      el.classList.toggle('on', on);
+    };
     $('btnMore').onclick = () => sheet.classList.add('on');
     sheet.onclick = (e) => {
       if (e.target === sheet) sheet.classList.remove('on');
@@ -1658,14 +1785,20 @@ export class App {
       b.onclick = () => {
         sheet.classList.remove('on');
         const a = b.dataset.a;
-        if (a === 'open') $('btnOpen').click();
+        if (a === 'open') return $('btnOpen').click();
+        if (a === 'openRaw') return $('btnOpenRaw').click();
+        if (a === 'hist') {
+          this.showHist = !this.showHist;
+          $('hist').classList.toggle('on', this.showHist);
+          setState('histState', this.showHist);
+          if (this.showHist) this.scheduleHist();
+          return;
+        }
         if (a === 'clip') {
           this.pipe.clip = !this.pipe.clip;
-          const st = $('clipState');
-          st.textContent = this.pipe.clip ? 'On' : 'Off';
-          st.classList.toggle('on', this.pipe.clip);
+          setState('clipState', this.pipe.clip);
           this.requestRender();
-          if (this.pipe.clip) this.toast('Clipped highlights show orange, clipped shadows cyan');
+          if (this.pipe.clip) this.toast('Blown highlights show orange, crushed shadows cyan');
           return;
         }
         if (!this.img) return;
@@ -1681,30 +1814,21 @@ export class App {
           this.state.curves = c.curves;
           this.commit();
           this.requestRender();
-          this.refreshPanel();
+          this.refreshSection();
           this.toast('Edits pasted');
         } else if (a === 'savePreset') {
-          const n = this.userLooks().length + 1;
-          const name = prompt('Name this look', `My look ${n}`) || `My look ${n}`;
-          const d = defaultValues();
-          const v: Record<string, number> = {};
-          for (const [k, x] of Object.entries(this.state.v)) {
-            if (k !== 'straighten' && k !== 'distortion' && x !== d[k]) v[k] = x;
-          }
-          const looks = this.userLooks();
-          looks.push({ name, v, curves: this.state.curves });
-          localStorage.setItem('lumen.looks', JSON.stringify(looks));
-          this.thumbsKey = '';
-          this.toast(`Saved “${name}” to Looks`);
+          this.openPresetSheet();
         } else if (a === 'resetAll') {
-          this.state = defaultState();
-          this.maskSel = -1;
-          this.syncAtlasSize();
-          this.aspectId = 'free';
-          this.look = { base: null, idx: -1, amt: 100 };
-          this.commit();
-          this.requestRender();
-          this.refreshPanel();
+          this.confirm('Reset all edits?', 'You can still undo this.', () => {
+            this.state = defaultState();
+            this.maskSel = -1;
+            this.aspectId = 'free';
+            this.look = { base: null, idx: -1, amt: 100 };
+            this.syncAtlasSize();
+            this.commit();
+            this.requestRender();
+            this.refreshSection();
+          });
         }
       };
     });
@@ -1713,31 +1837,29 @@ export class App {
   private bindKeys() {
     window.addEventListener('keydown', (e) => {
       if (!this.img || (e.target as HTMLElement).tagName === 'INPUT') return;
-      const id = this.currentParam();
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         this.restore(this.hIdx + (e.shiftKey ? 1 : -1));
         return;
       }
-      if (e.key === '\\') {
-        this.setCompare(!this.compare);
-        return;
-      }
+      if (e.key === '\\') return this.setCompare(!this.compare);
+      if (e.key === 'Escape' && this.tool) return this.setMode(null);
+      if (e.key === 'h') return this.toggleUI();
+      const id = this.currentParam();
       if (!id) return;
       const d = this.def(id);
       const n = this.params().length;
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault();
-        const i = Math.max(0, Math.min(n - 1, (this.paramIdx[this.tool.id] ?? 0) + (e.key === 'ArrowUp' ? -1 : 1)));
-        this.paramIdx[this.tool.id] = i;
-        this.updateParamBar();
+        this.paramIdx[this.tool!.id] = Math.max(0, Math.min(n - 1, (this.paramIdx[this.tool!.id] ?? 0) + (e.key === 'ArrowUp' ? -1 : 1)));
+        this.updateSecBar();
         this.showHud(this.currentParam()!);
         this.hideHudSoon();
       } else if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
         e.preventDefault();
         const step = ((d.max - d.min) / 200) * (e.shiftKey ? 10 : 1);
         this.set(id, this.get(id) + (e.key === 'ArrowRight' ? step : -step));
-        this.updateParamBar();
+        this.updateSecBar();
         this.showHud(id);
         this.hideHudSoon();
         this.commit();
@@ -1774,17 +1896,16 @@ export class App {
       $('exQVal').textContent = q.value;
     };
     $('exGo').onclick = () => this.doExport();
+    $('resultDone').onclick = () => $('resultSheet').classList.remove('on');
   }
 
   private exportDims(size: string) {
     const img = this.img!;
     const full = outputSize(this.state, img.full.w, img.full.h);
     const long = Math.max(full.w, full.h);
-    let target = size === 'full' ? long : +size;
+    const target = size === 'full' ? long : +size;
     let k = Math.min(1, target / long);
-    if (this.exportOpts.format === 'png' && full.w * full.h * k * k > CANVAS_LIMIT) {
-      k = Math.sqrt(CANVAS_LIMIT / (full.w * full.h));
-    }
+    if (this.exportOpts.format === 'png' && full.w * full.h * k * k > CANVAS_LIMIT) k = Math.sqrt(CANVAS_LIMIT / (full.w * full.h));
     return { w: Math.max(1, Math.round(full.w * k)), h: Math.max(1, Math.round(full.h * k)), k };
   }
 
@@ -1794,12 +1915,7 @@ export class App {
     const img = this.img!;
     const full = outputSize(this.state, img.full.w, img.full.h);
     const long = Math.max(full.w, full.h);
-    const opts = [
-      ['full', 'Full'],
-      ['4096', '4K'],
-      ['2048', 'Large'],
-      ['1080', 'Social'],
-    ].filter(([v]) => v === 'full' || +v < long);
+    const opts = [['full', 'Full'], ['4096', '4K'], ['2048', 'Large'], ['1080', 'Social']].filter(([v]) => v === 'full' || +v < long);
     if (!opts.some(([v]) => v === this.exportOpts.size)) this.exportOpts.size = 'full';
     for (const [v, label] of opts) {
       const d = this.exportDims(v);
@@ -1818,8 +1934,8 @@ export class App {
     const d = this.exportDims(this.exportOpts.size);
     $('exHint').textContent = isPng && d.k < 1 && this.exportOpts.size === 'full'
       ? 'PNG is limited to ~16 MP on phones; use JPEG for full resolution.'
-      : `${((d.w * d.h) / 1e6).toFixed(1)} MP · all edits applied at full quality`;
-    ($('exGo') as HTMLButtonElement).textContent = framed ? 'Export' : /iPhone|iPad|Android/i.test(navigator.userAgent) ? 'Save / Share' : 'Download';
+      : `${((d.w * d.h) / 1e6).toFixed(1)} MP · every edit applied at full quality`;
+    ($('exGo') as HTMLButtonElement).textContent = framed ? 'Export' : /iPhone|iPad|Android/i.test(navigator.userAgent) ? 'Save' : 'Download';
   }
 
   private async doExport() {
@@ -1827,37 +1943,31 @@ export class App {
     $('sheet').classList.remove('on');
     const img = this.img;
     const d = this.exportDims(this.exportOpts.size);
-    this.busy('Exporting… 0%');
+    this.busy('Exporting 0%');
     let tmp: Target | null = null;
     try {
-      // for big downscales, start from a smaller copy of the source to avoid aliasing
       let full = img.full;
       if (d.k < 0.5) {
         const kk = Math.min(1, d.k * 1.5);
         tmp = this.pipe.resize(img.full, Math.round(img.full.w * kk), Math.round(img.full.h * kk));
         full = { tex: tmp.tex, w: tmp.w, h: tmp.h, linear: img.full.linear };
       }
+      this.atlas.sync(this.state.masks);
+      this.pipe.brushTex = this.atlas.tex;
       const blob = await renderExport({
-        pipeline: this.pipe,
-        full,
-        analysis: img.preview,
-        state: this.state,
-        w: d.w,
-        h: d.h,
-        format: this.exportOpts.format,
-        quality: this.exportOpts.quality,
-        progress: (f) => this.busy(`Exporting… ${Math.round(f * 100)}%`),
+        pipeline: this.pipe, full, analysis: img.preview, state: this.state, w: d.w, h: d.h,
+        format: this.exportOpts.format, quality: this.exportOpts.quality,
+        progress: (f) => this.busy(`Exporting ${Math.round(f * 100)}%`),
       });
       if (tmp) {
         this.g.destroy(tmp);
         tmp = null;
       }
       this.busy(null);
-      const base = img.name.replace(/\.[^.]+$/, '');
-      const name = `${base}-lumen.${this.exportOpts.format === 'png' ? 'png' : 'jpg'}`;
+      const name = `${img.name.replace(/\.[^.]+$/, '')}-lumen.${this.exportOpts.format === 'png' ? 'png' : 'jpg'}`;
       const how = await saveOrShare(blob, name);
       if (how === 'shown') this.showResult(blob);
-      else this.toast(how === 'shared' ? 'Shared' : `Saved ${name} (${(blob.size / 1e6).toFixed(1)} MB)`);
+      else this.toast(how === 'shared' ? 'Shared' : `Saved ${name} · ${(blob.size / 1e6).toFixed(1)} MB`);
     } catch (e) {
       if ((e as Error).name !== 'AbortError') {
         console.error(e);
@@ -1872,14 +1982,11 @@ export class App {
   }
 
   private resultUrl = '';
-  /** Show the export so it can be saved with a long-press (when downloads are blocked). */
   private showResult(blob: Blob) {
     if (this.resultUrl) URL.revokeObjectURL(this.resultUrl);
     this.resultUrl = URL.createObjectURL(blob);
     $<HTMLImageElement>('resultImg').src = this.resultUrl;
-    const sheet = $('resultSheet');
-    sheet.classList.add('on');
-    $('resultDone').onclick = () => sheet.classList.remove('on');
+    $('resultSheet').classList.add('on');
   }
 
   // -----------------------------------------------------------------------------------
@@ -1903,4 +2010,8 @@ export class App {
 
 function escapeHtml(t: string) {
   return t.replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]!);
+}
+
+function rgbCss(c: number[]) {
+  return `rgb(${c.map((x) => Math.round(Math.min(1, Math.max(0, x)) * 255)).join(',')})`;
 }

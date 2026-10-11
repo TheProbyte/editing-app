@@ -5,35 +5,34 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 
 ## Using it
 
+Tap a tool in the bottom bar to open its section. Everything in a section is done on the photo:
+
 | Gesture | What it does |
 | --- | --- |
-| **Swipe up / down** on the photo | Move through the adjustments (swipe up = next one down the list) |
-| **Swipe left / right** on the photo | Decrease / increase it |
-| **Double-tap** the photo | Reset the current adjustment |
-| **Press & hold** the photo (or the compare button) | Show the original |
-| **Pinch** | Zoom in to check grain and detail |
-| Tap the adjustment name | Pick from a list |
-| Drag the slider | Set a value directly |
-| Tap the value | Type an exact number |
-| Swipe slowly | Finer control |
-
-Tools live in the bar at the bottom; chips above the slider switch sub-sections (colors in HSL,
-zones in Grading, channels in Curves, aspect ratios in Crop) or apply quick presets.
+| **Swipe left / right** | Change the adjustment (with haptic ticks; slow swipes are finer) |
+| **Swipe up / down** | Move through the adjustments (up = further down the list) |
+| **Tap** | Hide / show all controls |
+| **Double-tap** | Reset the current adjustment |
+| **Press & hold** | Show the original |
+| **Pinch** | Zoom |
+| Tap the value at the bottom | Type an exact number |
+| ✓ (bottom right) | Done — back to the tool bar · ↺ (bottom left) resets the section |
 
 ## Features
 
 - **Formats:** JPEG, HEIC (Safari), PNG, WebP, and **RAW** — DNG, CR2, CR3, NEF, ARW, RAF, ORF,
   RW2, PEF and more, decoded with LibRaw (WebAssembly) in 16-bit linear. If full RAW decoding
   isn't possible on a device, the camera's embedded full-size JPEG is used instead.
+- **Blur:** tilt-shift and radial focus blur with a draggable focus point (true linear-light lens blur).
 - **Masks & selective edits:** up to 8 per photo — Radial, Gradient, Brush (paint/erase with size,
   hardness, flow), Selective point (Snapseed-style, follows similar colors), Light range and Color
   range (tap the photo to pick). Each has Exposure, Contrast, Highlights, Shadows, Temperature,
   Tint, Saturation, Clarity and Dehaze, plus invert, strength, duplicate and a cyan overlay to see
-  exactly what's selected.
-- **Looks:** 17 film-style presets (Portra, CineStill 800T, Tri-X, Velvia, Chrome, Matte, Teal &
-  Orange, …) with a strength slider; save your own edits as a Look.
-- **Light:** Exposure, Contrast, Brightness, Highlights, Shadows, Whites, Blacks, one-tap Auto.
-- **Color:** Temperature, Tint, Vibrance, Saturation, Auto white balance.
+  exactly what's selected. Light/color picking shows a magnifier above your finger.
+- **Looks & presets:** 17 film-style looks (Portra, CineStill 800T, Tri-X, Velvia, Chrome, Matte, Teal &
+  Orange, …) with strength; save your own presets (long-press one to delete).
+- **Light:** Exposure, Contrast, Brightness, Highlights, Shadows, Whites, Blacks.
+- **Color:** Temperature, Tint, Vibrance, Saturation.
 - **Detail:** Sharpening (amount, radius, masking), Texture, Clarity, Dehaze, Noise reduction,
   Color noise reduction.
 - **Curves:** RGB + per-channel point curves with live histogram and presets.

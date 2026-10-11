@@ -1,23 +1,60 @@
 {
   "name": "Lumen Photo Editor",
   "short_name": "Lumen",
-  "description": "Pro photo editing on your phone — RAW, film grain, halation, curves and color grading.",
+  "description": "Photo editor for your phone \u2014 RAW, masks, blur, film grain, halation, curves and color.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
-  "background_color": "#0a0a0b",
-  "theme_color": "#0a0a0b",
+  "background_color": "#0b0a09",
+  "theme_color": "#0b0a09",
   "icons": [
-    { "src": "icon-192.png", "sizes": "192x192", "type": "image/png" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png" },
-    { "src": "icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" },
-    { "src": "icon.svg", "sizes": "any", "type": "image/svg+xml" }
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "maskable"
+    },
+    {
+      "src": "icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    }
   ],
   "file_handlers": [
     {
       "action": "./",
-      "accept": { "image/*": [".jpg", ".jpeg", ".png", ".heic", ".webp", ".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".orf", ".rw2"] }
+      "accept": {
+        "image/*": [
+          ".jpg",
+          ".jpeg",
+          ".png",
+          ".heic",
+          ".webp",
+          ".dng",
+          ".cr2",
+          ".cr3",
+          ".nef",
+          ".arw",
+          ".raf",
+          ".orf",
+          ".rw2"
+        ]
+      }
     }
+  ],
+  "display_override": [
+    "fullscreen",
+    "standalone"
   ]
 }

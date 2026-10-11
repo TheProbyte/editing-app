@@ -206,7 +206,7 @@ export class Pipeline {
   }
 
   private releaseFx(fx: ReturnType<Pipeline['effects']>) {
-    for (const t of [fx.hal, fx.hal2, fx.glow, fx.glow2]) this.g.release(t);
+    for (const t of [fx.hal, fx.hal2, fx.glow, fx.glow2, fx.blur1, fx.blur2]) this.g.release(t);
   }
 
   private releaseGlobals(glb: Globals) {
@@ -343,7 +343,14 @@ export class Pipeline {
     };
     const [hal, hal2] = make(v.halation, 0.35 + (v.halThreshold / 100) * 0.6, S * (0.003 + (v.halRadius / 100) ** 1.4 * 0.035), 3.5);
     const [glow, glow2] = make(v.glow, 0.25 + (v.glowThreshold / 100) * 0.65, S * (0.008 + (v.glowRadius / 100) ** 1.4 * 0.06), 3);
-    return { hal, hal2, glow, glow2 };
+    // lens blur in linear light, so bright points bloom like real bokeh
+    let blur1: Target | null = null, blur2: Target | null = null;
+    if (v.blurType > 0 && v.blurAmt > 0) {
+      const a = v.blurAmt / 100;
+      blur1 = this.blur(B, Math.max(1, S * 0.008 * a));
+      blur2 = this.blur(B, Math.max(2, S * 0.03 * a));
+    }
+    return { hal, hal2, glow, glow2, blur1, blur2 };
   }
 
   private finishPass(
@@ -364,6 +371,11 @@ export class Pipeline {
       this.g.bindTex(p, 'uHal2', fx.hal2 ? fx.hal2.tex : this.black);
       this.g.bindTex(p, 'uGlow', fx.glow ? fx.glow.tex : this.black);
       this.g.bindTex(p, 'uGlow2', fx.glow2 ? fx.glow2.tex : this.black);
+      this.g.bindTex(p, 'uBlur1', fx.blur1 ? fx.blur1.tex : this.black);
+      this.g.bindTex(p, 'uBlur2', fx.blur2 ? fx.blur2.tex : this.black);
+      gl.uniform1i(p.loc('uBlurType'), fx.blur1 ? Math.round(v.blurType) : 0);
+      gl.uniform4f(p.loc('uBlurP'), v.blurX, v.blurY, (v.blurSize / 100) * 0.6, 0.02 + (v.blurFeather / 100) * 0.5);
+      gl.uniform1f(p.loc('uBlurAngle'), (v.blurAngle * Math.PI) / 180);
       gl.uniform4f(p.loc('uBRect'), ...bRect);
       gl.uniform2f(p.loc('uBSize'), B.w, B.h);
       gl.uniform2f(p.loc('uFull'), full.w, full.h);

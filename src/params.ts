@@ -90,6 +90,14 @@ export const PARAMS: ParamDef[] = [
   p('ca', 'Color fringe', 0, 100),
   p('distortion', 'Distortion'),
   p('diffuse', 'Diffusion', 0, 100),
+  // Blur (tilt-shift / radial focus)
+  p('blurType', 'Blur type', 0, 2, 0),
+  p('blurAmt', 'Blur strength', 0, 100, 60),
+  p('blurSize', 'Focus size', 0, 100, 22),
+  p('blurFeather', 'Transition', 0, 100, 45),
+  p('blurAngle', 'Angle', -90, 90, 0, { fmt: (v) => Math.round(v) + '°' }),
+  p('blurX', 'Focus X', 0, 1, 0.5),
+  p('blurY', 'Focus Y', 0, 1, 0.55),
   // Geometry (crop tool)
   p('straighten', 'Straighten', -45, 45, 0, { fmt: straighten, swipe: 30 }),
   // Grading

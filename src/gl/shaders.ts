@@ -467,6 +467,10 @@ export const FINISH = COMMON + `
 uniform sampler2D uB;     // develop output (padded tile)
 uniform sampler2D uHal, uHal2;   // global halation blurs (core, wide)
 uniform sampler2D uGlow, uGlow2; // global glow blurs (core, wide)
+uniform sampler2D uBlur1, uBlur2; // global lens blurs (medium, large)
+uniform int uBlurType;            // 0 off, 1 tilt-shift, 2 radial
+uniform vec4 uBlurP;              // focus x, y, size, transition
+uniform float uBlurAngle;
 uniform vec4 uBRect;      // vUv -> B uv: offset.xy, scale.zw
 uniform vec2 uBSize;      // B texture pixel size
 uniform vec2 uFull;
@@ -522,6 +526,17 @@ void main() {
     c = vec3(texture(uB, bUv + sh).r, texture(uB, bUv).g, texture(uB, bUv - sh).b);
   } else {
     c = texture(uB, bUv).rgb;
+  }
+
+  if (uBlurType > 0) {
+    float aspect = uFull.x / uFull.y;
+    vec2 v = (gUv - uBlurP.xy) * vec2(aspect, 1.0);
+    float dist = uBlurType == 1 ? abs(dot(v, vec2(-sin(uBlurAngle), cos(uBlurAngle)))) : length(v);
+    float w = smoothstep(uBlurP.z, uBlurP.z + uBlurP.w, dist);
+    if (w > 0.0) {
+      c = mix(c, texture(uBlur1, gUv).rgb, smoothstep(0.0, 0.55, w));
+      c = mix(c, texture(uBlur2, gUv).rgb, smoothstep(0.45, 1.0, w));
+    }
   }
 
   if (uHalAmt > 0.0) {

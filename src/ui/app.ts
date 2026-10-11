@@ -25,7 +25,7 @@ import { tick } from './haptics';
 import { Camera } from './camera';
 import { isNative, Native, fileFromPath } from '../native';
 import { Segmenter, PEOPLE_PARTS, refineMask } from '../ai/segment';
-import { NeuralFill } from '../ai/neural';
+import { NeuralFill, LAMA_MB, type NeuralKind } from '../ai/neural';
 
 interface Img {
   full: Source;
@@ -137,6 +137,8 @@ export class App {
   private camera!: Camera;
   /** state when the open section was entered, for back-gesture cancel */
   private sectionStart = '';
+  /** how long GL start-up (creating the shader programs) took */
+  initMs = 0;
   private detailTimer = 0;
   /** full-res pixels of a region of the output, for deep zoom */
   private detail: { px: Uint8Array; x: number; y: number; w: number; h: number; W: number; H: number; ver: number } | null = null;
@@ -144,8 +146,10 @@ export class App {
   private zv: { img: ImageData | null; on: boolean } = { img: null, on: false };
 
   constructor() {
+    const t0 = performance.now();
     try {
       this.initGL();
+      this.initMs = Math.round(performance.now() - t0);
     } catch (e) {
       this.fatal((e as Error).message);
       return;
@@ -379,6 +383,27 @@ export class App {
     return this.tool?.kind ?? null;
   }
 
+  /** On-screen render scale (<= 1): the preview is rendered at about the size it's shown at. */
+  private rs = 1;
+  private wantRs() {
+    if (!this.img) return 1;
+    const fw = parseFloat(this.frame.style.width);
+    if (!fw) return 1;
+    const shown = fw * this.view.base * this.zoom.s * (window.devicePixelRatio || 1); // device px across the photo
+    const fullW = outputSize(this.viewState(), this.img.preview.w, this.img.preview.h).w;
+    const need = (shown / fullW) * 1.04;
+    let lv = [0.4, 0.55, 0.7, 0.85, 1].find((l) => l >= need) ?? 1;
+    if (lv < this.rs && need > this.rs * 0.8) lv = this.rs; // don't flip-flop at the edge of a level
+    return lv;
+  }
+  private syncRenderScale() {
+    const n = this.wantRs();
+    if (n !== this.rs) {
+      this.rs = n;
+      this.requestRender();
+    }
+  }
+
   /** What's on screen: the edit, the original (compare), or the uncropped frame (crop section). */
   private viewState(): EditState {
     let s = this.state;
@@ -392,7 +417,9 @@ export class App {
   private renderNow() {
     if (!this.img) return;
     const st = this.viewState();
-    const { w, h } = outputSize(st, this.img.preview.w, this.img.preview.h);
+    const full = outputSize(st, this.img.preview.w, this.img.preview.h);
+    // render only as many pixels as the screen can show (a big saving while dragging sliders)
+    const w = Math.max(1, Math.round(full.w * this.rs)), h = Math.max(1, Math.round(full.h * this.rs));
     if (this.canvas.width !== w || this.canvas.height !== h) {
       this.canvas.width = w;
       this.canvas.height = h;
@@ -648,6 +675,7 @@ export class App {
       }, 280);
     }
     this.frame.style.transform = `translate(${V.cx + z.x}px, ${V.cy + z.y}px) scale(${V.base * z.s}) translate(-50%, -50%)`;
+    this.syncRenderScale();
     const b = $('zoomBadge');
     b.classList.toggle('on', z.s > 1.01);
     if (z.s > 1.01) b.textContent = this.img && this.pxPerOut() * z.s >= 1 ? `${Math.round(this.pxPerOut() * z.s * 100)}%` : Math.round(z.s * 100) + '%';
@@ -684,6 +712,10 @@ export class App {
     this.history = this.history.slice(0, this.hIdx + 1);
     this.history.push(s);
     if (this.history.length > 200) this.history.shift();
+    // brush-heavy edits make big states: keep the whole history under ~60 MB of text
+    let size = 0;
+    for (const h of this.history) size += h.length;
+    while (size > 60_000_000 && this.history.length > 3) size -= this.history.shift()!.length;
     this.hIdx = this.history.length - 1;
     this.updateChrome();
     if (this.img) {
@@ -1250,6 +1282,7 @@ export class App {
     } else {
       this.sub[t.id] = id;
       if (t.kind === 'heal') {
+        if (id === 'fill') this.askFillModel();
         this.spotSel = -1;
         this.toast(id === 'fill' ? 'Paint over the object · let go and the AI rebuilds what’s behind it' : 'Paint over a blemish · drag the yellow copy to pick the source', 3000);
         this.healOv.draw();
@@ -3192,15 +3225,8 @@ export class App {
       const st = { ...defaultState(), geo: { ...this.state.geo, crop: { x: 0, y: 0, w: 1, h: 1 } } };
       st.v.straighten = this.state.v.straighten;
       const { w: W, h: H } = outputSize(st, img.preview.w, img.preview.h);
-      const lin = this.pipe.analysisPixels(img.preview, st, W, H);
-      const rgba = new Uint8ClampedArray(W * H * 4);
-      const enc = (l: number) => (l <= 0.0031308 ? l * 12.92 : 1.055 * Math.pow(Math.max(0, l), 1 / 2.4) - 0.055) * 255;
-      for (let i = 0; i < W * H; i++) {
-        rgba[i * 4] = enc(lin[i * 4]);
-        rgba[i * 4 + 1] = enc(lin[i * 4 + 1]);
-        rgba[i * 4 + 2] = enc(lin[i * 4 + 2]);
-        rgba[i * 4 + 3] = 255;
-      }
+      const rgba = new Uint8ClampedArray(this.pipe.renderPixels(img.preview, st, W, H).buffer);
+      for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
       // what to remove: the painted strokes
       const mc = document.createElement('canvas');
       mc.width = W;
@@ -3223,32 +3249,39 @@ export class App {
       const mask = new Uint8Array(W * H);
       for (let i = 0; i < mask.length; i++) mask[i] = md[i * 4] > 127 ? 1 : 0;
 
-      let out: Uint8ClampedArray;
-      try {
-        // the neural network (MI-GAN); it keeps the originals' copies so the classic fill can step in
-        out = await this.neural.fill(rgba.slice(), W, H, mask.slice(), (m) => this.busy(m));
-      } catch (err) {
-        console.warn('Neural fill failed, using the classic fill', err);
-        this.toast('The AI model couldn’t run here, so the classic fill was used', 3500);
+      let out: Uint8ClampedArray | null = null;
+      const first: NeuralKind = this.fillModel() === 'lama' ? 'lama' : 'migan';
+      for (const kind of first === 'lama' ? (['lama', 'migan'] as const) : (['migan'] as const)) {
+        try {
+          // each attempt gets its own copies, so a failed one doesn't use up the pixels
+          out = await this.neural.fill(kind, rgba.slice(), W, H, mask.slice(), (m) => this.busy(m));
+          break;
+        } catch (err) {
+          console.warn(`${kind} fill failed`, err);
+          if (kind === 'lama') this.toast(`LaMa couldn’t run (${(err as Error).message}) — using the built-in model`, 4500);
+        }
+      }
+      if (!out) {
+        this.toast('The AI models couldn’t run here, so the classic fill was used', 3500);
         this.busy('Filling');
-      out = await new Promise<Uint8ClampedArray>((res, rej) => {
-        const wk = new Worker(new URL('../ai/inpaintWorker.ts', import.meta.url), { type: 'module' });
-        wk.onmessage = (e) => {
-          if (e.data.progress !== undefined) this.busy(`Filling ${Math.round(e.data.progress * 100)}%`);
-          else if (e.data.done) {
-            res(e.data.done);
+        out = await new Promise<Uint8ClampedArray>((res, rej) => {
+          const wk = new Worker(new URL('../ai/inpaintWorker.ts', import.meta.url), { type: 'module' });
+          wk.onmessage = (e) => {
+            if (e.data.progress !== undefined) this.busy(`Filling ${Math.round(e.data.progress * 100)}%`);
+            else if (e.data.done) {
+              res(e.data.done);
+              wk.terminate();
+            } else if (e.data.error) {
+              rej(new Error(e.data.error));
+              wk.terminate();
+            }
+          };
+          wk.onerror = (e) => {
+            rej(new Error(e.message || 'Fill failed'));
             wk.terminate();
-          } else if (e.data.error) {
-            rej(new Error(e.data.error));
-            wk.terminate();
-          }
-        };
-        wk.onerror = (e) => {
-          rej(new Error(e.message || 'Fill failed'));
-          wk.terminate();
-        };
-        wk.postMessage({ rgba, w: W, h: H, mask }, [rgba.buffer]);
-      });
+          };
+          wk.postMessage({ rgba, w: W, h: H, mask }, [rgba.buffer]);
+        });
       }
       if (this.img !== img) return;
       const gl = this.g.gl;
@@ -3673,16 +3706,55 @@ export class App {
     setTimeout(() => input.focus(), 250);
   }
 
-  private confirm(title: string, text: string, yes: () => void) {
+  private confirm(title: string, text: string, yes: () => void, o: { yes?: string; no?: string; onNo?: () => void } = {}) {
     const sheet = $('confirmSheet');
     $('confirmTitle').textContent = title;
     $('confirmText').textContent = text;
+    $('confirmYes').textContent = o.yes ?? 'Delete';
+    $('confirmNo').textContent = o.no ?? 'Cancel';
     sheet.classList.add('on');
-    $('confirmNo').onclick = () => sheet.classList.remove('on');
+    $('confirmNo').onclick = () => {
+      sheet.classList.remove('on');
+      o.onNo?.();
+    };
     $('confirmYes').onclick = () => {
       sheet.classList.remove('on');
       yes();
     };
+  }
+
+  // ---- which model does AI fill use? LaMa (best, downloaded once) or the small built-in one
+
+  private fillModel(): NeuralKind | null {
+    try {
+      const v = localStorage.getItem('lumen.fillModel');
+      return v === 'lama' || v === 'migan' ? v : null;
+    } catch {
+      return null;
+    }
+  }
+  private setFillModel(k: NeuralKind) {
+    try {
+      localStorage.setItem('lumen.fillModel', k);
+    } catch {
+      /* not saved */
+    }
+    this.renderFillModel();
+  }
+  private renderFillModel() {
+    const k = this.fillModel();
+    const el = $('fillModelState');
+    el.textContent = k === 'lama' ? 'LaMa' : k === 'migan' ? 'Built-in' : 'Ask';
+    el.classList.toggle('on', k === 'lama');
+  }
+  private askFillModel() {
+    if (this.fillModel()) return;
+    this.confirm(
+      'Use LaMa for AI fill?',
+      `LaMa gives the best results. It needs a one-time ${LAMA_MB} MB download, then works offline. Otherwise a smaller built-in model is used (you can switch in the ⋯ menu).`,
+      () => this.setFillModel('lama'),
+      { yes: 'Use LaMa', no: 'Built-in', onNo: () => this.setFillModel('migan') },
+    );
   }
 
   // -----------------------------------------------------------------------------------
@@ -3696,6 +3768,7 @@ export class App {
       el.classList.toggle('on', on);
     };
     if (isNative || !/Android/i.test(navigator.userAgent)) $('getApp').style.display = 'none';
+    this.renderFillModel();
     $('btnMore').onclick = () => sheet.classList.add('on');
     sheet.onclick = (e) => {
       if (e.target === sheet) sheet.classList.remove('on');
@@ -3706,6 +3779,12 @@ export class App {
         const a = b.dataset.a;
         if (a === 'open') return this.pickPhoto();
         if (a === 'camera') return this.takePhoto();
+        if (a === 'aimodel') {
+          const next: NeuralKind = this.fillModel() === 'lama' ? 'migan' : 'lama';
+          this.setFillModel(next);
+          this.toast(next === 'lama' ? `AI fill uses LaMa (one-time ${LAMA_MB} MB download on first use)` : 'AI fill uses the small built-in model', 3200);
+          return;
+        }
         if (a === 'getApp') {
           const a2 = document.createElement('a');
           a2.href = 'lumen.apk';

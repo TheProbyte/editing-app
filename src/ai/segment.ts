@@ -44,6 +44,15 @@ function fileset() {
   return { wasmLoaderPath: base + 'vision_wasm_internal.js', wasmBinaryPath: base + 'vision_wasm_internal.wasm' };
 }
 
+/** Is this model already stored on the device (so using it needs no download)? */
+export async function isModelCached(url: string) {
+  try {
+    return !!(await (await caches.open(CACHE)).match(url));
+  } catch {
+    return false;
+  }
+}
+
 export async function fetchModel(url: string, progress: (f: number) => void): Promise<Uint8Array> {
   let cache: Cache | null = null;
   try {
@@ -57,27 +66,28 @@ export async function fetchModel(url: string, progress: (f: number) => void): Pr
   if (!r.ok || !r.body) throw new Error(`Model download failed (${r.status})`);
   const total = +(r.headers.get('content-length') ?? 0);
   const reader = r.body.getReader();
-  const parts: Uint8Array[] = [];
+  // with a known size, fill one buffer as the data arrives (no second copy of a 200 MB file)
+  let buf = new Uint8Array(total || 1 << 26);
   let got = 0;
   for (;;) {
     const { done, value } = await reader.read();
     if (done) break;
-    parts.push(value);
+    if (got + value.length > buf.length) {
+      const bigger = new Uint8Array(Math.max(buf.length * 2, got + value.length));
+      bigger.set(buf.subarray(0, got));
+      buf = bigger;
+    }
+    buf.set(value, got);
     got += value.length;
     if (total) progress(got / total);
   }
-  const buf = new Uint8Array(got);
-  let o = 0;
-  for (const p of parts) {
-    buf.set(p, o);
-    o += p.length;
-  }
+  const out = got === buf.length ? buf : buf.subarray(0, got);
   try {
-    await cache?.put(url, new Response(buf, { headers: { 'content-type': 'application/octet-stream' } }));
+    await cache?.put(url, new Response(out, { headers: { 'content-type': 'application/octet-stream' } }));
   } catch {
     /* storage full: fine, we just download again next time */
   }
-  return buf;
+  return out;
 }
 
 export class Segmenter {

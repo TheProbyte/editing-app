@@ -17,18 +17,36 @@ void main() {
 export class Program {
   prog: WebGLProgram;
   private locs = new Map<string, WebGLUniformLocation | null>();
-  constructor(private gl: WebGL2RenderingContext, frag: string, name: string) {
-    const vs = compile(gl, gl.VERTEX_SHADER, VERT, name);
-    const fs = compile(gl, gl.FRAGMENT_SHADER, frag, name);
+  private checked = false;
+  private vs: WebGLShader;
+  private fs: WebGLShader;
+  /**
+   * Compiling and linking are only *started* here; `check()` waits for the result. Creating all
+   * the programs first and checking afterwards lets the driver build them in parallel.
+   */
+  constructor(private gl: WebGL2RenderingContext, frag: string, private name: string) {
+    this.vs = compile(gl, gl.VERTEX_SHADER, VERT);
+    this.fs = compile(gl, gl.FRAGMENT_SHADER, frag);
     const prog = gl.createProgram()!;
-    gl.attachShader(prog, vs);
-    gl.attachShader(prog, fs);
+    gl.attachShader(prog, this.vs);
+    gl.attachShader(prog, this.fs);
     gl.bindAttribLocation(prog, 0, 'aPos');
     gl.linkProgram(prog);
-    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
-      throw new Error(`Link failed (${name}): ${gl.getProgramInfoLog(prog)}`);
-    }
     this.prog = prog;
+    if (Program.serial) this.check();
+  }
+  /** `?serialCompile` in the URL: check each program as it's created (to compare start-up times). */
+  static serial = typeof location !== 'undefined' && /[?&]serialCompile/.test(location.search);
+  check() {
+    if (this.checked) return;
+    const gl = this.gl;
+    for (const [s, kind] of [[this.vs, 'vertex'], [this.fs, 'fragment']] as const) {
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(`Shader compile failed (${this.name}, ${kind}): ${gl.getShaderInfoLog(s)}`);
+    }
+    if (!gl.getProgramParameter(this.prog, gl.LINK_STATUS)) throw new Error(`Link failed (${this.name}): ${gl.getProgramInfoLog(this.prog)}`);
+    gl.deleteShader(this.vs);
+    gl.deleteShader(this.fs);
+    this.checked = true;
   }
   loc(n: string) {
     if (!this.locs.has(n)) this.locs.set(n, this.gl.getUniformLocation(this.prog, n));
@@ -36,14 +54,10 @@ export class Program {
   }
 }
 
-function compile(gl: WebGL2RenderingContext, type: number, src: string, name: string) {
+function compile(gl: WebGL2RenderingContext, type: number, src: string) {
   const s = gl.createShader(type)!;
   gl.shaderSource(s, src);
   gl.compileShader(s);
-  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
-    const log = gl.getShaderInfoLog(s);
-    throw new Error(`Shader compile failed (${name}): ${log}`);
-  }
   return s;
 }
 
@@ -131,6 +145,7 @@ export class GL {
 
   draw(prog: Program, target: Target | null, w: number, h: number, setup: (p: Program) => void) {
     const gl = this.gl;
+    prog.check();
     gl.useProgram(prog.prog);
     gl.bindFramebuffer(gl.FRAMEBUFFER, target ? target.fbo : null);
     gl.viewport(0, 0, w, h);

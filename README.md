@@ -31,10 +31,14 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 - **Remove:** press on a blemish, slide to place it (a loupe shows it close up), let go to remove it.
   Each fix shows where it copied from — drag that yellow ring to choose the source yourself (e.g. a clean
   bit of chain over a necklace clasp); Auto fill and Delete for the selected spot.
-- **AI fill (in Remove):** paint over an object and let go: a neural network (MI-GAN) rebuilds what's
-  behind it, on the phone. The 28 MB model ships with the app (`public/models/migan.onnx`) and runs with
-  ONNX Runtime Web (one thread; `public/ort/` is copied from `node_modules` at build). If the model can't
-  run on a device, it falls back to a classic PatchMatch fill (`src/ai/inpaint.ts`).
+- **AI fill (in Remove):** paint over an object and let go: a neural network rebuilds what's behind it,
+  on the phone. Two models (More ⋯ → *AI fill model*):
+  - **LaMa** (big-lama, Apache-2.0) — the best quality. 208 MB, downloaded once from Hugging Face the first
+    time you use it (the app asks), then kept on the device and used offline.
+  - **MI-GAN** (Picsart AI Research, MIT) — small (28 MB), ships with the app (`public/models/migan.onnx`).
+    Used when LaMa isn't chosen/downloaded or can't run.
+  Both run with ONNX Runtime Web in a worker (`public/ort/` is copied from `node_modules` at build). If neither
+  can run, a classic PatchMatch fill (`src/ai/inpaint.ts`) steps in.
 - **Light leaks:** 22 built-in leaks (flares, burns, prisms, streaks, orbs) drawn on the fly; move, scale,
   rotate (drag, corner square or pinch), blend modes, and a Hide/Show brush.
 - **Double exposure:** add a second photo, drag to place it, size/rotate/opacity, 9 blend modes, and
@@ -113,8 +117,8 @@ Code map:
 
 ## Credits and licences
 
-- **MI-GAN** (Picsart AI Research, MIT) — the `migan_pipeline_v2.onnx` weights used for AI fill, taken from the
-  `migan-onnx` npm package. The weights were trained on Places2 / FFHQ research datasets, so treat this as a
+- **MI-GAN** (Picsart AI Research, MIT) — the `migan_pipeline_v2.onnx` weights used for the built-in AI fill, taken from the
+  `migan-onnx` npm package. **LaMa** (Samsung AI Center, Apache-2.0) is fetched on request. The weights were trained on Places2 / FFHQ research datasets, so treat this as a
   personal-use app.
 - **LibRaw** (via `libraw-wasm`), **MediaPipe Tasks Vision** (Apache-2.0) for subject / people selection,
   **ONNX Runtime Web** (MIT), Pixelify Sans and Silkscreen (OFL).

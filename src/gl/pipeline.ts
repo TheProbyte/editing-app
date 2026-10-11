@@ -15,9 +15,10 @@ interface Globals {
   w: number;
   h: number;
   A: Target;
-  texB: Target;
-  clarB: Target;
-  largeB: Target;
+  /** Large blurs for texture / clarity / dehaze / diffusion; only made when one of those is in use. */
+  texB: Target | null;
+  clarB: Target | null;
+  largeB: Target | null;
 }
 
 interface Tile {
@@ -44,6 +45,9 @@ export function outputSize(state: EditState, w: number, h: number) {
   };
 }
 
+/** Settings only the finish pass reads (halation/glow/blur *amounts* are checked separately). */
+const FINISH_ONLY = /^(halation|halThreshold|halRadius|halHue|halSat|glow|glowThreshold|glowRadius|glowWarmth|vig\w*|grain\w*|ca|blur(Type|Amt|Size|Feather|Angle|X|Y))$/;
+
 export class Pipeline {
   g: GL;
   private geo: Program;
@@ -64,6 +68,8 @@ export class Pipeline {
   showMask = -1;
   /** Highlight clipped highlights/shadows on screen. */
   clip = false;
+  /** Tests: always build the big blurs, to compare against the lazy path. */
+  forceBlurs = false;
   /** Double exposure: the second photo's texture (sRGB) and its hide-brush (atlas, red channel). */
   overlay: { tex: WebGLTexture; id: string } | null = null;
   /** Light leak texture (procedural) */
@@ -82,6 +88,8 @@ export class Pipeline {
     this.bright = new Program(gl, BRIGHT, 'bright');
     this.dev = new Program(gl, DEVELOP, 'develop');
     this.fin = new Program(gl, FINISH, 'finish');
+    // all six were started above; now wait for them together
+    for (const p of [this.geo, this.down, this.blurP, this.bright, this.dev, this.fin]) p.check();
     this.lut = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.lut);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, LUT_SIZE, 1);
@@ -101,6 +109,23 @@ export class Pipeline {
     }
     this.globals = null;
     this.clearSmall();
+    this.clearFx();
+  }
+
+  private fxCache = new Map<string, { key: string; a: Target | null; b: Target | null }>();
+  private clearFx() {
+    for (const c of this.fxCache.values()) {
+      this.g.release(c.a);
+      this.g.release(c.b);
+    }
+    this.fxCache.clear();
+  }
+
+  /** Everything that decides what the developed image looks like (i.e. all but the finish-pass settings). */
+  private devKey(state: EditState, geoKey: string) {
+    const v: Record<string, number> = {};
+    for (const k in state.v) if (!FINISH_ONLY.test(k)) v[k] = state.v[k];
+    return JSON.stringify([geoKey, v, state.curves, state.masks, this.showMask]);
   }
 
   private clearSmall() {
@@ -263,21 +288,32 @@ export class Pipeline {
   /** The full-frame analysis image and its large blurs, at (w, h). Cached by geometry. */
   private ensureGlobals(src: Source, state: EditState, w: number, h: number, cache = true): Globals {
     const key = this.geoKey(src, state, w, h);
-    if (cache && this.globals && this.globals.key === key) return this.globals;
+    if (cache && this.globals && this.globals.key === key) {
+      this.ensureBlurs(this.globals, state);
+      return this.globals;
+    }
     const A = this.g.acquire(w, h);
     this.geometryPass(src, state, { w, h }, { x: 0, y: 0, w, h }, A);
-    const S = Math.min(w, h);
-    const glb: Globals = {
-      key, w, h, A,
-      texB: this.blur(A, S * 0.004),
-      clarB: this.blur(A, S * 0.02),
-      largeB: this.blur(A, S * 0.06),
-    };
+    const glb: Globals = { key, w, h, A, texB: null, clarB: null, largeB: null };
+    this.ensureBlurs(glb, state);
     if (cache) {
       if (this.globals) this.invalidate();
       this.globals = glb;
     }
     return glb;
+  }
+
+  private ensureBlurs(glb: Globals, state: EditState) {
+    if (glb.texB) return;
+    const v = state.v;
+    // everything in the develop shader that reads the blurred copies (see yTex / yClar / yLarge there)
+    const need = v.texture !== 0 || v.clarity !== 0 || v.dehaze !== 0 || v.diffuse > 0 || v.shadows !== 0 || v.highlights !== 0 ||
+      v.colorDenoise > 0 || v.sharpenMask > 0 || (state.masks ?? []).length > 0;
+    if (!need && !this.forceBlurs) return;
+    const S = Math.min(glb.w, glb.h);
+    glb.texB = this.blur(glb.A, S * 0.004);
+    glb.clarB = this.blur(glb.A, S * 0.02);
+    glb.largeB = this.blur(glb.A, S * 0.06);
   }
 
   private releaseFx(fx: ReturnType<Pipeline['effects']>) {
@@ -349,9 +385,10 @@ export class Pipeline {
       this.g.bindTex(p, 'uA', A.tex);
       this.g.bindTex(p, 'uSharpB', small.sharp.tex);
       this.g.bindTex(p, 'uNoiseB', small.noise.tex);
-      this.g.bindTex(p, 'uTexB', glb.texB.tex);
-      this.g.bindTex(p, 'uClarB', glb.clarB.tex);
-      this.g.bindTex(p, 'uLargeB', glb.largeB.tex);
+      // unused (and not computed) while texture / clarity / dehaze / diffusion are off
+      this.g.bindTex(p, 'uTexB', (glb.texB ?? A).tex);
+      this.g.bindTex(p, 'uClarB', (glb.clarB ?? A).tex);
+      this.g.bindTex(p, 'uLargeB', (glb.largeB ?? A).tex);
       this.g.bindTex(p, 'uLut', this.lut);
       gl.uniform2f(p.loc('uFull'), full.w, full.h);
       gl.uniform4f(p.loc('uTile'), tile.x, tile.y, tile.w, tile.h);
@@ -394,10 +431,36 @@ export class Pipeline {
     });
   }
 
-  /** Halation + glow light-spread maps, computed from the full-frame developed image. */
-  private effects(B: Target, state: EditState) {
+  /**
+   * Halation + glow light-spread maps and the lens blur, computed from the full-frame developed
+   * image. With a `devKey` (the interactive preview) each map is kept until the developed image or
+   * its own settings change, so dragging the halation amount, the blur focus point, vignette,
+   * grain… never recomputes them.
+   */
+  private effects(B: Target, state: EditState, devKey: string | null = null) {
     const v = state.v;
     const S = Math.min(B.w, B.h);
+    const slot = (name: string, key: string | null, build: () => readonly [Target | null, Target | null]) => {
+      if (!devKey) return build();
+      const old = this.fxCache.get(name);
+      if (key === null) {
+        if (old) {
+          this.g.release(old.a);
+          this.g.release(old.b);
+          this.fxCache.delete(name);
+        }
+        return [null, null] as const;
+      }
+      const full = `${devKey}|${B.w}x${B.h}|${key}`;
+      if (old?.key === full) return [old.a, old.b] as const;
+      if (old) {
+        this.g.release(old.a);
+        this.g.release(old.b);
+      }
+      const r = build();
+      this.fxCache.set(name, { key: full, a: r[0], b: r[1] });
+      return r;
+    };
     const make = (amount: number, threshold: number, sigma: number, wideK: number) => {
       if (amount <= 0) return [null, null] as const;
       const gl = this.g.gl;
@@ -416,15 +479,15 @@ export class Pipeline {
       this.g.release(br);
       return [core, wide] as const;
     };
-    const [hal, hal2] = make(v.halation, 0.35 + (v.halThreshold / 100) * 0.6, S * (0.003 + (v.halRadius / 100) ** 1.4 * 0.035), 3.5);
-    const [glow, glow2] = make(v.glow, 0.25 + (v.glowThreshold / 100) * 0.65, S * (0.008 + (v.glowRadius / 100) ** 1.4 * 0.06), 3);
+    const hT = 0.35 + (v.halThreshold / 100) * 0.6, hS = S * (0.003 + (v.halRadius / 100) ** 1.4 * 0.035);
+    const gT = 0.25 + (v.glowThreshold / 100) * 0.65, gS = S * (0.008 + (v.glowRadius / 100) ** 1.4 * 0.06);
+    const [hal, hal2] = slot('hal', v.halation > 0 ? `${hT}|${hS}` : null, () => make(v.halation, hT, hS, 3.5));
+    const [glow, glow2] = slot('glow', v.glow > 0 ? `${gT}|${gS}` : null, () => make(v.glow, gT, gS, 3));
     // lens blur in linear light, so bright points bloom like real bokeh
-    let blur1: Target | null = null, blur2: Target | null = null;
-    if (v.blurType > 0 && v.blurAmt > 0) {
+    const [blur1, blur2] = slot('blur', v.blurType > 0 && v.blurAmt > 0 ? `${v.blurAmt}` : null, () => {
       const a = v.blurAmt / 100;
-      blur1 = this.blur(B, Math.max(1, S * 0.008 * a));
-      blur2 = this.blur(B, Math.max(2, S * 0.03 * a));
-    }
+      return [this.blur(B, Math.max(1, S * 0.008 * a)), this.blur(B, Math.max(2, S * 0.03 * a))] as const;
+    });
     return { hal, hal2, glow, glow2, blur1, blur2 };
   }
 
@@ -533,10 +596,10 @@ export class Pipeline {
     const small = this.smallBlurs(glb.A, state, Math.min(w, h), cache ? glb.key : null);
     const B = this.g.acquire(w, h);
     this.developPass(glb.A, state, glb, full, tile, small, B, src.linear, aspectOf(src, state), dst === null);
-    const fx = this.effects(B, state);
+    const fx = this.effects(B, state, cache ? this.devKey(state, glb.key) : null);
     this.finishPass(B, [0, 0, 1, 1], state, full, tile, fx, dst, dst === null);
     this.g.release(B);
-    this.releaseFx(fx);
+    if (!cache) this.releaseFx(fx);
     this.g.release(small.sharp.t);
     this.g.release(small.noise.t);
     if (!cache) this.releaseGlobals(glb);

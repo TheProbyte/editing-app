@@ -66,6 +66,23 @@ Tap a tool in the bottom bar to open its section. Everything in a section is don
    - iPhone (Safari): Share → **Add to Home Screen**.
    - Android (Chrome): ⋮ → **Install app** / **Add to Home screen**.
 
+## Android app (APK)
+
+Every push builds a signed APK and publishes it next to the web app:
+`https://theprobyte.github.io/editing-app/lumen.apk` (also in the web app: ⋯ → **Get the Android app**).
+
+1. Open the link in Chrome on the phone and let it download.
+2. Tap the download → if asked, allow **Install unknown apps** for Chrome → **Install**.
+3. Play Protect may warn about an unknown developer: **More details → Install anyway**.
+
+Later builds install over the old one (same signing key in `android/lumen.keystore`), keeping your data.
+
+The app adds: Camera2 RAW capture saved as real DNG files, exports saved straight to
+**Pictures/Lumen** in the gallery, the phone's own haptic ticks, and Android's RAW decoder as a
+fallback. Native code lives in `android/app/src/main/java/app/lumen/editor/`.
+
+Build it locally: `npm run build && npx cap sync android && cd android && ./gradlew assembleRelease`.
+
 ## Develop
 
 ```sh

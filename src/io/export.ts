@@ -68,9 +68,9 @@ export const framed = (() => {
   }
 })();
 
-export async function saveOrShare(blob: Blob, name: string): Promise<'shared' | 'downloaded' | 'shown' | 'gallery'> {
+export async function saveOrShare(blob: Blob, name: string, onProgress?: (f: number) => void): Promise<'shared' | 'downloaded' | 'shown' | 'gallery'> {
   if (isNative) {
-    await writeBlob(blob, name, 'gallery');
+    await writeBlob(blob, name, 'gallery', onProgress);
     return 'gallery';
   }
   if (framed) return 'shown';

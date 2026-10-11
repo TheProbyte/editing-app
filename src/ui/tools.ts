@@ -14,7 +14,7 @@ export interface ToolDef {
   id: string;
   label: string;
   icon: string;
-  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur' | 'heal' | 'double';
+  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur' | 'heal' | 'double' | 'leak';
   subs?: Chip[];
   params: (sub: string) => string[];
   /** quick presets / one-tap actions shown in the section */
@@ -30,7 +30,13 @@ export const TOOLS: ToolDef[] = [
     params: list('exposure', 'contrast', 'brightness', 'highlights', 'shadows', 'whites', 'blacks'),
   },
   { id: 'color', label: 'Color', icon: ICONS.color, kind: 'params', params: list('temp', 'tint', 'vibrance', 'saturation') },
-  { id: 'heal', label: 'Remove', icon: ICONS.heal, kind: 'heal', params: list('healSize') },
+  {
+    id: 'heal', label: 'Remove', icon: ICONS.heal, kind: 'heal', params: list('healSize'),
+    subs: [
+      { id: 'heal', label: 'Heal' },
+      { id: 'fill', label: 'Fill' },
+    ],
+  },
   { id: 'masks', label: 'Masks', icon: ICONS.masks, kind: 'masks', params: () => [] },
   {
     id: 'detail', label: 'Detail', icon: ICONS.detail, kind: 'params',
@@ -71,6 +77,7 @@ export const TOOLS: ToolDef[] = [
     subs: BLEND_MODES.map((m, i) => ({ id: String(i), label: m })),
     params: () => ['dxOpacity', 'dxScale', 'dxRot'],
   },
+  { id: 'leak', label: 'Leaks', icon: ICONS.leak, kind: 'leak', params: () => ['lkOpacity', 'lkScale', 'lkRot', 'lkBlend'] },
   {
     id: 'blur', label: 'Blur', icon: ICONS.blur, kind: 'blur',
     subs: [

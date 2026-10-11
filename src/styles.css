@@ -75,8 +75,8 @@ svg { display: block; }
 #zoomView { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; display: none; }
 #zoomView.on { display: block; }
 #frame.zv #view, #frame.zv #detail { visibility: hidden; }
-#cropLayer, #maskLayer, #blurLayer, #healLayer, #vigLayer { position: absolute; inset: 0; display: none; pointer-events: none; }
-#cropLayer.on, #maskLayer.on, #blurLayer.on, #healLayer.on, #vigLayer.on { display: block; }
+#cropLayer, #maskLayer, #blurLayer, #healLayer, #vigLayer, #layerLayer { position: absolute; inset: 0; display: none; pointer-events: none; }
+#cropLayer.on, #maskLayer.on, #blurLayer.on, #healLayer.on, #vigLayer.on, #layerLayer.on { display: block; }
 /* the mask layer is also used to map screen points onto the photo, so it's always laid out */
 #maskLayer { display: block; visibility: hidden; }
 #maskLayer.on { visibility: visible; }
@@ -105,6 +105,7 @@ svg { display: block; }
 .heal-svg .patch.faint { stroke: rgba(255, 255, 255, 0.16); }
 .heal-svg .patch.sel { stroke: rgba(255, 255, 255, 0.3); }
 .heal-svg .patch.src { stroke: rgba(255, 200, 61, 0.34); }
+.heal-svg .patch.fillarea { stroke: rgba(255, 255, 255, 0.22); }
 .heal-svg .patch.live { stroke: rgba(255, 200, 61, 0.5); }
 .heal-svg .pin.main { fill: var(--accent); stroke: rgba(0, 0, 0, 0.4); }
 
@@ -235,13 +236,15 @@ svg { display: block; }
 /* ---------------------------------------------------------------- empty state */
 #empty {
   position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
-  text-align: center; padding: 40px 24px; gap: 14px; background: var(--bg); animation: rise 0.45s var(--ease);
+  text-align: center; padding: 40px 24px; gap: 14px; background: var(--bg);
+  opacity: 0; transition: opacity 0.3s var(--ease);
 }
+#empty.ready { opacity: 1; }
 #empty.hidden { display: none; }
 #empty.over { position: fixed; z-index: 12; }
-#empty .logo { width: 96px; height: 96px; image-rendering: pixelated; animation: pop 0.5s var(--spring); }
-#empty h1 { margin: 4px 0 34px; font: 700 34px var(--block); letter-spacing: 0.16em; padding-left: 0.16em; animation: rise 0.5s 0.06s var(--ease) both; }
-#empty .start-actions { display: flex; flex-direction: column; gap: 12px; align-items: center; animation: rise 0.5s 0.12s var(--ease) both; }
+#empty .logo { width: 96px; height: 96px; image-rendering: pixelated; }
+#empty h1 { margin: 4px 0 34px; font: 700 34px var(--block); letter-spacing: 0.16em; padding-left: 0.16em; }
+#empty .start-actions { display: flex; flex-direction: column; gap: 12px; align-items: center; }
 
 /* ---------------------------------------------------------------- dock: tools / section */
 #dock { bottom: 0; padding: 6px 0 calc(var(--safe-b) + 6px); display: flex; flex-direction: column; }

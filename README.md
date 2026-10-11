@@ -31,6 +31,11 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 - **Remove:** press on a blemish, slide to place it (a loupe shows it close up), let go to remove it.
   Each fix shows where it copied from — drag that yellow ring to choose the source yourself (e.g. a clean
   bit of chain over a necklace clasp); Auto fill and Delete for the selected spot.
+- **Fill (in Remove):** paint over a bigger object and let go: it's rebuilt from the rest of the photo
+  (multi-scale PatchMatch content-aware fill, on the phone, no download). Best on backgrounds like sky,
+  grass, walls and sand.
+- **Light leaks:** 22 built-in leaks (flares, burns, prisms, streaks, orbs) drawn on the fly; move, scale,
+  rotate (drag, corner square or pinch), blend modes, and a Hide/Show brush.
 - **Double exposure:** add a second photo, drag to place it, size/rotate/opacity, 9 blend modes, and
   Hide/Show brushes to paint it away.
 - **Looks & presets:** 17 film-style looks (Portra, CineStill 800T, Tri-X, Velvia, Chrome, Matte, Teal &

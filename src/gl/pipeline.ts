@@ -66,7 +66,12 @@ export class Pipeline {
   clip = false;
   /** Double exposure: the second photo's texture (sRGB) and its hide-brush (atlas, red channel). */
   overlay: { tex: WebGLTexture; id: string } | null = null;
+  /** Light leak texture (procedural) */
+  leak: { tex: WebGLTexture; id: string } | null = null;
+  /** Hide-brush atlas for both layers (red = double exposure, green = leak) */
   overlayMask: WebGLTexture | null = null;
+  /** Content-aware fill result in frame space (rgb + amount), and the key of what it was made from */
+  fill: { tex: WebGLTexture; key: string } | null = null;
 
   constructor(g: GL) {
     this.g = g;
@@ -197,22 +202,38 @@ export class Pipeline {
       gl.uniform1i(p.loc('uCircCount'), n);
       gl.uniform4fv(p.loc('uCirc'), C);
       gl.uniform4fv(p.loc('uPatch'), P);
-      const ov = state.overlay;
-      const on = !!(ov && this.overlay && this.overlay.id === ov.id && state.v.dxOpacity > 0);
-      gl.uniform1i(p.loc('uOvOn'), on ? 1 : 0);
-      this.g.bindTex(p, 'uOv', on ? this.overlay!.tex : this.black);
-      this.g.bindTex(p, 'uOvMask', this.overlayMask ?? this.black);
-      if (on) {
-        const v = state.v;
-        // at 100% the second photo just covers the frame
-        const k = Math.max(f.w / ov!.aspect, f.h) * (v.dxScale / 100);
-        gl.uniform2f(p.loc('uOvC'), v.dxX, v.dxY);
-        gl.uniform2f(p.loc('uOvHalf'), (ov!.aspect * k) / 2, k / 2);
-        gl.uniform1f(p.loc('uOvRot'), (v.dxRot * Math.PI) / 180);
-        gl.uniform1f(p.loc('uOvOpacity'), v.dxOpacity / 100);
-        gl.uniform1i(p.loc('uOvBlend'), Math.round(v.dxBlend));
-        gl.uniform1f(p.loc('uOvMaskOn'), ov!.strokes.length && this.overlayMask ? 1 : 0);
-      }
+      // layers: double exposure (0) and light leak (1)
+      const v = state.v;
+      const layers = [
+        { st: state.overlay, tex: this.overlay, pre: 'dx' },
+        { st: state.leak, tex: this.leak, pre: 'lk' },
+      ];
+      const on = [0, 0], maskOn = [0, 0], LC = new Float32Array(4), LH = new Float32Array(4), rot = [0, 0], op = [0, 0], bl = [0, 0];
+      layers.forEach((L, i) => {
+        const ok = !!(L.st && L.tex && L.tex.id === L.st.id && v[L.pre + 'Opacity'] > 0);
+        on[i] = ok ? 1 : 0;
+        this.g.bindTex(p, i ? 'uLy1' : 'uLy0', ok ? L.tex!.tex : this.black);
+        if (!ok) return;
+        // at 100% the layer just covers the frame
+        const k = Math.max(f.w / L.st!.aspect, f.h) * (v[L.pre + 'Scale'] / 100);
+        LC.set([v[L.pre + 'X'], v[L.pre + 'Y']], i * 2);
+        LH.set([(L.st!.aspect * k) / 2, k / 2], i * 2);
+        rot[i] = (v[L.pre + 'Rot'] * Math.PI) / 180;
+        op[i] = v[L.pre + 'Opacity'] / 100;
+        bl[i] = Math.round(v[L.pre + 'Blend']);
+        maskOn[i] = L.st!.strokes.length && this.overlayMask ? 1 : 0;
+      });
+      gl.uniform1iv(p.loc('uLyOn'), on);
+      gl.uniform1fv(p.loc('uLyMaskOn'), maskOn);
+      gl.uniform2fv(p.loc('uLyC'), LC);
+      gl.uniform2fv(p.loc('uLyHalf'), LH);
+      gl.uniform1fv(p.loc('uLyRot'), rot);
+      gl.uniform1fv(p.loc('uLyOpacity'), op);
+      gl.uniform1iv(p.loc('uLyBlend'), bl);
+      this.g.bindTex(p, 'uLayerMask', this.overlayMask ?? this.black);
+      const fillOn = !!(state.fills?.length && this.fill);
+      gl.uniform1i(p.loc('uFillOn'), fillOn ? 1 : 0);
+      this.g.bindTex(p, 'uFill', fillOn ? this.fill!.tex : this.black);
     });
   }
 
@@ -232,10 +253,11 @@ export class Pipeline {
 
   private geoKey(src: Source, state: EditState, w: number, h: number) {
     const v = state.v;
-    const ov = state.overlay && this.overlay?.id === state.overlay.id
-      ? [state.overlay, v.dxOpacity, v.dxScale, v.dxRot, v.dxBlend, v.dxX, v.dxY]
-      : null;
-    return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, state.spots, ov]);
+    const lay = (st: EditState['overlay'], t: { id: string } | null, pre: string) =>
+      st && t?.id === st.id ? [st, v[pre + 'Opacity'], v[pre + 'Scale'], v[pre + 'Rot'], v[pre + 'Blend'], v[pre + 'X'], v[pre + 'Y']] : null;
+    const ov = [lay(state.overlay, this.overlay, 'dx'), lay(state.leak, this.leak, 'lk')];
+    const fill = state.fills?.length && this.fill ? this.fill.key : null;
+    return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, state.spots, ov, fill]);
   }
 
   /** The full-frame analysis image and its large blurs, at (w, h). Cached by geometry. */

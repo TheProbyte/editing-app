@@ -62,16 +62,20 @@ uniform vec4 uTile;       // tile offset.xy, size.zw in output px
 uniform int uCircCount;
 uniform vec4 uCirc[96];    // x, y, r (frame heights), patch index
 uniform vec4 uPatch[64];   // per patch: [2p] = source offset xy (frame coords), correction rg; [2p+1].x = correction b
-// double exposure
-uniform int uOvOn;
-uniform sampler2D uOv;
-uniform sampler2D uOvMask;  // .r = hidden (painted) areas, frame coords
-uniform float uOvMaskOn;
-uniform vec2 uOvC;          // centre, frame coords
-uniform vec2 uOvHalf;       // half size, frame px (same scale as uFrameSize)
-uniform float uOvRot;
-uniform float uOvOpacity;
-uniform int uOvBlend;
+// content-aware fill: rebuilt pixels in frame space (rgb sRGB, a = amount)
+uniform int uFillOn;
+uniform sampler2D uFill;
+// layers: double exposure (0) and light leak (1)
+uniform sampler2D uLayerMask;   // .r = hidden (painted) areas of layer 0, .g of layer 1; frame coords
+uniform int uLyOn[2];
+uniform sampler2D uLy0;
+uniform sampler2D uLy1;
+uniform float uLyMaskOn[2];
+uniform vec2 uLyC[2];          // centre, frame coords
+uniform vec2 uLyHalf[2];       // half size, frame px (same scale as uFrameSize)
+uniform float uLyRot[2];
+uniform float uLyOpacity[2];
+uniform int uLyBlend[2];
 
 vec3 blendMode(vec3 b, vec3 o, int m) {
   if (m == 1) return max(b, o);
@@ -83,6 +87,26 @@ vec3 blendMode(vec3 b, vec3 o, int m) {
   if (m == 7) return min(b + o, 1.0);
   if (m == 8) return abs(b - o);
   return o;
+}
+
+vec3 applyLayer(vec3 col, vec2 fr, sampler2D tex, int i) {
+  vec2 P = (fr - uLyC[i]) * uFrameSize;
+  float c = cos(-uLyRot[i]), s = sin(-uLyRot[i]);
+  vec2 q = mat2(c, s, -s, c) * P;
+  vec2 ouv = q / (2.0 * uLyHalf[i]) + 0.5;
+  // soft 1.5px edge so a rotated layer doesn't stair-step
+  vec2 px = 1.5 / (2.0 * uLyHalf[i]);
+  vec2 e = smoothstep(vec2(0.0), px, ouv) * smoothstep(vec2(0.0), px, 1.0 - ouv);
+  float a = uLyOpacity[i] * e.x * e.y;
+  if (uLyMaskOn[i] > 0.5) {
+    vec2 m = texture(uLayerMask, fr).rg;
+    a *= 1.0 - (i == 0 ? m.r : m.g);
+  }
+  if (a <= 0.0) return col;
+  // blend like a photo editor does: on display-referred (gamma) values
+  vec3 b = clamp(toPerc(col), 0.0, 1.0);
+  vec3 o = toPerc(srgbToLin(texture(tex, clamp(ouv, 0.0, 1.0)).rgb));
+  return mix(col, toLin(blendMode(b, o, uLyBlend[i])), a);
 }
 
 /** Frame coordinates (0..1 over the turned, uncropped frame) -> linear source color. */
@@ -110,6 +134,10 @@ void main() {
   }
   vec2 fr = uCrop.xy + g * uCrop.zw;
   vec3 col = srcAt(fr);
+  if (uFillOn == 1) {
+    vec4 f = texture(uFill, fr);
+    if (f.a > 0.0) col = mix(col, srgbToLin(f.rgb), f.a);
+  }
   float fa = uFrameSize.x / uFrameSize.y;
   // each patch covers the union of its circles (soft edge), filled from its source
   int cur = -1;
@@ -135,23 +163,8 @@ void main() {
     wmax = max(wmax, w);
     if (pi == -2) break;
   }
-  if (uOvOn == 1) {
-    vec2 P = (fr - uOvC) * uFrameSize;
-    float c = cos(-uOvRot), s = sin(-uOvRot);
-    vec2 q = mat2(c, s, -s, c) * P;
-    vec2 ouv = q / (2.0 * uOvHalf) + 0.5;
-    // soft 1.5px edge so a rotated overlay doesn't stair-step
-    vec2 px = 1.5 / (2.0 * uOvHalf);
-    vec2 e = smoothstep(vec2(0.0), px, ouv) * smoothstep(vec2(0.0), px, 1.0 - ouv);
-    float a = uOvOpacity * e.x * e.y;
-    if (uOvMaskOn > 0.5) a *= 1.0 - texture(uOvMask, fr).r;
-    if (a > 0.0) {
-      // blend like a photo editor does: on display-referred (gamma) values
-      vec3 b = clamp(toPerc(col), 0.0, 1.0);
-      vec3 o = toPerc(srgbToLin(texture(uOv, clamp(ouv, 0.0, 1.0)).rgb));
-      col = mix(col, toLin(blendMode(b, o, uOvBlend)), a);
-    }
-  }
+  if (uLyOn[0] == 1) col = applyLayer(col, fr, uLy0, 0);
+  if (uLyOn[1] == 1) col = applyLayer(col, fr, uLy1, 1);
   outColor = vec4(col, 1.0);
 }`;
 

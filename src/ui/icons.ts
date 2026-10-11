@@ -602,6 +602,17 @@ const A = {
     ....#####.../
     ...#......../
     ..#.........`,
+  leak: `
+    ############/
+    #####+++...#/
+    ####++++...#/
+    #####++++..#/
+    ####+++++..#/
+    #####+++...#/
+    ####++++...#/
+    ############/
+    ..#.......#./
+    .#.........#`,
   flipCam: `
     ...#####.../
     ..#.....##./
@@ -687,6 +698,7 @@ export const ICONS = {
   hide: pix(A.hide),
   pin: pix(A.pin),
   flipCam: pix(A.flipCam),
+  leak: pix(A.leak),
 };
 
 export type IconName = keyof typeof ICONS;

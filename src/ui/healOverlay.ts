@@ -18,7 +18,7 @@ export class HealOverlay {
   constructor(
     private host: HTMLElement,
     private map: Mapper,
-    private get: () => { spots: Spot[]; sel: number; aspect: number; painting: { pts: P[]; r: number } | null },
+    private get: () => { spots: Spot[]; sel: number; aspect: number; painting: { pts: P[]; r: number } | null; fills: { pts: number[]; r: number }[] },
   ) {
     this.svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
     this.svg.setAttribute('class', 'mask-svg heal-svg');
@@ -58,8 +58,13 @@ export class HealOverlay {
     // a painted area: a fat round-capped line (a single point still draws a dot)
     const area = (pts: P[], rad: number, cls: string, ox = 0, oy = 0) =>
       `<path class="${cls}" d="${path(pts.length > 1 ? pts : [pts[0], { x: pts[0].x + 0.01, y: pts[0].y }], ox, oy)}" stroke-width="${rad * 2 * k}"/>`;
-    const { spots, sel, painting } = this.get();
+    const { spots, sel, painting, fills } = this.get();
     let s = '';
+    for (const f of fills) {
+      const pts: P[] = [];
+      for (let i = 0; i < f.pts.length; i += 2) pts.push(this.map.toScreen(f.pts[i], f.pts[i + 1]));
+      s += area(pts, f.r * this.map.pxPerFrameH(), 'patch fillarea');
+    }
     spots.forEach((sp, i) => {
       const g = this.geom(sp);
       if (i !== sel) {

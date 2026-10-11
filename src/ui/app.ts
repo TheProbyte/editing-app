@@ -17,6 +17,8 @@ import { CropOverlay, fitAspect } from './cropOverlay';
 import { MaskOverlay } from './maskOverlay';
 import { BlurOverlay, VignetteOverlay } from './blurOverlay';
 import { HealOverlay } from './healOverlay';
+import { LayerOverlay } from './layerOverlay';
+import { LEAKS, LEAK_W, LEAK_H, leakCanvas } from '../leaks';
 import { Loupe } from './loupe';
 import { drawHistogram } from './histogram';
 import { tick } from './haptics';
@@ -91,6 +93,7 @@ export class App {
   private blurOv!: BlurOverlay;
   private vigOv!: VignetteOverlay;
   /** two-finger shaping (blur / vignette): where the gesture started */
+  private lshape0: { d: number; a: number; scale: number; rot: number; x: number; y: number; mf: { x: number; y: number } } | null = null;
   private shape0: { d: number; a: number; size: number; angle: number; mid: number; sx: number; sy: number } | null = null;
   private healOv!: HealOverlay;
   /** selected Remove spot (its source ring can be dragged), or -1 */
@@ -116,7 +119,13 @@ export class App {
   private ovLoading = '';
   private dxMode: 'move' | 'hide' | 'show' = 'move';
   private dxStroke: Stroke | null = null;
-  private dxDrag: { x: number; y: number; f0: { x: number; y: number } } | null = null;
+  private ld: { kind: 'move' | 'size'; x: number; y: number; f0: { x: number; y: number }; scale: number; rot: number; d0: number; a0: number } | null = null;
+  private layerOv!: LayerOverlay;
+  private lkTex = new Map<string, WebGLTexture>();
+  // content-aware fill results (by what they were made from), newest last
+  private fillCache: { key: string; tex: WebGLTexture }[] = [];
+  private fillJob = '';
+  private fillWaiters: (() => void)[] = [];
   private pickMode: 'pick' | 'swipe' = 'pick';
   private maskOverlayOn = false;
   private maskInteracting = false;
@@ -190,7 +199,9 @@ export class App {
     this.healOv = new HealOverlay($('healLayer'), this.maskOv, () => ({
       spots: this.state.spots, sel: this.spotSel, aspect: this.frameInfo().aspect,
       painting: this.healPaint ? { pts: this.healPaint.pts, r: this.healPaint.r } : null,
+      fills: this.state.fills ?? [],
     }));
+    this.layerOv = new LayerOverlay($('layerLayer'), () => this.layerGeometry());
     this.camera = new Camera((m, ms) => this.toast(m, ms));
     this.bindChrome();
     this.bindGestures();
@@ -201,7 +212,12 @@ export class App {
     this.updateChrome();
     new ResizeObserver(() => this.layout()).observe(this.stage);
     new ResizeObserver(() => this.layout()).observe($('dock'));
-    this.offerResume();
+    // reveal the start page once fonts and the saved session are known, so nothing shifts
+    const fonts = Promise.race([
+      Promise.all(['700 34px Silkscreen', '700 14px Silkscreen', '500 16px "Pixelify Sans"'].map((f) => document.fonts.load(f).catch(() => []))),
+      new Promise((r) => setTimeout(r, 900)),
+    ]);
+    void Promise.all([this.offerResume(), fonts]).then(() => requestAnimationFrame(() => $('empty').classList.add('ready')));
   }
 
   private initGL() {
@@ -221,6 +237,8 @@ export class App {
       this.atlas.getBase = (m) => this.maskBase(m);
       this.ovAtlas = new BrushAtlas(this.g.gl);
       this.ovImg = null;
+      this.lkTex.clear();
+      this.fillCache = [];
       this.img = null;
       if (this.file) await this.open(this.file, true);
     });
@@ -229,6 +247,7 @@ export class App {
   private fatal(msg: string) {
     const e = $('empty');
     e.innerHTML = `<h1>LUMEN</h1><p>${msg}</p><p>Try the latest Safari or Chrome.</p>`;
+    e.classList.add('ready');
   }
 
   private async offerResume() {
@@ -362,7 +381,7 @@ export class App {
   private viewState(): EditState {
     let s = this.state;
     if (this.compare) {
-      s = { v: { ...defaultValues(), straighten: s.v.straighten }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null };
+      s = { v: { ...defaultValues(), straighten: s.v.straighten }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null, leak: null, fills: [] };
     }
     if (this.kind() === 'crop') s = { ...s, geo: { ...s.geo, crop: { x: 0, y: 0, w: 1, h: 1 } } };
     return s;
@@ -764,7 +783,11 @@ export class App {
     }
     if (t.kind === 'blur') return t.params(String(Math.round(this.state.v.blurType)));
     if (t.kind === 'heal') return ['healSize'];
-    if (t.kind === 'double') return this.state.overlay ? (this.dxMode === 'move' ? ['dxOpacity', 'dxScale', 'dxRot'] : ['dxBrush', 'dxOpacity']) : [];
+    if (t.kind === 'double' || t.kind === 'leak') {
+      const k = t.kind === 'double' ? 'dx' : 'lk';
+      if (!this.layerOf(k)) return [];
+      return this.dxMode === 'move' ? [k + 'Opacity', k + 'Scale', k + 'Rot', ...(k === 'lk' ? ['lkBlend'] : [])] : [k + 'Brush', k + 'Opacity'];
+    }
     if (t.kind === 'looks') return this.look.idx > 0 ? ['lookAmt'] : [];
     return t.params(this.sub[t.id] ?? t.subs?.[0].id ?? '');
   }
@@ -795,9 +818,11 @@ export class App {
       case 'blur':
         return v.blurType > 0;
       case 'heal':
-        return this.state.spots.length > 0;
+        return this.state.spots.length > 0 || !!this.state.fills?.length;
       case 'double':
         return !!this.state.overlay;
+      case 'leak':
+        return !!this.state.leak;
       default: {
         const subs = t.subs ? t.subs.map((s) => s.id) : [''];
         return subs.some((s) => t.params(s).some((p) => Math.abs(v[p] - PARAM_MAP[p].def) > 1e-6));
@@ -897,7 +922,7 @@ export class App {
     if (on) {
       this.setMode(null);
       el.classList.remove('hidden');
-      el.classList.add('over');
+      el.classList.add('over', 'ready');
       resume.hidden = false;
       resume.textContent = 'Back to photo';
       resume.onclick = () => this.showHome(false);
@@ -958,7 +983,7 @@ export class App {
       all: TOOLS.map((t) => t.id),
       tone: ['light', 'color', 'curves', 'hsl', 'grade', 'bw'],
       fix: ['heal', 'crop', 'detail', 'masks'],
-      style: ['looks', 'double', 'blur', 'grain', 'halation', 'glow', 'vignette', 'film'],
+      style: ['looks', 'double', 'leak', 'blur', 'grain', 'halation', 'glow', 'vignette', 'film'],
     };
     tabs.innerHTML = '';
     for (const k of Object.keys(groups)) {
@@ -1087,6 +1112,9 @@ export class App {
     this.requestRender();
     if (t?.kind === 'masks' && !this.state.masks.length && this.img) setTimeout(() => this.openMaskSheet(), 180);
     if (t?.kind === 'double' && this.img && !this.state.overlay) setTimeout(() => this.pickOverlay(), 200);
+    if (t?.kind === 'leak' && this.img && !this.state.leak) this.setLeak(LEAKS[0].id);
+    if (t?.kind === 'double' || t?.kind === 'leak') this.dxMode = 'move';
+    this.layerOv.show((t?.kind === 'double' || t?.kind === 'leak') && !!this.img);
     if (t?.kind === 'heal' && this.img) this.toast('Paint over what to remove · let go to fix it', 2600);
   }
 
@@ -1146,6 +1174,7 @@ export class App {
     const t = this.tool!;
     if (t.kind === 'looks') return this.buildLooks();
     if (t.kind === 'masks') return this.buildMaskList();
+    if (t.kind === 'leak') return this.buildLeaks();
     if (!t.subs) return;
     if (t.kind === 'double' && !this.state.overlay) return;
     const cur = t.kind === 'crop' ? this.aspectId : t.kind === 'blur' ? String(Math.round(this.state.v.blurType))
@@ -1190,6 +1219,11 @@ export class App {
       if (id !== '0') this.toast('Drag the orange dot to place the focus', 2400);
     } else {
       this.sub[t.id] = id;
+      if (t.kind === 'heal') {
+        this.spotSel = -1;
+        this.toast(id === 'fill' ? 'Paint over the object · let go and it’s filled from the surroundings' : 'Paint over a blemish · drag the yellow copy to pick the source', 3000);
+        this.healOv.draw();
+      }
       if (t.kind === 'curves') {
         this.curve.channel = id as keyof Curves;
         this.curve.draw();
@@ -1204,7 +1238,8 @@ export class App {
     const t = this.tool!;
     if (t.kind === 'masks') return this.buildMaskActs();
     if (t.kind === 'heal') return this.buildHealActs();
-    if (t.kind === 'double') return this.buildDoubleActs();
+    if (t.kind === 'double') return this.buildLayerActs('dx');
+    if (t.kind === 'leak') return this.buildLayerActs('lk');
     for (const a of t.actions ?? []) {
       if (a.icon) this.tile(row, a.icon, a.label, '', () => this.action(a.id));
       else this.chip(row, a, false, () => this.action(a.id));
@@ -1286,7 +1321,7 @@ export class App {
   private sizeTimer = 0;
   private showSizeRing(id: string) {
     const k = this.maskOv.pxPerFrameH();
-    const px = id === 'healSize' ? this.healPx() : id === 'mg.size' ? this.brushRadius() * k : id === 'dxBrush' ? this.dxRadius() * k : 0;
+    const px = id === 'healSize' ? this.healPx() : id === 'mg.size' ? this.brushRadius() * k : id === 'dxBrush' || id === 'lkBrush' ? this.layerRadius(id.slice(0, 2) as 'dx' | 'lk') * k : 0;
     if (!px) return;
     const ring = $('brushRing');
     const st = this.stage.getBoundingClientRect();
@@ -1452,7 +1487,7 @@ export class App {
   private bindGestures() {
     const st = this.stage;
     const pts = new Map<number, { x: number; y: number }>();
-    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx' | 'vig' | 'shape';
+    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx' | 'vig' | 'shape' | 'lshape';
     let mode: Mode = 'none';
     let sx = 0, sy = 0, startIdx = 0, lastStep = 0;
     let lastX = 0, lastT = 0;
@@ -1485,7 +1520,7 @@ export class App {
           this.aiStroke = null;
           this.hideBrushRing();
         }
-        if (mode === 'dx') this.dxUp();
+        if (mode === 'dx') this.layerUp();
         if (mode === 'mask') this.maskOv.cancel();
         if (mode === 'pick') this.endPick(false);
         if (mode === 'heal') this.healCancel();
@@ -1504,6 +1539,15 @@ export class App {
             sx: Math.abs(b.x - a.x), sy: Math.abs(b.y - a.y),
           };
           mode = 'shape';
+          return;
+        }
+        // double exposure / light leak in Move: two fingers place the layer (pinch = size, twist = angle)
+        const lk = this.layerKey();
+        if (lk && this.layerOf(lk) && this.dxMode === 'move') {
+          const L = this.state.v;
+          const mf = this.maskOv.toFrame((a.x + b.x) / 2, (a.y + b.y) / 2);
+          this.lshape0 = { d: pinch0.d, a: Math.atan2(b.y - a.y, b.x - a.x), scale: L[lk + 'Scale'], rot: L[lk + 'Rot'], x: L[lk + 'X'], y: L[lk + 'Y'], mf: { x: mf.x, y: mf.y } };
+          mode = 'lshape';
           return;
         }
         mode = 'pinch';
@@ -1532,9 +1576,9 @@ export class App {
         this.healDown(e);
         return;
       }
-      if (k === 'double' && this.state.overlay) {
+      if ((k === 'double' || k === 'leak') && this.layerOf(this.layerKey()!)) {
         mode = 'dx';
-        this.dxDown(e);
+        this.layerDown(e);
         return;
       }
       if (k === 'masks') {
@@ -1623,7 +1667,8 @@ export class App {
       }
       if (mode === 'paint') return this.continueStroke(e);
       if (mode === 'ai') return this.continueAiStroke(e);
-      if (mode === 'dx') return this.dxMove(e);
+      if (mode === 'dx') return this.layerMove(e);
+      if (mode === 'lshape' && pts.size >= 2 && this.lshape0) return this.layerPinch(pts);
       if (mode === 'pick') return this.pickAt(e);
       if (mode === 'heal') return this.healMove(e);
       if (mode === 'pan') {
@@ -1705,6 +1750,15 @@ export class App {
         if (pts.size === 0) mode = 'none';
         return;
       }
+      if (mode === 'lshape') {
+        if (pts.size === 0) {
+          mode = 'none';
+          this.lshape0 = null;
+          tick();
+          this.commitAndRefresh();
+        }
+        return;
+      }
       if (mode === 'shape') {
         if (pts.size === 0) {
           mode = 'none';
@@ -1735,7 +1789,7 @@ export class App {
       } else if (mode === 'ai') {
         this.endAiStroke();
       } else if (mode === 'dx') {
-        this.dxUp();
+        this.layerUp();
       } else if (mode === 'pick') {
         this.endPick(true);
       } else if (mode === 'heal') {
@@ -2322,6 +2376,11 @@ export class App {
         for (let i = 0; i < st.pts.length; i += 2) [st.pts[i], st.pts[i + 1]] = pt(st.pts[i], st.pts[i + 1]);
       }
     }
+    for (const f of this.state.fills ?? []) {
+      const fp = (x: number, y: number): [number, number] => (kind === 'rot' ? [1 - y, x] : kind === 'flipH' ? [1 - x, y] : [x, 1 - y]);
+      for (let i = 0; i < f.pts.length; i += 2) [f.pts[i], f.pts[i + 1]] = fp(f.pts[i], f.pts[i + 1]);
+      if (kind === 'rot') f.r /= aspect;
+    }
     for (const sp of this.state.spots) {
       const tp = (x: number, y: number): [number, number] => (kind === 'rot' ? [1 - y, x] : kind === 'flipH' ? [1 - x, y] : [x, 1 - y]);
       if (sp.pts) for (let i = 0; i < sp.pts.length; i += 2) [sp.pts[i], sp.pts[i + 1]] = tp(sp.pts[i], sp.pts[i + 1]);
@@ -2364,10 +2423,23 @@ export class App {
   /** the stroke being painted: screen points (for drawing) and frame points (for the patch) */
   private healPaint: { pts: { x: number; y: number }[]; frame: number[]; r: number } | null = null;
 
+  private fillMode() {
+    return (this.sub.heal ?? 'heal') === 'fill';
+  }
+
   private healDown(e: PointerEvent) {
     const f0 = this.maskOv.toFrame(e.clientX, e.clientY);
     const spots = this.state.spots;
     const sel = spots[this.spotSel];
+    if (this.fillMode()) {
+      // Fill: just paint over what should go
+      this.hd = { i: -1, kind: 'new', f0, sp0: null, moved: false };
+      this.healPaint = { pts: [{ x: e.clientX, y: e.clientY }], frame: [f0.x, f0.y], r: this.healPx() };
+      this.healRing(e);
+      this.healLoupe(e.clientX, e.clientY, this.healPx());
+      this.healOv.draw();
+      return;
+    }
     if (sel) {
       const h = this.healOv.hit(sel, e.clientX, e.clientY, 10);
       if (h.source || h.target) {
@@ -2438,6 +2510,10 @@ export class App {
     this.loupe.zoom = 3.2;
     this.hideBrushRing();
     if (!hd || !this.img) return this.healOv.draw();
+    if (hd.kind === 'new' && this.fillMode()) {
+      this.addFill(paint!);
+      return;
+    }
     if (hd.kind === 'new') {
       if (!hd.moved && hd.i >= 0) {
         this.spotSel = hd.i;
@@ -2472,6 +2548,22 @@ export class App {
     this.hideBrushRing();
     this.healOv.draw();
     this.requestRender();
+  }
+
+  /** Content-aware fill: the painted area is rebuilt from the rest of the photo. */
+  private addFill(paint: { frame: number[]; r: number }) {
+    if ((this.state.fills ?? []).length >= 12) {
+      this.healOv.draw();
+      return this.toast('Up to 12 fills per photo');
+    }
+    const pts = paint.frame.slice();
+    if (pts.length < 4) pts.push(pts[0], pts[1]);
+    (this.state.fills ??= []).push({ pts, r: this.healRadius() });
+    tick(true);
+    this.commit();
+    this.refreshSection();
+    this.healOv.draw();
+    this.requestRender(); // computes the fill; shows its progress
   }
 
   /** Turn the painted stroke (or a tap) into a patch filled from the best match nearby. */
@@ -2645,6 +2737,26 @@ export class App {
 
   private buildHealActs() {
     const row = $('acts');
+    if (this.fillMode()) {
+      const n = this.state.fills?.length ?? 0;
+      if (n) {
+        this.tile(row, ICONS.undo, 'Undo fill', '', () => {
+          this.state.fills!.pop();
+          this.commit();
+          this.refreshSection();
+          this.healOv.draw();
+          this.requestRender();
+        });
+        this.tile(row, ICONS.trash, 'Clear fills', 'danger', () => {
+          this.state.fills = [];
+          this.commit();
+          this.refreshSection();
+          this.healOv.draw();
+          this.requestRender();
+        });
+      }
+      return;
+    }
     const sel = this.state.spots[this.spotSel];
     if (sel) {
       this.tile(row, ICONS.detail, 'Auto fill', '', () => {
@@ -2676,8 +2788,170 @@ export class App {
   }
 
   // -----------------------------------------------------------------------------------
-  // Double exposure: a second photo on top, moved and sized on the photo, blended, and
-  // brushed away where you don't want it
+  // Layers: Double exposure (a second photo) and Light leaks (built-in glows). Both are placed
+  // on the photo — drag to move, drag the corner square or pinch to scale and turn — blended,
+  // and brushed away where you don't want them.
+
+  private layerKey(): 'dx' | 'lk' | null {
+    return this.tool?.id === 'double' ? 'dx' : this.tool?.id === 'leak' ? 'lk' : null;
+  }
+  private layerOf(k: 'dx' | 'lk' | null) {
+    return k === 'dx' ? this.state.overlay ?? null : k === 'lk' ? this.state.leak ?? null : null;
+  }
+
+  /** Screen corners (top-left, top-right, bottom-right, bottom-left) and centre of the placed layer. */
+  private layerGeometry() {
+    const k = this.layerKey();
+    const L = this.layerOf(k);
+    if (!k || !L || this.dxMode !== 'move' || !this.img) return null;
+    const v = this.state.v;
+    const fa = this.frameInfo().aspect;
+    const kk = Math.max(fa / L.aspect, 1) * (v[k + 'Scale'] / 100);
+    const hw = (L.aspect * kk) / 2, hh = kk / 2;
+    const rot = (v[k + 'Rot'] * Math.PI) / 180, co = Math.cos(rot), si = Math.sin(rot);
+    const at = (sx: number, sy: number) => {
+      const lx = sx * hw, ly = sy * hh;
+      const px = lx * co - ly * si, py = lx * si + ly * co;
+      return this.maskOv.toScreen(v[k + 'X'] + px / fa, v[k + 'Y'] + py);
+    };
+    return { corners: [at(-1, -1), at(1, -1), at(1, 1), at(-1, 1)], centre: this.maskOv.toScreen(v[k + 'X'], v[k + 'Y']) };
+  }
+
+  private layerRadius(k: 'dx' | 'lk') {
+    return 0.006 + Math.pow(this.state.v[k + 'Brush'] / 100, 1.5) * 0.22;
+  }
+
+  private layerDown(e: PointerEvent) {
+    const k = this.layerKey()!;
+    const L = this.layerOf(k)!;
+    const v = this.state.v;
+    const f = this.maskOv.toFrame(e.clientX, e.clientY);
+    if (this.dxMode === 'move') {
+      const g = this.layerGeometry();
+      const mode = g && Math.hypot(g.corners[2].x - e.clientX, g.corners[2].y - e.clientY) < 34 ? 'size' : 'move';
+      const c = g?.centre ?? { x: e.clientX, y: e.clientY };
+      this.ld = {
+        kind: mode, x: v[k + 'X'], y: v[k + 'Y'], f0: f, scale: v[k + 'Scale'], rot: v[k + 'Rot'],
+        d0: Math.hypot(e.clientX - c.x, e.clientY - c.y) || 1, a0: Math.atan2(e.clientY - c.y, e.clientX - c.x),
+      };
+      if (mode === 'size') tick();
+      return;
+    }
+    this.dxStroke = { r: this.layerRadius(k), hard: 0.35, flow: 0.8, erase: this.dxMode === 'show', pts: [f.x, f.y] };
+    L.strokes.push(this.dxStroke);
+    this.showLayerRing(e);
+    this.requestRender();
+  }
+
+  private layerMove(e: PointerEvent) {
+    const k = this.layerKey();
+    if (!k) return;
+    const v = this.state.v;
+    const f = this.maskOv.toFrame(e.clientX, e.clientY);
+    if (this.ld) {
+      const D = this.ld;
+      if (D.kind === 'move') {
+        v[k + 'X'] = D.x + (f.x - D.f0.x);
+        v[k + 'Y'] = D.y + (f.y - D.f0.y);
+      } else {
+        const g = this.layerGeometry();
+        const c = g?.centre ?? { x: e.clientX, y: e.clientY };
+        const d = Math.hypot(e.clientX - c.x, e.clientY - c.y);
+        v[k + 'Scale'] = clampParam(k + 'Scale', D.scale * (d / D.d0));
+        v[k + 'Rot'] = wrap180(D.rot + ((Math.atan2(e.clientY - c.y, e.clientX - c.x) - D.a0) * 180) / Math.PI);
+        const id = this.currentParam();
+        if (id) this.showHud(id);
+      }
+      this.layerOv.draw();
+      this.requestRender();
+      return;
+    }
+    const st = this.dxStroke;
+    if (!st) return;
+    const P = st.pts;
+    const { aspect } = this.frameInfo();
+    if (Math.hypot((f.x - P[P.length - 2]) * aspect, f.y - P[P.length - 1]) > st.r * 0.12) {
+      P.push(f.x, f.y);
+      this.requestRender();
+    }
+    this.showLayerRing(e);
+  }
+
+  /** Two fingers: pinch scales, twist turns, dragging both moves. */
+  private layerPinch(pts: Map<number, { x: number; y: number }>) {
+    const k = this.layerKey(), S = this.lshape0;
+    if (!k || !S) return;
+    const [a, b] = [...pts.values()];
+    const v = this.state.v;
+    v[k + 'Scale'] = clampParam(k + 'Scale', S.scale * (Math.hypot(a.x - b.x, a.y - b.y) / S.d));
+    v[k + 'Rot'] = wrap180(S.rot + ((Math.atan2(b.y - a.y, b.x - a.x) - S.a) * 180) / Math.PI);
+    const mf = this.maskOv.toFrame((a.x + b.x) / 2, (a.y + b.y) / 2);
+    v[k + 'X'] = S.x + (mf.x - S.mf.x);
+    v[k + 'Y'] = S.y + (mf.y - S.mf.y);
+    const id = this.currentParam();
+    if (id) this.showHud(id);
+    this.layerOv.draw();
+    this.requestRender();
+  }
+
+  private layerUp() {
+    const changed = !!this.ld || !!this.dxStroke;
+    this.ld = null;
+    this.dxStroke = null;
+    this.hideBrushRing();
+    if (changed) {
+      this.commit();
+      this.refreshSection();
+    }
+  }
+
+  private showLayerRing(e: PointerEvent) {
+    const k = this.layerKey();
+    if (!k) return;
+    const ring = $('brushRing');
+    const r = this.layerRadius(k) * this.maskOv.pxPerFrameH();
+    const st = this.stage.getBoundingClientRect();
+    ring.style.width = ring.style.height = r * 2 + 'px';
+    ring.style.transform = `translate(${e.clientX - st.left - r}px, ${e.clientY - st.top - r}px)`;
+    ring.classList.toggle('erase', this.dxMode === 'hide');
+    ring.classList.add('on');
+  }
+
+  private buildLayerActs(k: 'dx' | 'lk') {
+    const row = $('acts');
+    const L = this.layerOf(k);
+    if (k === 'dx') this.tile(row, ICONS.image, L ? 'Replace' : 'Choose', L ? '' : 'hot', () => this.pickOverlay());
+    if (!L) return;
+    const mode = (m: 'move' | 'hide' | 'show') => () => {
+      this.dxMode = m;
+      this.paramIdx[this.tool!.id] = 0;
+      this.refreshSection();
+      this.layerOv.draw();
+      if (m !== 'move') this.toast(m === 'hide' ? 'Paint over the parts to hide' : 'Paint to bring parts back', 1800);
+    };
+    if (k === 'dx') row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
+    this.tile(row, ICONS.move, 'Move', this.dxMode === 'move' ? 'on' : '', mode('move'));
+    this.tile(row, ICONS.erase, 'Hide', this.dxMode === 'hide' ? 'on' : '', mode('hide'));
+    this.tile(row, ICONS.paint, 'Show', this.dxMode === 'show' ? 'on' : '', mode('show'));
+    if (L.strokes.length) {
+      this.tile(row, ICONS.reset, 'Clear brush', '', () => {
+        L.strokes = [];
+        this.commit();
+        this.refreshSection();
+        this.requestRender();
+      });
+    }
+    if (k === 'dx') {
+      this.tile(row, ICONS.trash, 'Remove', 'danger', () => {
+        this.state.overlay = null;
+        this.commit();
+        this.refreshSection();
+        this.requestRender();
+      });
+    }
+  }
+
+  // ---- double exposure: the second photo
 
   private pickOverlay() {
     const input = $<HTMLInputElement>('fileOverlay');
@@ -2706,8 +2980,9 @@ export class App {
       this.dxMode = 'move';
       this.commit();
       this.refreshSection();
+      this.layerOv.draw();
       this.requestRender();
-      this.toast('Drag to move it · pick a blend · Hide brush to paint it away', 3200);
+      this.toast('Drag to move · corner square or pinch to scale · Hide brush paints it away', 3400);
     } catch (e) {
       this.toast('Couldn’t open that photo: ' + (e as Error).message, 4000);
     } finally {
@@ -2762,101 +3037,198 @@ export class App {
     }
   }
 
-  /** Bring the GPU side (second photo + its brush) in line with an edit state before rendering. */
-  private syncOverlay(st: EditState) {
-    const ov = st.overlay;
-    if (ov && this.ovImg?.id !== ov.id && this.ovLoading !== ov.id) void this.loadOverlay(ov.id);
-    this.pipe.overlay = ov && this.ovImg?.id === ov.id ? this.ovImg : null;
-    this.ovAtlas.sync(ov?.strokes.length ? [{ id: 1, type: 'brush', strokes: ov.strokes } as unknown as Mask] : []);
-    this.pipe.overlayMask = this.ovAtlas.tex[0];
-  }
+  // ---- light leaks
 
-  private dxRadius() {
-    return 0.006 + Math.pow(this.state.v.dxBrush / 100, 1.5) * 0.22;
-  }
-
-  private dxDown(e: PointerEvent) {
-    const f = this.maskOv.toFrame(e.clientX, e.clientY);
-    const ov = this.state.overlay!;
-    if (this.dxMode === 'move') {
-      this.dxDrag = { x: this.state.v.dxX, y: this.state.v.dxY, f0: f };
-      return;
+  private setLeak(id: string) {
+    const keep = this.state.leak;
+    this.state.leak = { id, aspect: LEAK_W / LEAK_H, strokes: keep?.strokes ?? [] };
+    if (!keep) {
+      const v = this.state.v;
+      v.lkX = 0.5;
+      v.lkY = 0.5;
+      v.lkScale = 100;
+      v.lkRot = 0;
     }
-    this.dxStroke = { r: this.dxRadius(), hard: 0.35, flow: 0.8, erase: this.dxMode === 'show', pts: [f.x, f.y] };
-    ov.strokes.push(this.dxStroke);
-    this.showDxRing(e);
+    this.commit();
+    this.refreshSection();
+    this.layerOv.draw();
     this.requestRender();
   }
 
-  private dxMove(e: PointerEvent) {
-    const f = this.maskOv.toFrame(e.clientX, e.clientY);
-    if (this.dxDrag) {
-      this.state.v.dxX = this.dxDrag.x + (f.x - this.dxDrag.f0.x);
-      this.state.v.dxY = this.dxDrag.y + (f.y - this.dxDrag.f0.y);
+  private leakTexture(id: string) {
+    let tex = this.lkTex.get(id);
+    if (!tex) {
+      const gl = this.g.gl;
+      const c = leakCanvas(id);
+      tex = this.g.texture(c.width, c.height, 'u8');
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, c);
+      this.lkTex.set(id, tex);
+    }
+    return tex;
+  }
+
+  private buildLeaks() {
+    const row = $('subs');
+    const cur = this.state.leak?.id;
+    const off = document.createElement('button');
+    off.className = 'look save';
+    off.innerHTML = `<span class="th">${ICONS.off}</span><small>None</small>`;
+    off.onclick = () => {
+      tick();
+      this.state.leak = null;
+      this.commit();
+      this.refreshSection();
       this.requestRender();
+    };
+    row.appendChild(off);
+    for (const L of LEAKS) {
+      const b = document.createElement('button');
+      b.className = 'look' + (L.id === cur ? ' on' : '');
+      const c = document.createElement('canvas');
+      c.className = 'th';
+      c.width = 132;
+      c.height = 132;
+      const x = c.getContext('2d')!;
+      x.fillStyle = '#000';
+      x.fillRect(0, 0, 132, 132);
+      const src = leakCanvas(L.id);
+      x.drawImage(src, (src.width - src.height) / 2, 0, src.height, src.height, 0, 0, 132, 132);
+      b.appendChild(c);
+      const label = document.createElement('small');
+      label.textContent = L.name;
+      b.appendChild(label);
+      b.onclick = () => {
+        tick();
+        this.setLeak(L.id);
+      };
+      row.appendChild(b);
+    }
+  }
+
+  /** Bring the GPU side (layers, their brush, the content-aware fill) in line with a state before rendering. */
+  private syncOverlay(st: EditState) {
+    const ov = st.overlay, lk = st.leak;
+    if (ov && this.ovImg?.id !== ov.id && this.ovLoading !== ov.id) void this.loadOverlay(ov.id);
+    this.pipe.overlay = ov && this.ovImg?.id === ov.id ? this.ovImg : null;
+    this.pipe.leak = lk ? { id: lk.id, tex: this.leakTexture(lk.id) } : null;
+    const slot = (L: typeof ov, id: number) => (L?.strokes.length ? ({ id, type: 'brush', strokes: L.strokes } as unknown as Mask) : ({ id: 0, type: 'radial', strokes: [] } as unknown as Mask));
+    this.ovAtlas.sync([slot(ov, 1), slot(lk, 2)]);
+    this.pipe.overlayMask = this.ovAtlas.tex[0];
+    this.syncFill(st);
+  }
+
+  // ---- content-aware fill
+
+  private fillKey(fills: NonNullable<EditState['fills']>) {
+    return this.frameKey() + '|' + JSON.stringify(fills);
+  }
+
+  private syncFill(st: EditState) {
+    const fills = st.fills ?? [];
+    if (!fills.length || !this.img) {
+      this.pipe.fill = null;
       return;
     }
-    const st = this.dxStroke;
-    if (!st) return;
-    const P = st.pts;
-    const { aspect } = this.frameInfo();
-    if (Math.hypot((f.x - P[P.length - 2]) * aspect, f.y - P[P.length - 1]) > st.r * 0.12) {
-      P.push(f.x, f.y);
-      this.requestRender();
+    const key = this.fillKey(fills);
+    const hit = this.fillCache.find((f) => f.key === key);
+    if (hit) {
+      this.pipe.fill = hit;
+      return;
     }
-    this.showDxRing(e);
+    // keep showing the last result while the new one is being made
+    this.pipe.fill = this.fillCache[this.fillCache.length - 1] ?? null;
+    if (this.fillJob !== key) void this.computeFill(key, fills);
   }
 
-  private dxUp() {
-    const changed = !!this.dxDrag || !!this.dxStroke;
-    this.dxDrag = null;
-    this.dxStroke = null;
-    this.hideBrushRing();
-    if (changed) {
-      this.commit();
-      this.refreshSection();
-    }
+  /** Resolves once the fill for this state is ready (export waits for it). */
+  private async ensureFill(st: EditState) {
+    const fills = st.fills ?? [];
+    if (!fills.length) return;
+    const key = this.fillKey(fills);
+    if (this.fillCache.some((f) => f.key === key)) return;
+    if (this.fillJob !== key) void this.computeFill(key, fills);
+    await new Promise<void>((res) => this.fillWaiters.push(res));
+    if (!this.fillCache.some((f) => f.key === key)) await this.ensureFill(st);
   }
 
-  private showDxRing(e: PointerEvent) {
-    const ring = $('brushRing');
-    const r = this.dxRadius() * this.maskOv.pxPerFrameH();
-    const st = this.stage.getBoundingClientRect();
-    ring.style.width = ring.style.height = r * 2 + 'px';
-    ring.style.transform = `translate(${e.clientX - st.left - r}px, ${e.clientY - st.top - r}px)`;
-    ring.classList.toggle('erase', this.dxMode === 'hide');
-    ring.classList.add('on');
-  }
+  private async computeFill(key: string, fills: NonNullable<EditState['fills']>) {
+    if (!this.img) return;
+    this.fillJob = key;
+    const img = this.img;
+    try {
+      this.busy('Filling');
+      await new Promise((r) => setTimeout(r, 30));
+      // the photo in frame space (turned, straightened, uncropped, no heals) in sRGB
+      const st = { ...defaultState(), geo: { ...this.state.geo, crop: { x: 0, y: 0, w: 1, h: 1 } } };
+      st.v.straighten = this.state.v.straighten;
+      const { w: W, h: H } = outputSize(st, img.preview.w, img.preview.h);
+      const lin = this.pipe.analysisPixels(img.preview, st, W, H);
+      const rgba = new Uint8ClampedArray(W * H * 4);
+      const enc = (l: number) => (l <= 0.0031308 ? l * 12.92 : 1.055 * Math.pow(Math.max(0, l), 1 / 2.4) - 0.055) * 255;
+      for (let i = 0; i < W * H; i++) {
+        rgba[i * 4] = enc(lin[i * 4]);
+        rgba[i * 4 + 1] = enc(lin[i * 4 + 1]);
+        rgba[i * 4 + 2] = enc(lin[i * 4 + 2]);
+        rgba[i * 4 + 3] = 255;
+      }
+      // what to remove: the painted strokes
+      const mc = document.createElement('canvas');
+      mc.width = W;
+      mc.height = H;
+      const mx = mc.getContext('2d')!;
+      mx.fillStyle = '#000';
+      mx.fillRect(0, 0, W, H);
+      mx.strokeStyle = '#fff';
+      mx.fillStyle = '#fff';
+      mx.lineCap = mx.lineJoin = 'round';
+      for (const f of fills) {
+        mx.lineWidth = Math.max(2, f.r * H * 2);
+        mx.beginPath();
+        mx.moveTo(f.pts[0] * W, f.pts[1] * H);
+        for (let i = 2; i < f.pts.length; i += 2) mx.lineTo(f.pts[i] * W, f.pts[i + 1] * H);
+        if (f.pts.length <= 2) mx.lineTo(f.pts[0] * W + 0.01, f.pts[1] * H);
+        mx.stroke();
+      }
+      const md = mx.getImageData(0, 0, W, H).data;
+      const mask = new Uint8Array(W * H);
+      for (let i = 0; i < mask.length; i++) mask[i] = md[i * 4] > 127 ? 1 : 0;
 
-  private buildDoubleActs() {
-    const row = $('acts');
-    const ov = this.state.overlay;
-    this.tile(row, ICONS.image, ov ? 'Replace' : 'Choose', ov ? '' : 'hot', () => this.pickOverlay());
-    if (!ov) return;
-    const mode = (m: 'move' | 'hide' | 'show') => () => {
-      this.dxMode = m;
-      this.paramIdx.double = 0;
-      this.refreshSection();
-      if (m !== 'move') this.toast(m === 'hide' ? 'Paint over the parts to hide' : 'Paint to bring parts back', 1800);
-    };
-    row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
-    this.tile(row, ICONS.move, 'Move', this.dxMode === 'move' ? 'on' : '', mode('move'));
-    this.tile(row, ICONS.erase, 'Hide', this.dxMode === 'hide' ? 'on' : '', mode('hide'));
-    this.tile(row, ICONS.paint, 'Show', this.dxMode === 'show' ? 'on' : '', mode('show'));
-    if (ov.strokes.length) {
-      this.tile(row, ICONS.reset, 'Clear brush', '', () => {
-        ov.strokes = [];
-        this.commit();
-        this.refreshSection();
-        this.requestRender();
+      const out = await new Promise<Uint8ClampedArray>((res, rej) => {
+        const wk = new Worker(new URL('../ai/inpaintWorker.ts', import.meta.url), { type: 'module' });
+        wk.onmessage = (e) => {
+          if (e.data.progress !== undefined) this.busy(`Filling ${Math.round(e.data.progress * 100)}%`);
+          else if (e.data.done) {
+            res(e.data.done);
+            wk.terminate();
+          } else if (e.data.error) {
+            rej(new Error(e.data.error));
+            wk.terminate();
+          }
+        };
+        wk.onerror = (e) => {
+          rej(new Error(e.message || 'Fill failed'));
+          wk.terminate();
+        };
+        wk.postMessage({ rgba, w: W, h: H, mask }, [rgba.buffer]);
       });
-    }
-    this.tile(row, ICONS.trash, 'Remove', 'danger', () => {
-      this.state.overlay = null;
-      this.commit();
-      this.refreshSection();
+      if (this.img !== img) return;
+      const gl = this.g.gl;
+      const tex = this.g.texture(W, H, 'u8');
+      gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array(out.buffer, out.byteOffset, out.byteLength));
+      this.fillCache.push({ key, tex });
+      while (this.fillCache.length > 4) gl.deleteTexture(this.fillCache.shift()!.tex);
+      this.pipe.invalidate();
+    } catch (e) {
+      console.error(e);
+      this.toast('Fill failed: ' + ((e as Error).message || 'unknown error'), 4000);
+      this.state.fills = (this.state.fills ?? []).filter((f) => fills.some((q) => q === f) === false);
+    } finally {
+      this.fillJob = '';
+      this.busy(null);
+      const w = this.fillWaiters.splice(0);
+      w.forEach((r) => r());
       this.requestRender();
-    });
+    }
   }
 
   // -----------------------------------------------------------------------------------
@@ -3021,10 +3393,16 @@ export class App {
         break;
       case 'heal':
         this.state.spots = [];
+        this.state.fills = [];
+        this.spotSel = -1;
         break;
       case 'double':
         this.state.overlay = null;
         for (const p of ['dxOpacity', 'dxScale', 'dxRot', 'dxBlend', 'dxX', 'dxY']) v[p] = PARAM_MAP[p].def;
+        break;
+      case 'leak':
+        this.state.leak = null;
+        for (const p of ['lkOpacity', 'lkScale', 'lkRot', 'lkBlend', 'lkX', 'lkY']) v[p] = PARAM_MAP[p].def;
         break;
       case 'curves':
         this.state.curves = defaultState().curves;
@@ -3455,7 +3833,7 @@ export class App {
     $('sheet').classList.remove('on');
     const img = this.img;
     const d = this.exportDims(this.exportOpts.size);
-    this.busy('Exporting 0%');
+    this.busy('Rendering 0%');
     let tmp: Target | null = null;
     try {
       let full = img.full;
@@ -3466,19 +3844,22 @@ export class App {
       }
       this.atlas.sync(this.state.masks);
       this.pipe.brushTex = this.atlas.tex;
+      await this.ensureFill(this.state);
       this.syncOverlay(this.state);
       const blob = await renderExport({
         pipeline: this.pipe, full, analysis: img.preview, state: this.state, w: d.w, h: d.h,
         format: this.exportOpts.format, quality: this.exportOpts.quality,
-        progress: (f) => this.busy(`Exporting ${Math.round(f * 100)}%`),
+        // rendering fills the first 90%; after that the file is being encoded
+        progress: (f) => this.busy(f < 0.9 ? `Rendering ${Math.round((f / 0.9) * 100)}%` : this.exportOpts.format === 'png' ? 'Encoding PNG' : 'Encoding JPEG'),
       });
       if (tmp) {
         this.g.destroy(tmp);
         tmp = null;
       }
-      this.busy(null);
       const name = `${img.name.replace(/\.[^.]+$/, '')}-lumen.${this.exportOpts.format === 'png' ? 'png' : 'jpg'}`;
-      const how = await saveOrShare(blob, name);
+      this.busy('Saving 0%');
+      const how = await saveOrShare(blob, name, (f) => this.busy(`Saving ${Math.round(f * 100)}%`));
+      this.busy(null);
       if (how === 'shown') this.showResult(blob);
       else if (how === 'gallery') this.toast('Saved to your gallery · Pictures/Lumen', 2600);
       else if (how === 'shared') this.toast('Shared');
@@ -3542,6 +3923,10 @@ function describeChange(a: string, b: string): string {
     /* fall through */
   }
   return '';
+}
+
+function wrap180(deg: number) {
+  return ((((deg + 180) % 360) + 360) % 360) - 180;
 }
 
 function wrap90(deg: number) {

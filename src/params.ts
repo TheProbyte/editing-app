@@ -108,6 +108,14 @@ export const PARAMS: ParamDef[] = [
   p('dxBrush', 'Brush size', 1, 100, 30),
   p('dxX', 'Position X', 0, 1, 0.5),
   p('dxY', 'Position Y', 0, 1, 0.5),
+  // Light leak
+  p('lkOpacity', 'Opacity', 0, 100, 80),
+  p('lkScale', 'Size', 10, 300, 100, { fmt: (v) => Math.round(v) + '%' }),
+  p('lkRot', 'Rotate', -180, 180, 0, { fmt: (v) => Math.round(v) + '°' }),
+  p('lkBlend', 'Blend', 0, 8, 2, { fmt: (v) => BLEND_MODES[Math.round(v)] }),
+  p('lkBrush', 'Brush size', 1, 100, 30),
+  p('lkX', 'Position X', 0, 1, 0.5),
+  p('lkY', 'Position Y', 0, 1, 0.5),
   // Remove (spot healing)
   p('healSize', 'Brush size', 1, 100, 25),
   // Geometry (crop tool)
@@ -236,6 +244,10 @@ export interface EditState {
   spots: Spot[];
   /** double exposure: the second photo (stored on the device by id) and its hide/show brush */
   overlay?: { id: string; aspect: number; strokes: Stroke[] } | null;
+  /** light leak: a built-in leak (by id), placed like the double-exposure photo */
+  leak?: { id: string; aspect: number; strokes: Stroke[] } | null;
+  /** content-aware fills: areas painted over, rebuilt from the rest of the photo */
+  fills?: { pts: number[]; r: number }[];
 }
 
 export const BLEND_MODES = ['Normal', 'Lighten', 'Screen', 'Multiply', 'Darken', 'Overlay', 'Soft light', 'Add', 'Difference'];
@@ -256,6 +268,8 @@ export function defaultState(): EditState {
     masks: [],
     spots: [],
     overlay: null,
+    leak: null,
+    fills: [],
   };
 }
 

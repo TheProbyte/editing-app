@@ -1,7 +1,7 @@
 import { GL, Program, Target } from './glutil';
 import { BLUR, BRIGHT, DEVELOP, DOWNSAMPLE, FINISH, GEOMETRY } from './shaders';
 import { buildCurveLut, isIdentity, LUT_SIZE } from '../curves';
-import { EditState, GRADE_ZONES, HSL_BANDS, Geometry, MAX_MASKS, MAX_SPOTS } from '../params';
+import { EditState, GRADE_ZONES, HSL_BANDS, Geometry, MAX_MASKS, MAX_SPOTS, MAX_SPOT_CIRCLES, spotCircles } from '../params';
 
 export interface Source {
   tex: WebGLTexture;
@@ -182,16 +182,21 @@ export class Pipeline {
       gl.uniform2f(p.loc('uFull'), full.w, full.h);
       gl.uniform4f(p.loc('uTile'), tile.x, tile.y, tile.w, tile.h);
       const spots = (state.spots ?? []).slice(0, MAX_SPOTS);
-      const S0 = new Float32Array(MAX_SPOTS * 4), S1 = new Float32Array(MAX_SPOTS * 4), S2 = new Float32Array(MAX_SPOTS);
+      const C = new Float32Array(MAX_SPOT_CIRCLES * 4), P = new Float32Array(MAX_SPOTS * 8);
+      const painted = spots.filter((sp) => sp.pts && sp.pts.length >= 4).length;
+      const per = Math.max(4, Math.min(48, Math.floor((MAX_SPOT_CIRCLES - (spots.length - painted)) / Math.max(1, painted))));
+      let n = 0;
       spots.forEach((sp, i) => {
-        S0.set([sp.x, sp.y, sp.r, 0], i * 4);
-        S1.set([sp.ox, sp.oy, sp.c[0], sp.c[1]], i * 4);
-        S2[i] = sp.c[2];
+        P.set([sp.ox, sp.oy, sp.c[0], sp.c[1], sp.c[2], 0, 0, 0], i * 8);
+        for (const [x, y] of spotCircles(sp, f.w / f.h, per)) {
+          if (n >= MAX_SPOT_CIRCLES) break;
+          C.set([x, y, sp.r, i], n * 4);
+          n++;
+        }
       });
-      gl.uniform1i(p.loc('uSpotCount'), spots.length);
-      gl.uniform4fv(p.loc('uSpot'), S0);
-      gl.uniform4fv(p.loc('uSpotOff'), S1);
-      gl.uniform1fv(p.loc('uSpotCorrB'), S2);
+      gl.uniform1i(p.loc('uCircCount'), n);
+      gl.uniform4fv(p.loc('uCirc'), C);
+      gl.uniform4fv(p.loc('uPatch'), P);
       const ov = state.overlay;
       const on = !!(ov && this.overlay && this.overlay.id === ov.id && state.v.dxOpacity > 0);
       gl.uniform1i(p.loc('uOvOn'), on ? 1 : 0);
@@ -439,6 +444,7 @@ export class Pipeline {
       u1('uVigRound', v.vigRound / 100);
       u1('uVigFeather', v.vigFeather / 100);
       u1('uVigHi', v.vigHighlights / 100);
+      gl.uniform2f(p.loc('uVigC'), v.vigX ?? 0.5, v.vigY ?? 0.5);
       u1('uGrain', v.grain / 100);
       u1('uGrainCell', 0.55 + (v.grainSize / 100) ** 1.6 * 6.5);
       u1('uGrainRough', v.grainRough / 100);

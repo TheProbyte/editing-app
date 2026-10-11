@@ -84,6 +84,8 @@ export const PARAMS: ParamDef[] = [
   p('vigRound', 'Roundness'),
   p('vigFeather', 'Feather', 0, 100, 50),
   p('vigHighlights', 'Protect lights', 0, 100, 0),
+  p('vigX', 'Centre X', 0, 1, 0.5),
+  p('vigY', 'Centre Y', 0, 1, 0.5),
   // Film / lens
   p('fade', 'Fade', 0, 100),
   p('fadeWarmth', 'Fade warmth'),
@@ -107,7 +109,7 @@ export const PARAMS: ParamDef[] = [
   p('dxX', 'Position X', 0, 1, 0.5),
   p('dxY', 'Position Y', 0, 1, 0.5),
   // Remove (spot healing)
-  p('healSize', 'Spot size', 1, 100, 25),
+  p('healSize', 'Brush size', 1, 100, 25),
   // Geometry (crop tool)
   p('straighten', 'Straighten', -45, 45, 0, { fmt: straighten, swipe: 30 }),
   // Grading
@@ -188,6 +190,40 @@ export interface Spot {
   oy: number;
   /** linear RGB added to the copied patch so it matches its new surroundings */
   c: [number, number, number];
+  /** a painted area: the brush path (frame coords); x, y is then its centre */
+  pts?: number[];
+}
+
+/** Max circles the GPU gets for all Remove patches together. */
+export const MAX_SPOT_CIRCLES = 96;
+
+/**
+ * The circles that make up a Remove patch: one for a tap, or a row along the painted path
+ * (frame coords; distances measured in frame heights, so x is scaled by the aspect).
+ */
+export function spotCircles(sp: Spot, aspect: number, maxN = 48): [number, number][] {
+  const P = sp.pts;
+  if (!P || P.length < 4) return [[sp.x, sp.y]];
+  let len = 0;
+  for (let i = 2; i < P.length; i += 2) len += Math.hypot((P[i] - P[i - 2]) * aspect, P[i + 1] - P[i - 1]);
+  const step = Math.max(sp.r * 0.45, len / Math.max(1, maxN - 1));
+  const out: [number, number][] = [[P[0], P[1]]];
+  let carry = 0;
+  for (let i = 2; i < P.length; i += 2) {
+    const ax = P[i - 2], ay = P[i - 1], bx = P[i], by = P[i + 1];
+    const seg = Math.hypot((bx - ax) * aspect, by - ay);
+    let t = step - carry;
+    while (t <= seg && out.length < maxN) {
+      const k = t / seg;
+      out.push([ax + (bx - ax) * k, ay + (by - ay) * k]);
+      t += step;
+    }
+    carry = seg - (t - step);
+  }
+  const lx = P[P.length - 2], ly = P[P.length - 1];
+  const last = out[out.length - 1];
+  if (Math.hypot((lx - last[0]) * aspect, ly - last[1]) > sp.r * 0.2 && out.length < maxN) out.push([lx, ly]);
+  return out;
 }
 
 export const MAX_SPOTS = 32;

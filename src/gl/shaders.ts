@@ -58,11 +58,10 @@ uniform vec2 uFlip;
 uniform float uDistort;
 uniform vec2 uFull;       // output (cropped) image size in px
 uniform vec4 uTile;       // tile offset.xy, size.zw in output px
-// spot healing
-uniform int uSpotCount;
-uniform vec4 uSpot[32];   // x, y, r (frame heights), -
-uniform vec4 uSpotOff[32];// offset x, y (frame coords); correction r, g in zw
-uniform float uSpotCorrB[32];
+// Remove: painted patches as rows of circles (sorted by patch)
+uniform int uCircCount;
+uniform vec4 uCirc[96];    // x, y, r (frame heights), patch index
+uniform vec4 uPatch[64];   // per patch: [2p] = source offset xy (frame coords), correction rg; [2p+1].x = correction b
 // double exposure
 uniform int uOvOn;
 uniform sampler2D uOv;
@@ -112,15 +111,29 @@ void main() {
   vec2 fr = uCrop.xy + g * uCrop.zw;
   vec3 col = srcAt(fr);
   float fa = uFrameSize.x / uFrameSize.y;
-  for (int i = 0; i < 32; i++) {
-    if (i >= uSpotCount) break;
-    vec4 sp = uSpot[i];
-    float dd = length((fr - sp.xy) * vec2(fa, 1.0)) / sp.z;
-    if (dd < 1.0) {
-      vec4 o = uSpotOff[i];
-      vec3 donor = max(srcAt(fr + o.xy) + vec3(o.z, o.w, uSpotCorrB[i]), 0.0);
-      col = mix(col, donor, 1.0 - smoothstep(0.5, 1.0, dd));
+  // each patch covers the union of its circles (soft edge), filled from its source
+  int cur = -1;
+  float wmax = 0.0;
+  for (int i = 0; i <= 96; i++) {
+    int pi = -2;
+    float w = 0.0;
+    if (i < uCircCount && i < 96) {
+      vec4 c = uCirc[i];
+      pi = int(c.w + 0.5);
+      float dd = length((fr - c.xy) * vec2(fa, 1.0)) / c.z;
+      w = dd < 1.0 ? 1.0 - smoothstep(0.55, 1.0, dd) : 0.0;
     }
+    if (pi != cur) {
+      if (cur >= 0 && wmax > 0.0) {
+        vec4 a = uPatch[cur * 2];
+        vec3 donor = max(srcAt(fr + a.xy) + vec3(a.z, a.w, uPatch[cur * 2 + 1].x), 0.0);
+        col = mix(col, donor, wmax);
+      }
+      cur = pi;
+      wmax = 0.0;
+    }
+    wmax = max(wmax, w);
+    if (pi == -2) break;
   }
   if (uOvOn == 1) {
     vec2 P = (fr - uOvC) * uFrameSize;
@@ -542,6 +555,7 @@ uniform vec3 uHalColor;
 uniform float uGlowAmt;
 uniform vec3 uGlowColor;
 uniform float uVig, uVigMid, uVigRound, uVigFeather, uVigHi;
+uniform vec2 uVigC;
 uniform float uGrain, uGrainCell, uGrainRough, uGrainColor, uGrainSh, uGrainHi;
 uniform float uSeed;
 uniform float uClip;
@@ -613,7 +627,7 @@ void main() {
   vec3 p = toPerc(c);
 
   if (uVig != 0.0) {
-    vec2 d = (gUv - 0.5) * 2.0;
+    vec2 d = (gUv - uVigC) * 2.0;
     float aspect = uFull.x / uFull.y;
     float rt = clamp(uVigRound, 0.0, 1.0);
     d *= mix(vec2(1.0), vec2(aspect, 1.0) / max(aspect, 1.0), rt);

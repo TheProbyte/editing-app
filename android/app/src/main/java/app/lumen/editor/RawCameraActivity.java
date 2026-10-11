@@ -8,7 +8,7 @@ import android.content.pm.PackageManager;
 import android.graphics.Color;
 import android.graphics.ImageFormat;
 import android.graphics.SurfaceTexture;
-import android.graphics.drawable.GradientDrawable;
+import android.graphics.drawable.ColorDrawable;
 import android.hardware.camera2.CameraAccessException;
 import android.hardware.camera2.CameraCaptureSession;
 import android.hardware.camera2.CameraCharacteristics;
@@ -16,8 +16,11 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.DngCreator;
 import android.hardware.camera2.TotalCaptureResult;
+import android.hardware.camera2.params.OutputConfiguration;
+import android.hardware.camera2.params.SessionConfiguration;
 import android.hardware.camera2.params.StreamConfigurationMap;
 import android.media.ExifInterface;
 import android.media.Image;
@@ -30,6 +33,7 @@ import android.os.HandlerThread;
 import android.os.Looper;
 import android.provider.MediaStore;
 import android.util.Size;
+import android.util.SizeF;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
@@ -39,6 +43,7 @@ import android.view.TextureView;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.FrameLayout;
+import android.widget.LinearLayout;
 import android.widget.TextView;
 import java.io.File;
 import java.io.FileInputStream;
@@ -46,30 +51,51 @@ import java.io.FileOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Date;
+import java.util.List;
 import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Executor;
 
-/** Minimal Camera2 RAW_SENSOR capture that writes a real DNG and hands it back to the editor. */
+/**
+ * Camera2 RAW_SENSOR capture that writes a real DNG and hands it back to the editor.
+ * Every back lens that offers RAW gets a button (.5×, 1×, 5× …), including the physical
+ * lenses behind a "logical" multi-camera such as a Pixel's.
+ */
 public class RawCameraActivity extends Activity {
 
     private static final int REQ_CAM = 41;
-    private static final int ORANGE = 0xFFFFC83D;
-    private static final int CREAM = 0xFFF4F4F2;
+    private static final int ACCENT = 0xFFFFC83D;
+    private static final int INK = 0xFFF4F4F2;
+    private static final int ACCENT_INK = 0xFF1C1500;
+
+    /** One lens you can shoot with. */
+    private static class Lens {
+        String openId;      // camera to open
+        String physicalId;  // physical lens inside it (null = the camera itself)
+        CameraCharacteristics chars;
+        Size raw;
+        float eq;           // 35mm-equivalent focal length
+        String label;
+        boolean failed;
+    }
 
     private TextureView preview;
     private TextView status;
     private View shutter;
+    private LinearLayout lensRow;
 
     private HandlerThread thread;
     private Handler bg;
     private CameraDevice device;
     private CameraCaptureSession session;
     private ImageReader rawReader;
-    private CameraCharacteristics chars;
-    private String cameraId;
-    private Size rawSize;
+    private final List<Lens> lenses = new ArrayList<>();
+    private Lens lens;
     private Size previewSize;
     private CaptureRequest.Builder previewReq;
 
@@ -91,7 +117,7 @@ public class RawCameraActivity extends Activity {
         root.addView(preview, new FrameLayout.LayoutParams(-1, -1, Gravity.CENTER));
 
         TextView title = text("RAW · DNG", 13);
-        title.setTextColor(ORANGE);
+        title.setTextColor(ACCENT);
         title.setLetterSpacing(0.25f);
         FrameLayout.LayoutParams tl = new FrameLayout.LayoutParams(-2, -2, Gravity.TOP | Gravity.CENTER_HORIZONTAL);
         tl.topMargin = dp(44);
@@ -107,19 +133,26 @@ public class RawCameraActivity extends Activity {
 
         status = text("", 13);
         FrameLayout.LayoutParams sl = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
-        sl.bottomMargin = dp(160);
+        sl.bottomMargin = dp(210);
         root.addView(status, sl);
 
+        lensRow = new LinearLayout(this);
+        lensRow.setOrientation(LinearLayout.HORIZONTAL);
+        FrameLayout.LayoutParams ll = new FrameLayout.LayoutParams(-2, -2, Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        ll.bottomMargin = dp(158);
+        root.addView(lensRow, ll);
+
+        // square pixel-style shutter: yellow block in a white frame
+        FrameLayout shutterFrame = new FrameLayout(this);
+        shutterFrame.setBackground(new ColorDrawable(INK));
+        shutterFrame.setPadding(dp(5), dp(5), dp(5), dp(5));
         shutter = new View(this);
-        GradientDrawable g = new GradientDrawable();
-        g.setShape(GradientDrawable.OVAL);
-        g.setColor(ORANGE);
-        g.setStroke(dp(4), CREAM);
-        shutter.setBackground(g);
-        shutter.setOnClickListener(v -> capture());
-        FrameLayout.LayoutParams bl = new FrameLayout.LayoutParams(dp(76), dp(76), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
+        shutter.setBackground(new ColorDrawable(ACCENT));
+        shutterFrame.addView(shutter, new FrameLayout.LayoutParams(-1, -1));
+        shutterFrame.setOnClickListener(v -> capture());
+        FrameLayout.LayoutParams bl = new FrameLayout.LayoutParams(dp(74), dp(74), Gravity.BOTTOM | Gravity.CENTER_HORIZONTAL);
         bl.bottomMargin = dp(64);
-        root.addView(shutter, bl);
+        root.addView(shutterFrame, bl);
 
         setContentView(root);
         orientationListener = new OrientationEventListener(this) {
@@ -133,7 +166,7 @@ public class RawCameraActivity extends Activity {
     private TextView text(String s, int sp) {
         TextView t = new TextView(this);
         t.setText(s);
-        t.setTextColor(CREAM);
+        t.setTextColor(INK);
         t.setTextSize(TypedValue.COMPLEX_UNIT_SP, sp);
         return t;
     }
@@ -185,42 +218,132 @@ public class RawCameraActivity extends Activity {
         });
     }
 
+    // ------------------------------------------------------------------ lenses
+
+    private static boolean hasRaw(CameraCharacteristics c) {
+        int[] caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
+        if (caps == null) return false;
+        for (int cap : caps) if (cap == CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) return true;
+        return false;
+    }
+
+    private static Size biggestRaw(CameraCharacteristics c) {
+        StreamConfigurationMap map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+        if (map == null) return null;
+        Size[] sizes = map.getOutputSizes(ImageFormat.RAW_SENSOR);
+        if (sizes == null || sizes.length == 0) return null;
+        return Collections.max(Arrays.asList(sizes), (a, b) -> Long.compare((long) a.getWidth() * a.getHeight(), (long) b.getWidth() * b.getHeight()));
+    }
+
+    private static float equivalentFocal(CameraCharacteristics c) {
+        float[] f = c.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS);
+        SizeF s = c.get(CameraCharacteristics.SENSOR_INFO_PHYSICAL_SIZE);
+        if (f == null || f.length == 0 || s == null) return 0;
+        double diag = Math.hypot(s.getWidth(), s.getHeight());
+        return diag > 0 ? (float) (f[0] * 43.27 / diag) : 0;
+    }
+
+    private void addLens(String openId, String physicalId, CameraCharacteristics c) {
+        if (!hasRaw(c)) return;
+        Size raw = biggestRaw(c);
+        if (raw == null) return;
+        Lens l = new Lens();
+        l.openId = openId;
+        l.physicalId = physicalId;
+        l.chars = c;
+        l.raw = raw;
+        l.eq = equivalentFocal(c);
+        // the same lens can show up twice (on its own and inside a logical camera): keep one,
+        // preferring the plain camera
+        for (int i = 0; i < lenses.size(); i++) {
+            Lens o = lenses.get(i);
+            if (o.eq > 0 && l.eq > 0 && Math.abs(o.eq - l.eq) / o.eq < 0.08) {
+                if (o.physicalId != null && physicalId == null) lenses.set(i, l);
+                return;
+            }
+        }
+        lenses.add(l);
+    }
+
+    private void findLenses(CameraManager cm) throws CameraAccessException {
+        lenses.clear();
+        for (String id : cm.getCameraIdList()) {
+            CameraCharacteristics c = cm.getCameraCharacteristics(id);
+            Integer facing = c.get(CameraCharacteristics.LENS_FACING);
+            if (facing == null || facing != CameraCharacteristics.LENS_FACING_BACK) continue;
+            addLens(id, null, c);
+            if (Build.VERSION.SDK_INT >= 28) {
+                Set<String> phys = c.getPhysicalCameraIds();
+                for (String pid : phys) {
+                    try {
+                        addLens(id, pid, cm.getCameraCharacteristics(pid));
+                    } catch (Exception ignored) {}
+                }
+            }
+        }
+        Collections.sort(lenses, (a, b) -> Float.compare(a.eq, b.eq));
+        // the main lens: closest to a 24-26mm view (or the biggest sensor when focal data is missing)
+        Lens main = null;
+        for (Lens l : lenses) {
+            if (main == null) main = l;
+            else if (l.eq > 0 && main.eq > 0 ? Math.abs(l.eq - 25) < Math.abs(main.eq - 25)
+                    : (long) l.raw.getWidth() * l.raw.getHeight() > (long) main.raw.getWidth() * main.raw.getHeight()) main = l;
+        }
+        for (Lens l : lenses) {
+            float k = main != null && main.eq > 0 && l.eq > 0 ? l.eq / main.eq : 1;
+            if (k < 0.95) l.label = String.format(Locale.US, "%.1f×", k).replace("0.", ".");
+            else l.label = Math.round(k) + "×";
+        }
+        if (lens == null) lens = main;
+    }
+
+    private void buildLensRow() {
+        runOnUiThread(() -> {
+            lensRow.removeAllViews();
+            if (lenses.size() < 2) return;
+            for (Lens l : lenses) {
+                if (l.failed) continue;
+                TextView b = text(l.label, 14);
+                b.setPadding(dp(14), dp(8), dp(14), dp(8));
+                boolean on = l == lens;
+                b.setBackground(new ColorDrawable(on ? ACCENT : 0x66000000));
+                b.setTextColor(on ? ACCENT_INK : INK);
+                LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(-2, -2);
+                lp.leftMargin = lp.rightMargin = dp(4);
+                b.setOnClickListener(v -> switchLens(l));
+                lensRow.addView(b, lp);
+            }
+        });
+    }
+
+    private void switchLens(Lens l) {
+        if (l == lens || busy) return;
+        lensRow.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK);
+        bg.post(() -> {
+            closeCamera();
+            lens = l;
+            buildLensRow();
+            openCamera();
+        });
+    }
+
+    // ------------------------------------------------------------------ camera
+
     private void openCamera() {
         if (device != null) return;
         CameraManager cm = (CameraManager) getSystemService(CAMERA_SERVICE);
         try {
-            long bestArea = 0;
-            for (String id : cm.getCameraIdList()) {
-                CameraCharacteristics c = cm.getCameraCharacteristics(id);
-                Integer facing = c.get(CameraCharacteristics.LENS_FACING);
-                if (facing == null || facing != CameraCharacteristics.LENS_FACING_BACK) continue;
-                int[] caps = c.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES);
-                boolean raw = false;
-                if (caps != null) for (int cap : caps) if (cap == CameraMetadata.REQUEST_AVAILABLE_CAPABILITIES_RAW) raw = true;
-                if (!raw) continue;
-                StreamConfigurationMap map = c.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-                if (map == null) continue;
-                Size[] sizes = map.getOutputSizes(ImageFormat.RAW_SENSOR);
-                if (sizes == null || sizes.length == 0) continue;
-                Size big = Collections.max(Arrays.asList(sizes), (a, bb) -> Long.compare((long) a.getWidth() * a.getHeight(), (long) bb.getWidth() * bb.getHeight()));
-                long area = (long) big.getWidth() * big.getHeight();
-                // first back camera with RAW is normally the main sensor; prefer it unless another is clearly bigger
-                if (cameraId == null || area > bestArea * 1.2) {
-                    cameraId = id;
-                    chars = c;
-                    rawSize = big;
-                    bestArea = area;
-                }
-            }
-            if (cameraId == null) {
+            if (lenses.isEmpty()) findLenses(cm);
+            if (lens == null) {
                 fail("This phone doesn't offer RAW capture to apps");
                 return;
             }
-            StreamConfigurationMap map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
-            previewSize = pickPreview(map.getOutputSizes(SurfaceTexture.class), rawSize);
+            buildLensRow();
+            StreamConfigurationMap map = lens.chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP);
+            previewSize = pickPreview(map.getOutputSizes(SurfaceTexture.class), lens.raw);
             layoutPreview();
 
-            rawReader = ImageReader.newInstance(rawSize.getWidth(), rawSize.getHeight(), ImageFormat.RAW_SENSOR, 2);
+            rawReader = ImageReader.newInstance(lens.raw.getWidth(), lens.raw.getHeight(), ImageFormat.RAW_SENSOR, 2);
             rawReader.setOnImageAvailableListener(r -> {
                 Image img = r.acquireNextImage();
                 synchronized (this) {
@@ -230,7 +353,7 @@ public class RawCameraActivity extends Activity {
             }, bg);
 
             //noinspection MissingPermission
-            cm.openCamera(cameraId, new CameraDevice.StateCallback() {
+            cm.openCamera(lens.openId, new CameraDevice.StateCallback() {
                 @Override public void onOpened(CameraDevice d) {
                     device = d;
                     startSession();
@@ -242,12 +365,31 @@ public class RawCameraActivity extends Activity {
                 @Override public void onError(CameraDevice d, int e) {
                     d.close();
                     device = null;
-                    fail("Camera error " + e);
+                    lensFailed("Camera error " + e);
                 }
             }, bg);
         } catch (SecurityException | CameraAccessException e) {
             fail("Couldn't open the camera: " + e.getMessage());
         }
+    }
+
+    /** A lens that won't give RAW to apps: hide it and go back to another one. */
+    private void lensFailed(String why) {
+        Lens bad = lens;
+        if (bad != null) bad.failed = true;
+        Lens next = null;
+        for (Lens l : lenses) if (!l.failed && (next == null || Math.abs(l.eq - 25) < Math.abs(next.eq - 25))) next = l;
+        if (next == null) {
+            fail(why);
+            return;
+        }
+        final Lens n = next;
+        runOnUiThread(() -> status.setText(bad != null ? bad.label + " can't shoot RAW for apps" : why));
+        bg.post(() -> {
+            closeCamera();
+            lens = n;
+            openCamera();
+        });
     }
 
     private static Size pickPreview(Size[] options, Size raw) {
@@ -281,22 +423,34 @@ public class RawCameraActivity extends Activity {
             previewReq = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW);
             previewReq.addTarget(ps);
             previewReq.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            //noinspection deprecation
-            device.createCaptureSession(Arrays.asList(ps, rawReader.getSurface()), new CameraCaptureSession.StateCallback() {
+            CameraCaptureSession.StateCallback cb = new CameraCaptureSession.StateCallback() {
                 @Override public void onConfigured(CameraCaptureSession s) {
                     session = s;
+                    runOnUiThread(() -> status.setText(""));
                     try {
                         s.setRepeatingRequest(previewReq.build(), null, bg);
                     } catch (Exception e) {
-                        fail("Preview failed: " + e.getMessage());
+                        lensFailed("Preview failed: " + e.getMessage());
                     }
                 }
                 @Override public void onConfigureFailed(CameraCaptureSession s) {
-                    fail("The camera couldn't be configured for RAW");
+                    lensFailed("The camera couldn't be configured for RAW");
                 }
-            }, bg);
+            };
+            if (lens.physicalId != null && Build.VERSION.SDK_INT >= 28) {
+                // stream straight from one physical lens of the logical camera
+                OutputConfiguration po = new OutputConfiguration(ps);
+                po.setPhysicalCameraId(lens.physicalId);
+                OutputConfiguration ro = new OutputConfiguration(rawReader.getSurface());
+                ro.setPhysicalCameraId(lens.physicalId);
+                Executor ex = bg::post;
+                device.createCaptureSession(new SessionConfiguration(SessionConfiguration.SESSION_REGULAR, Arrays.asList(po, ro), ex, cb));
+            } else {
+                //noinspection deprecation
+                device.createCaptureSession(Arrays.asList(ps, rawReader.getSurface()), cb, bg);
+            }
         } catch (Exception e) {
-            fail("Preview failed: " + e.getMessage());
+            lensFailed("Preview failed: " + e.getMessage());
         }
     }
 
@@ -304,13 +458,14 @@ public class RawCameraActivity extends Activity {
         if (session == null || busy) return;
         busy = true;
         shutter.performHapticFeedback(HapticFeedbackConstants.CONFIRM);
-        shutter.animate().scaleX(0.86f).scaleY(0.86f).setDuration(90).withEndAction(() -> shutter.animate().scaleX(1).scaleY(1).setDuration(140));
+        View frame = (View) shutter.getParent();
+        frame.animate().scaleX(0.88f).scaleY(0.88f).setDuration(80).withEndAction(() -> frame.animate().scaleX(1).scaleY(1).setDuration(140));
         status.setText("Capturing RAW…");
         try {
             CaptureRequest.Builder r = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
             r.addTarget(rawReader.getSurface());
             r.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE);
-            int[] shading = chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES);
+            int[] shading = lens.chars.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES);
             if (shading != null) for (int m : shading) if (m == CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON) {
                 r.set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CameraMetadata.STATISTICS_LENS_SHADING_MAP_MODE_ON);
             }
@@ -328,6 +483,21 @@ public class RawCameraActivity extends Activity {
         }
     }
 
+    /** The metadata that belongs to the lens that shot (a physical lens has its own). */
+    @SuppressWarnings("deprecation")
+    private CaptureResult resultFor(TotalCaptureResult res) {
+        if (lens.physicalId == null || Build.VERSION.SDK_INT < 28) return res;
+        try {
+            if (Build.VERSION.SDK_INT >= 31) {
+                Map<String, TotalCaptureResult> m = res.getPhysicalCameraTotalResults();
+                if (m.containsKey(lens.physicalId)) return m.get(lens.physicalId);
+            }
+            Map<String, CaptureResult> m = res.getPhysicalCameraResults();
+            if (m.containsKey(lens.physicalId)) return m.get(lens.physicalId);
+        } catch (Exception ignored) {}
+        return res;
+    }
+
     private void maybeSave() {
         Image img;
         TotalCaptureResult res;
@@ -340,7 +510,7 @@ public class RawCameraActivity extends Activity {
         }
         String name = "LUMEN_" + new SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(new Date()) + ".dng";
         File f = new File(getCacheDir(), name);
-        try (DngCreator dng = new DngCreator(chars, res); FileOutputStream os = new FileOutputStream(f)) {
+        try (DngCreator dng = new DngCreator(lens.chars, resultFor(res)); FileOutputStream os = new FileOutputStream(f)) {
             dng.setOrientation(exifOrientation());
             dng.writeImage(os, img);
         } catch (Exception e) {
@@ -364,7 +534,7 @@ public class RawCameraActivity extends Activity {
     }
 
     private int exifOrientation() {
-        Integer so = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
+        Integer so = lens.chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
         // back camera: sensor orientation plus how the phone is being held
         int deg = (so == null ? 90 : so) + deviceDeg;
         switch ((deg % 360 + 360) % 360) {

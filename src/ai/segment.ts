@@ -124,8 +124,10 @@ export class Segmenter {
   private getPeople(progress: (f: number) => void) {
     this.people ??= lib().then((mp) =>
       this.create(
-        (buf, delegate) => mp.ImageSegmenter.createFromOptions(fileset(), {
-          baseOptions: { modelAssetBuffer: buf, delegate },
+        // small model: the CPU is quick enough, and reading GPU-side masks back gives
+        // empty results on some phones
+        (buf) => mp.ImageSegmenter.createFromOptions(fileset(), {
+          baseOptions: { modelAssetBuffer: buf, delegate: 'CPU' },
           runningMode: 'IMAGE',
           outputConfidenceMasks: true,
           outputCategoryMask: false,
@@ -192,7 +194,12 @@ export class Segmenter {
       if (!m) continue;
       for (let i = 0; i < out.length; i++) out[i] += m[i];
     }
-    for (let i = 0; i < out.length; i++) out[i] = Math.min(1, out[i]);
+    let any = 0;
+    for (let i = 0; i < out.length; i++) {
+      out[i] = Math.min(1, out[i]);
+      if (out[i] > 0.5) any++;
+    }
+    if (any < out.length * 0.002) throw new Error(cats.includes(0) ? 'Couldn’t find the background' : 'No people found in this photo');
     return { data: out, w: P.w, h: P.h };
   }
 }

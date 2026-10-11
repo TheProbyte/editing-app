@@ -59,7 +59,6 @@ export class Camera {
   async open(onPhoto: (f: File) => void) {
     this.onPhoto = onPhoto;
     this.el.classList.add('on');
-    history.pushState({ lumen: 'camera' }, '');
     await this.start();
   }
 
@@ -71,7 +70,7 @@ export class Camera {
   close(fromBack = false) {
     this.stop();
     this.el.classList.remove('on');
-    if (!fromBack && history.state?.lumen === 'camera') history.back();
+    void fromBack;
   }
 
   private async start() {

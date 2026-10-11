@@ -2,11 +2,11 @@ import { GL, Target } from '../gl/glutil';
 import { Pipeline, Source, frameSize, outputSize, wbMul } from '../gl/pipeline';
 import { BrushAtlas } from '../gl/brushAtlas';
 import {
-  EditState, PARAM_MAP, ParamDef, CurvePoint, Curves, cloneState, defaultState, defaultValues, LINEAR, plain,
-  Mask, MaskType, MASK_ADJ, MASK_SETTINGS, MASK_TYPE_SETTINGS, MASK_LABEL, MAX_MASKS, Stroke, Spot, MAX_SPOTS,
+  EditState, PARAM_MAP, ParamDef, clampParam, CurvePoint, Curves, cloneState, defaultState, defaultValues, LINEAR, plain,
+  Mask, MaskType, MASK_ADJ, MASK_SETTINGS, MASK_TYPE_SETTINGS, MASK_LABEL, MAX_MASKS, Stroke, Spot, MAX_SPOTS, spotCircles,
 } from '../params';
 import { makeSpline } from '../curves';
-import { LOOKS, Look } from '../presets';
+import { LOOKS, Look, ImgStats, measure } from '../presets';
 import { loadFile } from '../io/loader';
 import { CANVAS_LIMIT, framed, renderExport, saveOrShare } from '../io/export';
 import { loadBlob, loadSession, saveBlob, saveFile, saveState } from '../io/session';
@@ -15,7 +15,7 @@ import { ICONS } from './icons';
 import { CurveEditor } from './curveEditor';
 import { CropOverlay, fitAspect } from './cropOverlay';
 import { MaskOverlay } from './maskOverlay';
-import { BlurOverlay } from './blurOverlay';
+import { BlurOverlay, VignetteOverlay } from './blurOverlay';
 import { HealOverlay } from './healOverlay';
 import { Loupe } from './loupe';
 import { drawHistogram } from './histogram';
@@ -89,6 +89,9 @@ export class App {
   private crop!: CropOverlay;
   private maskOv!: MaskOverlay;
   private blurOv!: BlurOverlay;
+  private vigOv!: VignetteOverlay;
+  /** two-finger shaping (blur / vignette): where the gesture started */
+  private shape0: { d: number; a: number; size: number; angle: number; mid: number; sx: number; sy: number } | null = null;
   private healOv!: HealOverlay;
   /** selected Remove spot (its source ring can be dragged), or -1 */
   private spotSel = -1;
@@ -106,6 +109,7 @@ export class App {
   private baseFailed = new Set<string>();
   private frameImg: { key: string; canvas: HTMLCanvasElement; px: Uint8ClampedArray; w: number; h: number } | null = null;
   private aiStroke: { neg: boolean; pts: number[] } | null = null;
+  private maskFlashTimer = 0;
   // double exposure: the second photo on the GPU, its hide/show brush, and the drag mode
   private ovAtlas!: BrushAtlas;
   private ovImg: { id: string; tex: WebGLTexture } | null = null;
@@ -122,8 +126,6 @@ export class App {
   private camera!: Camera;
   /** state when the open section was entered, for back-gesture cancel */
   private sectionStart = '';
-  private ignorePop = false;
-  private healSize = 22; // spot radius in screen px
   private detailTimer = 0;
   /** full-res pixels of a region of the output, for deep zoom */
   private detail: { px: Uint8Array; x: number; y: number; w: number; h: number; W: number; H: number; ver: number } | null = null;
@@ -161,13 +163,34 @@ export class App {
         type: Math.round(v.blurType), x: v.blurX, y: v.blurY,
         size: (v.blurSize / 100) * 0.6, feather: 0.02 + (v.blurFeather / 100) * 0.5, angle: (v.blurAngle * Math.PI) / 180,
       };
-    }, (x, y, commit) => {
-      this.state.v.blurX = x;
-      this.state.v.blurY = y;
+    }, (p, commit) => {
+      const v = this.state.v;
+      if (p.x !== undefined) v.blurX = p.x;
+      if (p.y !== undefined) v.blurY = p.y;
+      if (p.size !== undefined) v.blurSize = clampParam('blurSize', (p.size / 0.6) * 100);
+      if (p.angle !== undefined) v.blurAngle = wrap90((p.angle * 180) / Math.PI);
       this.requestRender();
-      if (commit) this.commit();
+      if (Object.keys(p).length) this.showHud(this.currentParam() ?? 'blurSize');
+      if (commit) this.commitAndRefresh();
     });
-    this.healOv = new HealOverlay($('healLayer'), this.maskOv, () => ({ spots: this.state.spots, sel: this.spotSel, preview: null }));
+    this.vigOv = new VignetteOverlay($('vigLayer'), () => {
+      const v = this.state.v;
+      return { x: v.vigX, y: v.vigY, start: 0.25 + (v.vigMidpoint / 100) * 0.9, round: v.vigRound / 100, aspect: this.canvas.width / Math.max(1, this.canvas.height) };
+    }, (p, commit) => {
+      const v = this.state.v;
+      if (p.x !== undefined) v.vigX = p.x;
+      if (p.y !== undefined) v.vigY = p.y;
+      if (p.start !== undefined) v.vigMidpoint = clampParam('vigMidpoint', ((p.start - 0.25) / 0.9) * 100);
+      if (p.round !== undefined) v.vigRound = clampParam('vigRound', p.round * 100);
+      if (v.vignette === 0 && Object.keys(p).length) v.vignette = -35; // moving an invisible vignette: give it some strength
+      this.requestRender();
+      if (commit) this.commitAndRefresh();
+      else if (this.currentParam()) this.showHud(this.currentParam()!);
+    });
+    this.healOv = new HealOverlay($('healLayer'), this.maskOv, () => ({
+      spots: this.state.spots, sel: this.spotSel, aspect: this.frameInfo().aspect,
+      painting: this.healPaint ? { pts: this.healPaint.pts, r: this.healPaint.r } : null,
+    }));
     this.camera = new Camera((m, ms) => this.toast(m, ms));
     this.bindChrome();
     this.bindGestures();
@@ -279,6 +302,8 @@ export class App {
         }
         this.history = [];
         this.hIdx = -1;
+        this.paramIdx = {};
+        this.sub = {};
         this.look = { base: null, idx: -1, amt: 100 };
         this.aspectId = 'free';
         this.zoom = { s: 1, x: 0, y: 0 };
@@ -564,10 +589,8 @@ export class App {
     if (this.uiOff) return { top: 0, bot: 0, sw, sh };
     const topEl = document.querySelector('.top') as HTMLElement;
     const top = topEl.offsetHeight - 16;
-    const dock = $('dock');
-    const tools = $('tools'), section = $('section');
-    const active = this.tool ? section : tools;
-    const bot = dock.offsetHeight - Math.max(tools.offsetHeight, section.offsetHeight) + active.offsetHeight - 14;
+    // the dock only holds the visible half (tools or section), so its height is what's covered
+    const bot = $('dock').offsetHeight - 6;
     return { top, bot, sw, sh };
   }
 
@@ -620,6 +643,7 @@ export class App {
     if (k === 'masks') this.maskOv.draw();
     if (k === 'blur') this.blurOv.draw();
     if (k === 'heal') this.healOv.draw();
+    if (this.tool?.id === 'vignette') this.vigOv.draw();
   }
 
   /** Tap the photo: fade all controls away (or back). */
@@ -650,6 +674,33 @@ export class App {
   private commitAndRefresh() {
     this.commit();
     this.updateSecBar();
+  }
+
+  /** Undo / redo with a click you can feel and a badge saying what changed. */
+  private undoRedo(dir: -1 | 1) {
+    const i = this.hIdx + dir;
+    if (i < 0 || i >= this.history.length) return;
+    const before = this.history[this.hIdx];
+    const after = this.history[i];
+    this.restore(i);
+    tick(true);
+    const what = describeChange(before, after);
+    this.flash((dir < 0 ? 'Undo' : 'Redo') + (what ? ' · ' + what : ''));
+    const b = $(dir < 0 ? 'btnUndo' : 'btnRedo');
+    b.classList.remove('kick');
+    void b.offsetWidth;
+    b.classList.add('kick');
+  }
+
+  private flashTimer = 0;
+  private flash(text: string) {
+    const el = $('flash');
+    el.textContent = text;
+    el.classList.remove('on');
+    void el.offsetWidth;
+    el.classList.add('on');
+    clearTimeout(this.flashTimer);
+    this.flashTimer = window.setTimeout(() => el.classList.remove('on'), 900);
   }
 
   private restore(i: number) {
@@ -698,6 +749,7 @@ export class App {
     } else {
       this.state.v[id] = v;
       if (id.startsWith('blur')) this.blurOv.draw();
+      if (id.startsWith('vig')) this.vigOv.draw();
     }
     this.requestRender();
   }
@@ -711,7 +763,7 @@ export class App {
       return [...MASK_ADJ.map((d) => 'ma.' + d.id), ...MASK_TYPE_SETTINGS[m.type].map((k) => 'mg.' + k)];
     }
     if (t.kind === 'blur') return t.params(String(Math.round(this.state.v.blurType)));
-    if (t.kind === 'heal') return [];
+    if (t.kind === 'heal') return ['healSize'];
     if (t.kind === 'double') return this.state.overlay ? (this.dxMode === 'move' ? ['dxOpacity', 'dxScale', 'dxRot'] : ['dxBrush', 'dxOpacity']) : [];
     if (t.kind === 'looks') return this.look.idx > 0 ? ['lookAmt'] : [];
     return t.params(this.sub[t.id] ?? t.subs?.[0].id ?? '');
@@ -760,7 +812,7 @@ export class App {
     $('btnHome').innerHTML = ICONS.home;
     $('btnHome').onclick = () => {
       tick();
-      this.showHome(true);
+      this.showHome(true, true);
     };
     $('btnCamera').onclick = () => this.takePhoto();
     $('btnUndo').innerHTML = ICONS.undo;
@@ -776,8 +828,8 @@ export class App {
       if (f) this.open(f);
     };
     $('btnOpenBig').onclick = () => this.pickPhoto();
-    $('btnUndo').onclick = () => this.restore(this.hIdx - 1);
-    $('btnRedo').onclick = () => this.restore(this.hIdx + 1);
+    $('btnUndo').onclick = () => this.undoRedo(-1);
+    $('btnRedo').onclick = () => this.undoRedo(1);
     $('secDone').onclick = () => {
       tick();
       this.closeSection();
@@ -833,11 +885,14 @@ export class App {
 
   /** The home screen (logo + open / take photo). Over an open photo it's a page you can go back from. */
   private homeOver = false;
-  private showHome(on: boolean) {
+  /** opened with the home button (back returns to the photo) rather than by going back */
+  private homeFromButton = false;
+  private showHome(on: boolean, fromButton = false) {
     const el = $('empty');
     if (!this.img) return;
     if (on === this.homeOver) return;
     this.homeOver = on;
+    this.homeFromButton = on && fromButton;
     const resume = $<HTMLButtonElement>('btnResume');
     if (on) {
       this.setMode(null);
@@ -846,16 +901,12 @@ export class App {
       resume.hidden = false;
       resume.textContent = 'Back to photo';
       resume.onclick = () => this.showHome(false);
-      history.pushState({ lumen: 'home' }, '');
     } else {
       el.classList.remove('over');
       el.classList.add('hidden');
       resume.hidden = true;
-      if (history.state?.lumen === 'home') {
-        this.ignorePop = true;
-        history.back();
-      }
     }
+    this.syncGuard();
   }
 
   private setCompare(on: boolean) {
@@ -938,16 +989,12 @@ export class App {
     });
   }
 
-  private showAll(on: boolean, fromPop = false) {
+  private showAll(on: boolean) {
     if (on === this.allOpen || (on && !this.img)) return;
     this.allOpen = on;
     if (on) this.buildAll();
     $('allTools').classList.toggle('on', on);
-    if (on) history.pushState({ lumen: 'all' }, '');
-    else if (!fromPop && history.state?.lumen === 'all') {
-      this.ignorePop = true;
-      history.back();
-    }
+    this.syncGuard();
   }
 
   /** Swipe up on the tool bar (or tap the handle) to see every tool at once. */
@@ -977,6 +1024,26 @@ export class App {
       tick();
       this.showAll(false);
     };
+    // swipe down anywhere on the grid page to put it away
+    const all = $('allTools');
+    let down: { y: number; id: number } | null = null;
+    all.addEventListener('pointerdown', (e) => (down = { y: e.clientY, id: e.pointerId }));
+    all.addEventListener('pointermove', (e) => {
+      if (!down || e.pointerId !== down.id) return;
+      const dy = e.clientY - down.y;
+      if (dy > 0) (all.querySelector('.all-grid') as HTMLElement).style.transform = `translateY(${dy * 0.5}px)`;
+      if (dy > 70) {
+        down = null;
+        tick();
+        this.showAll(false);
+      }
+    });
+    const reset = () => {
+      down = null;
+      (all.querySelector('.all-grid') as HTMLElement).style.transform = '';
+    };
+    all.addEventListener('pointerup', reset);
+    all.addEventListener('pointercancel', reset);
   }
 
   /** Open a section (focused controls) or go back to the tool bar (null). */
@@ -987,15 +1054,14 @@ export class App {
       this.look.idx = -1;
     }
     if (prev && !t) this.commit();
-    if (t && !prev) {
-      this.sectionStart = JSON.stringify(this.state);
-      history.pushState({ lumen: 'section' }, '');
-    }
+    queueMicrotask(() => this.syncGuard());
+    if (t && !prev) this.sectionStart = JSON.stringify(this.state);
     this.tool = t;
     this.showMenu(false);
     this.loupe.hide();
     this.appEl.dataset.mode = t ? 'section' : 'tools';
     if (t && t !== prev) {
+      this.paramIdx[t.id] = 0; // every section starts on its first adjustment
       // rows slide in once when a section opens (not on every rebuild)
       const sec = $('section');
       sec.classList.remove('enter');
@@ -1011,6 +1077,7 @@ export class App {
     this.crop.show(t?.kind === 'crop' && !!this.img);
     this.maskOv.show(t?.kind === 'masks' && !!this.img);
     this.blurOv.show(t?.kind === 'blur' && !!this.img);
+    this.vigOv.show(t?.id === 'vignette' && !!this.img);
     if (t?.kind !== 'heal') this.spotSel = -1;
     this.healOv.show(t?.kind === 'heal' && !!this.img);
     if (t?.kind === 'masks' && this.maskSel < 0 && this.state.masks.length) this.maskSel = 0;
@@ -1020,7 +1087,7 @@ export class App {
     this.requestRender();
     if (t?.kind === 'masks' && !this.state.masks.length && this.img) setTimeout(() => this.openMaskSheet(), 180);
     if (t?.kind === 'double' && this.img && !this.state.overlay) setTimeout(() => this.pickOverlay(), 200);
-    if (t?.kind === 'heal' && this.img) this.toast('Press on a spot, slide to place it, let go to remove it', 2800);
+    if (t?.kind === 'heal' && this.img) this.toast('Paint over what to remove · let go to fix it', 2600);
   }
 
   private refreshSection() {
@@ -1212,6 +1279,24 @@ export class App {
     else if (notch(v) !== notch(before)) tick();
     this.showHud(vd.id);
     if (this.kind() === 'blur') this.blurOv.draw();
+    this.showSizeRing(vd.id);
+  }
+
+  /** While a brush size changes, show the brush at that size in the middle of the photo. */
+  private sizeTimer = 0;
+  private showSizeRing(id: string) {
+    const k = this.maskOv.pxPerFrameH();
+    const px = id === 'healSize' ? this.healPx() : id === 'mg.size' ? this.brushRadius() * k : id === 'dxBrush' ? this.dxRadius() * k : 0;
+    if (!px) return;
+    const ring = $('brushRing');
+    const st = this.stage.getBoundingClientRect();
+    const cy = (this.region().top + st.height - this.region().bot) / 2;
+    ring.style.width = ring.style.height = px * 2 + 'px';
+    ring.style.transform = `translate(${st.width / 2 - px}px, ${cy - px}px)`;
+    ring.classList.remove('erase');
+    ring.classList.add('on', 'size');
+    clearTimeout(this.sizeTimer);
+    this.sizeTimer = window.setTimeout(() => ring.classList.remove('on', 'size'), 650);
   }
   private endValue() {
     if (!this.vd) return;
@@ -1308,7 +1393,9 @@ export class App {
     menu.querySelectorAll<HTMLElement>('.it').forEach((el) => {
       const k = Number(el.dataset.i);
       el.classList.toggle('sel', k === i);
-      el.style.opacity = String(Math.max(0.18, 1 - Math.abs(k - i) * 0.22));
+      const d = Math.abs(k - i);
+      el.style.opacity = String(Math.max(0.12, 1 - d * 0.3));
+      el.style.transform = `scale(${Math.max(0.84, 1 - d * 0.06)})`;
       if (k === i) target = el;
     });
     if (!target) return;
@@ -1365,7 +1452,7 @@ export class App {
   private bindGestures() {
     const st = this.stage;
     const pts = new Map<number, { x: number; y: number }>();
-    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx';
+    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx' | 'vig' | 'shape';
     let mode: Mode = 'none';
     let sx = 0, sy = 0, startIdx = 0, lastStep = 0;
     let lastX = 0, lastT = 0;
@@ -1404,9 +1491,21 @@ export class App {
         if (mode === 'heal') this.healCancel();
         this.hideBrushRing();
         this.setCompare(false);
+        if (mode === 'vig') this.vigOv.end();
+        if (mode === 'blur') this.blurOv.end();
         const [a, b] = [...pts.values()];
         const m = stageXY((a.x + b.x) / 2, (a.y + b.y) / 2);
         pinch0 = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: m.x, my: m.y, ...this.zoom };
+        // in Blur and Vignette two fingers shape the effect (pinch = size, twist = angle)
+        const v = this.state.v;
+        if ((this.kind() === 'blur' && v.blurType > 0) || this.tool?.id === 'vignette') {
+          this.shape0 = {
+            d: pinch0.d, a: Math.atan2(b.y - a.y, b.x - a.x), size: v.blurSize, angle: v.blurAngle, mid: v.vigMidpoint,
+            sx: Math.abs(b.x - a.x), sy: Math.abs(b.y - a.y),
+          };
+          mode = 'shape';
+          return;
+        }
         mode = 'pinch';
         return;
       }
@@ -1416,6 +1515,11 @@ export class App {
       const k = this.kind();
       if (k === 'crop' && this.cropGrab(e)) {
         mode = 'crop';
+        return;
+      }
+      if (this.tool?.id === 'vignette' && this.vigOv.start(e)) {
+        mode = 'vig';
+        tick();
         return;
       }
       if (k === 'blur' && this.blurOv.start(e)) {
@@ -1485,6 +1589,25 @@ export class App {
         this.applyZoom();
         return;
       }
+      if (mode === 'shape' && pts.size >= 2 && this.shape0) {
+        const [a, b] = [...pts.values()];
+        const S = this.shape0, v = this.state.v;
+        const ratio = Math.hypot(a.x - b.x, a.y - b.y) / S.d;
+        if (this.kind() === 'blur') {
+          v.blurSize = clampParam('blurSize', S.size * ratio);
+          if (v.blurType === 1) v.blurAngle = wrap90(S.angle + ((Math.atan2(b.y - a.y, b.x - a.x) - S.a) * 180) / Math.PI);
+          this.blurOv.draw();
+        } else {
+          const start = (0.25 + (S.mid / 100) * 0.9) * ratio;
+          v.vigMidpoint = clampParam('vigMidpoint', ((start - 0.25) / 0.9) * 100);
+          this.vigOv.draw();
+        }
+        this.requestRender();
+        const id = this.currentParam();
+        if (id) this.showHud(id);
+        return;
+      }
+      if (mode === 'vig') return this.vigOv.moveTo(e);
       if (mode === 'crop') return this.crop.move(e);
       if (mode === 'blur') return this.blurOv.moveTo(e);
       if (mode === 'mask') {
@@ -1549,9 +1672,9 @@ export class App {
         this.moveValue((ddx / st.clientWidth) * range * fine);
       } else if (mode === 'menu') {
         const n = this.params().length;
-        // detents: every 30px of travel moves exactly one row (at most one per event),
+        // detents: every 42px of travel moves exactly one row (at most one per event),
         // measured from where the list opened; swiping up moves down the list
-        const STEP = 30;
+        const STEP = 42;
         let d = anchorY - e.clientY;
         let i = lastStep;
         if (d >= STEP && i < n - 1) {
@@ -1582,6 +1705,20 @@ export class App {
         if (pts.size === 0) mode = 'none';
         return;
       }
+      if (mode === 'shape') {
+        if (pts.size === 0) {
+          mode = 'none';
+          this.shape0 = null;
+          tick();
+          this.commitAndRefresh();
+        }
+        return;
+      }
+      if (mode === 'vig') {
+        this.vigOv.end();
+        mode = 'none';
+        return;
+      }
       if (mode === 'crop') {
         this.crop.end();
         this.updateSecBar();
@@ -1602,7 +1739,7 @@ export class App {
       } else if (mode === 'pick') {
         this.endPick(true);
       } else if (mode === 'heal') {
-        this.healUp(e);
+        this.healUp();
       } else if (mode === 'compare') {
         this.setCompare(false);
       } else if (mode === 'value' || mode === 'menu') {
@@ -1819,6 +1956,13 @@ export class App {
       ctx.putImageData(out, 0, 0);
       this.bases.set(key, c);
       this.lastBase.set(m.id, c);
+      // show what got selected for a moment
+      this.maskInteracting = true;
+      clearTimeout(this.maskFlashTimer);
+      this.maskFlashTimer = window.setTimeout(() => {
+        this.maskInteracting = false;
+        this.requestRender();
+      }, 1400);
       // keep the cache small: rasters are ~1 MP each
       while (this.bases.size > 24) this.bases.delete(this.bases.keys().next().value!);
     } catch (e) {
@@ -2179,6 +2323,8 @@ export class App {
       }
     }
     for (const sp of this.state.spots) {
+      const tp = (x: number, y: number): [number, number] => (kind === 'rot' ? [1 - y, x] : kind === 'flipH' ? [1 - x, y] : [x, 1 - y]);
+      if (sp.pts) for (let i = 0; i < sp.pts.length; i += 2) [sp.pts[i], sp.pts[i + 1]] = tp(sp.pts[i], sp.pts[i + 1]);
       const [x, y] = kind === 'rot' ? [1 - sp.y, sp.x] : kind === 'flipH' ? [1 - sp.x, sp.y] : [sp.x, 1 - sp.y];
       const [ox, oy] = kind === 'rot' ? [-sp.oy, sp.ox] : kind === 'flipH' ? [-sp.ox, sp.oy] : [sp.ox, -sp.oy];
       Object.assign(sp, { x, y, ox, oy });
@@ -2187,13 +2333,17 @@ export class App {
   }
 
   // -----------------------------------------------------------------------------------
-  // Remove (spot healing)
+  // Remove: paint over what should go (you see it as you paint), let go and it's filled from
+  // a matching patch nearby; drag the yellow copy to choose the source yourself.
 
+  /** Brush radius in screen px, from the Brush size slider. */
+  private healPx() {
+    return 4 + this.state.v.healSize * 0.72;
+  }
   private healRadius() {
-    return this.healSize / this.maskOv.pxPerFrameH(); // frame heights; constant size on screen
+    return this.healPx() / this.maskOv.pxPerFrameH(); // frame heights; constant size on screen
   }
 
-  /** The loupe follows the spot while you place it, showing the spot at its real size. */
   private healLoupe(x: number, y: number, rPx: number) {
     this.loupe.color = '#f4f4f2';
     this.loupe.ring = rPx;
@@ -2203,47 +2353,42 @@ export class App {
 
   private healRing(e: PointerEvent) {
     const ring = $('brushRing');
-    const r = this.healSize;
+    const r = this.healPx();
     const st = this.stage.getBoundingClientRect();
     ring.style.width = ring.style.height = r * 2 + 'px';
     ring.style.transform = `translate(${e.clientX - st.left - r}px, ${e.clientY - st.top - r}px)`;
-    ring.classList.remove('erase');
+    ring.classList.remove('erase', 'size');
     ring.classList.add('on');
   }
 
-  /**
-   * Remove tool, on press: grab the selected spot's source ring (choose what fills it), grab a
-   * spot (tap to select, drag to move), or start placing a new spot (released = removed).
-   */
+  /** the stroke being painted: screen points (for drawing) and frame points (for the patch) */
+  private healPaint: { pts: { x: number; y: number }[]; frame: number[]; r: number } | null = null;
+
   private healDown(e: PointerEvent) {
     const f0 = this.maskOv.toFrame(e.clientX, e.clientY);
     const spots = this.state.spots;
-    const d = (p: { x: number; y: number }) => Math.hypot(p.x - e.clientX, p.y - e.clientY);
     const sel = spots[this.spotSel];
     if (sel) {
-      const g = this.healOv.geom(sel);
-      if (d(g.s) < Math.max(g.r, 14) + 12) {
-        this.hd = { i: this.spotSel, kind: 'src', f0, sp0: { ...sel }, moved: false };
-        tick();
-        return;
-      }
-      if (d(g.t) < Math.max(g.r, 14) + 6) {
-        this.hd = { i: this.spotSel, kind: 'spot', f0, sp0: { ...sel }, moved: false };
+      const h = this.healOv.hit(sel, e.clientX, e.clientY, 10);
+      if (h.source || h.target) {
+        this.hd = { i: this.spotSel, kind: h.source ? 'src' : 'spot', f0, sp0: JSON.parse(JSON.stringify(sel)), moved: false };
+        if (h.source) tick();
         return;
       }
     }
-    // an unselected spot: a tap selects it, a drag places a new spot instead
+    // an unselected patch: a tap selects it, a drag paints a new one
     let hit = -1;
     for (let i = spots.length - 1; i >= 0; i--) {
-      const g = this.healOv.geom(spots[i]);
-      if (d(g.t) < Math.max(g.r, 14) + 4) {
+      if (this.healOv.hit(spots[i], e.clientX, e.clientY, 2).target) {
         hit = i;
         break;
       }
     }
     this.hd = { i: hit, kind: 'new', f0, sp0: null, moved: false };
+    this.healPaint = { pts: [{ x: e.clientX, y: e.clientY }], frame: [f0.x, f0.y], r: this.healPx() };
     this.healRing(e);
-    this.healLoupe(e.clientX, e.clientY, this.healSize);
+    this.healLoupe(e.clientX, e.clientY, this.healPx());
+    this.healOv.draw();
     this.requestRender();
   }
 
@@ -2252,10 +2397,17 @@ export class App {
     if (!hd) return;
     const f = this.maskOv.toFrame(e.clientX, e.clientY);
     const dx = f.x - hd.f0.x, dy = f.y - hd.f0.y;
-    if (!hd.moved && Math.hypot(dx, dy) * this.maskOv.pxPerFrameH() > 6) hd.moved = true;
+    if (!hd.moved && Math.hypot(dx * this.frameInfo().aspect, dy) * this.maskOv.pxPerFrameH() > 6) hd.moved = true;
     if (hd.kind === 'new') {
+      const P = this.healPaint!;
+      const last = P.pts[P.pts.length - 1];
+      if (Math.hypot(e.clientX - last.x, e.clientY - last.y) > Math.max(2, P.r * 0.25)) {
+        P.pts.push({ x: e.clientX, y: e.clientY });
+        P.frame.push(f.x, f.y);
+        this.healOv.draw();
+      }
       this.healRing(e);
-      this.healLoupe(e.clientX, e.clientY, this.healSize);
+      this.healLoupe(e.clientX, e.clientY, this.healPx());
       this.requestRender();
       return;
     }
@@ -2267,38 +2419,40 @@ export class App {
     } else {
       sp.x = hd.sp0.x + dx;
       sp.y = hd.sp0.y + dy;
+      if (hd.sp0.pts) sp.pts = hd.sp0.pts.map((v, k) => v + (k % 2 ? dy : dx));
     }
-    // watch the result live in the loupe, centred on the spot
+    // watch the result live in the loupe, centred on the patch
     const g = this.healOv.geom(sp);
     this.healLoupe(g.t.x, g.t.y, g.r);
     this.healOv.draw();
     this.requestRender();
   }
 
-  private healUp(e: PointerEvent) {
+  private healUp() {
     const hd = this.hd;
+    const paint = this.healPaint;
     this.hd = null;
+    this.healPaint = null;
     this.loupe.hide();
     this.loupe.ring = 0;
     this.loupe.zoom = 3.2;
     this.hideBrushRing();
-    if (!hd || !this.img) return;
+    if (!hd || !this.img) return this.healOv.draw();
     if (hd.kind === 'new') {
       if (!hd.moved && hd.i >= 0) {
         this.spotSel = hd.i;
         tick();
         this.healOv.draw();
         this.refreshSection();
-        this.requestRender();
         return;
       }
-      this.addSpot(e);
+      this.addSpot(paint!, hd.moved);
       return;
     }
     const sp = this.state.spots[hd.i];
     if (!sp) return;
     if (!hd.moved) {
-      if (hd.kind === 'spot') this.spotSel = -1; // tap the selected spot again to deselect
+      if (hd.kind === 'spot') this.spotSel = -1; // tap the selected patch again to deselect
     } else {
       sp.c = this.spotCorr(hd.i);
       tick(true);
@@ -2311,23 +2465,41 @@ export class App {
 
   private healCancel() {
     const hd = this.hd;
-    if (hd?.sp0 && this.state.spots[hd.i]) Object.assign(this.state.spots[hd.i], hd.sp0);
+    if (hd?.sp0 && this.state.spots[hd.i]) this.state.spots[hd.i] = hd.sp0;
     this.hd = null;
+    this.healPaint = null;
     this.loupe.hide();
     this.hideBrushRing();
+    this.healOv.draw();
     this.requestRender();
   }
 
-  /** Heal a spot: find a nearby patch whose surroundings match, then blend it in. */
-  private addSpot(e: PointerEvent) {
+  /** Turn the painted stroke (or a tap) into a patch filled from the best match nearby. */
+  private addSpot(paint: { frame: number[] }, painted: boolean) {
     this.requestRender();
-    if (!this.img) return;
-    const f = this.maskOv.toFrame(e.clientX, e.clientY);
-    if (f.u < 0 || f.u > 1 || f.v < 0 || f.v > 1) return;
-    if (this.state.spots.length >= MAX_SPOTS) return this.toast(`Up to ${MAX_SPOTS} spots per photo`);
-    const r = this.healRadius();
-    const spot = this.findPatch(f.x, f.y, r);
-    if (!spot) return this.toast('Couldn’t find a clean patch nearby — try zooming in');
+    if (this.state.spots.length >= MAX_SPOTS) {
+      this.healOv.draw();
+      return this.toast(`Up to ${MAX_SPOTS} fixes per photo`);
+    }
+    const F = paint.frame;
+    let cx = 0, cy = 0;
+    for (let i = 0; i < F.length; i += 2) {
+      cx += F[i];
+      cy += F[i + 1];
+    }
+    const n = F.length / 2;
+    const spot: Spot = { x: cx / n, y: cy / n, r: this.healRadius(), ox: 0, oy: 0, c: [0, 0, 0] };
+    if (painted && F.length >= 4) spot.pts = F.slice();
+    else {
+      spot.x = F[0];
+      spot.y = F[1];
+    }
+    const fill = this.findPatch(spot, -1);
+    if (!fill) {
+      this.healOv.draw();
+      return this.toast('Couldn’t find a clean patch nearby — try zooming in');
+    }
+    Object.assign(spot, fill);
     this.state.spots.push(spot);
     const first = this.spotSel < 0 && this.state.spots.length === 1;
     this.spotSel = this.state.spots.length - 1;
@@ -2336,143 +2508,148 @@ export class App {
     this.refreshSection();
     this.healOv.draw();
     this.requestRender();
-    if (first) this.toast('Not right? Drag the yellow ring to choose what fills it', 3200);
+    if (first) this.toast('Drag the yellow copy to choose what fills it', 3000);
   }
 
-  /** Color correction for a spot: the difference between the rings around target and source. */
-  private spotCorr(i: number): [number, number, number] {
+  /** The unedited, geometry-applied preview without patch `exclude` (and its pixel size). */
+  private healBase(exclude: number) {
     const img = this.img!;
-    const sp = this.state.spots[i];
-    const st = { ...defaultState(), geo: this.state.geo, spots: this.state.spots.filter((_, j) => j !== i) };
+    const st = { ...defaultState(), geo: this.state.geo, spots: this.state.spots.filter((_, j) => j !== exclude) };
     st.v.straighten = this.state.v.straighten;
     st.v.distortion = this.state.v.distortion;
     const { w: W, h: H } = outputSize(st, img.preview.w, img.preview.h);
+    return { st, W, H };
+  }
+
+  /** Points around (ring) and inside a patch, in preview px. */
+  private patchSamples(sp: Spot, W: number, H: number) {
     const c = this.state.geo.crop;
-    const tx = ((sp.x - c.x) / c.w) * W, ty = ((sp.y - c.y) / c.h) * H;
-    const sx = tx + (sp.ox / c.w) * W, sy = ty + (sp.oy / c.h) * H;
+    const toPx = (x: number, y: number): [number, number] => [((x - c.x) / c.w) * W, ((y - c.y) / c.h) * H];
+    const circles = spotCircles(sp, this.frameInfo().aspect).map(([x, y]) => toPx(x, y));
     const rp = Math.max(1.5, (sp.r / c.h) * H);
-    const pad = rp * 1.6;
-    const x0 = Math.min(tx, sx) - pad, y0 = Math.min(ty, sy) - pad;
-    const R = this.pipe.geometryRegion(img.preview, st, W, H, { x: x0, y: y0, w: Math.abs(tx - sx) + pad * 2, h: Math.abs(ty - sy) + pad * 2 });
-    const mean = (cx: number, cy: number) => {
-      const m = [0, 0, 0];
-      let n = 0;
-      for (let k = 0; k < 32; k++) {
-        const a = (k / 32) * Math.PI * 2;
+    const ring: [number, number][] = [];
+    const inside: [number, number][] = [];
+    const nA = circles.length > 1 ? 12 : 28;
+    for (const [cx, cy] of circles) {
+      inside.push([cx, cy]);
+      for (let k = 0; k < 6; k++) inside.push([cx + Math.cos(k * 1.047) * rp * 0.55, cy + Math.sin(k * 1.047) * rp * 0.55]);
+      for (let k = 0; k < nA; k++) {
+        const a = (k / nA) * Math.PI * 2;
         for (const rr of [1.15, 1.45]) {
-          const ix = Math.round(cx + Math.cos(a) * rp * rr - R.x), iy = Math.round(cy + Math.sin(a) * rp * rr - R.y);
-          if (ix < 0 || iy < 0 || ix >= R.w || iy >= R.h) continue;
-          const o = (iy * R.w + ix) * 4;
-          m[0] += R.px[o] / 255;
-          m[1] += R.px[o + 1] / 255;
-          m[2] += R.px[o + 2] / 255;
-          n++;
+          const x = cx + Math.cos(a) * rp * rr, y = cy + Math.sin(a) * rp * rr;
+          if (circles.every(([qx, qy]) => Math.hypot(x - qx, y - qy) > rp * 1.08)) ring.push([x, y]);
         }
       }
-      return n ? m.map((x) => x / n) : [0, 0, 0];
-    };
-    const a = mean(tx, ty), b = mean(sx, sy);
-    return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+    }
+    const thin = <T,>(a: T[], max: number) => (a.length <= max ? a : a.filter((_, i) => i % Math.ceil(a.length / max) === 0));
+    let mx = 0, my = 0;
+    for (const [x, y] of circles) {
+      mx += x / circles.length;
+      my += y / circles.length;
+    }
+    let ext = rp;
+    for (const [x, y] of circles) ext = Math.max(ext, Math.hypot(x - mx, y - my) + rp);
+    return { ring: thin(ring, 160), inside: thin(inside, 120), rp, ext, mx, my, circles };
   }
 
-  private findPatch(fx: number, fy: number, r: number): Spot | null {
+  /** Find where to copy a patch from: the surroundings must match and the source must be clean. */
+  private findPatch(sp: Spot, exclude: number): Pick<Spot, 'ox' | 'oy' | 'c'> | null {
     const img = this.img!;
-    const st = { ...defaultState(), geo: this.state.geo, spots: this.state.spots };
-    st.v.straighten = this.state.v.straighten;
-    st.v.distortion = this.state.v.distortion;
-    const { w: W, h: H } = outputSize(st, img.preview.w, img.preview.h);
+    const { st, W, H } = this.healBase(exclude);
     const c = this.state.geo.crop;
-    const cx = ((fx - c.x) / c.w) * W, cy = ((fy - c.y) / c.h) * H;
-    const rp = Math.max(1.5, (r / c.h) * H); // radius in preview px
-    const reach = rp * 5.5;
-    const R = this.pipe.geometryRegion(img.preview, st, W, H, { x: cx - reach, y: cy - reach, w: reach * 2, h: reach * 2 });
+    const S = this.patchSamples(sp, W, H);
+    const base = Math.max(S.ext, S.rp);
+    const dists = [1.25, 1.75, 2.4].map((k) => base * k + S.rp * 0.9);
+    const reach = dists[2] + base + S.rp * 1.6;
+    const R = this.pipe.geometryRegion(img.preview, st, W, H, { x: S.mx - reach, y: S.my - reach, w: reach * 2, h: reach * 2 });
     const at = (x: number, y: number): [number, number, number] | null => {
       const ix = Math.round(x - R.x), iy = Math.round(y - R.y);
       if (ix < 0 || iy < 0 || ix >= R.w || iy >= R.h) return null;
       const i = (iy * R.w + ix) * 4;
       return [R.px[i] / 255, R.px[i + 1] / 255, R.px[i + 2] / 255];
     };
-    // the ring around the spot describes what the patch has to blend into
-    const ring: [number, number][] = [];
-    for (let k = 0; k < 28; k++) {
-      const a = (k / 28) * Math.PI * 2;
-      for (const rr of [1.15, 1.45]) ring.push([Math.cos(a) * rp * rr, Math.sin(a) * rp * rr]);
-    }
-    const dst = ring.map(([x, y]) => at(cx + x, cy + y));
-    const inside: [number, number][] = [[0, 0]];
-    for (let k = 0; k < 12; k++) {
-      const a = (k / 12) * Math.PI * 2;
-      for (const rr of [0.35, 0.7]) inside.push([Math.cos(a) * rp * rr, Math.sin(a) * rp * rr]);
-    }
+    const dst = S.ring.map(([x, y]) => at(x, y));
+    const lum = (p: number[]) => 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
     let best: { cost: number; ox: number; oy: number; corr: [number, number, number] } | null = null;
-    for (const dist of [2.2, 2.9, 3.8]) {
-      for (let k = 0; k < 20; k++) {
-        const a = (k / 20) * Math.PI * 2;
-        const ox = Math.cos(a) * rp * dist, oy = Math.sin(a) * rp * dist;
-        // keep away from other healed spots
-        let cost = 0, n = 0;
+    for (const dist of dists) {
+      for (let k = 0; k < 24; k++) {
+        const a = (k / 24) * Math.PI * 2;
+        const ox = Math.cos(a) * dist, oy = Math.sin(a) * dist;
         const mean = [0, 0, 0], meanD = [0, 0, 0];
-        // near the photo's edge part of the ring falls outside: compare what's there
         const pairs: [number[], number[]][] = [];
-        for (let j = 0; j < ring.length; j++) {
+        S.ring.forEach(([x, y], j) => {
           const d = dst[j];
-          const sCol = at(cx + ring[j][0] + ox, cy + ring[j][1] + oy);
-          if (!d || !sCol) continue;
-          pairs.push([d, sCol]);
+          const sc = at(x + ox, y + oy);
+          if (!d || !sc) return;
+          pairs.push([d, sc]);
           for (let ch = 0; ch < 3; ch++) {
-            mean[ch] += sCol[ch];
+            mean[ch] += sc[ch];
             meanD[ch] += d[ch];
           }
-          n++;
-        }
-        // the donor itself has to be inside the photo, and enough of the ring has to match
-        if (n < ring.length * 0.45 || !at(cx + ox, cy + oy)) continue;
+        });
+        const n = pairs.length;
+        // near the photo's edge part of the ring falls outside; enough of it must match, and
+        // the whole source must be inside the photo
+        if (n < S.ring.length * 0.45 || S.inside.some(([x, y]) => !at(x + ox, y + oy))) continue;
         const corr = [0, 1, 2].map((ch) => (meanD[ch] - mean[ch]) / n) as [number, number, number];
-        // texture match after removing the average difference
-        for (const [d, sCol] of pairs) {
-          for (let ch = 0; ch < 3; ch++) cost += ((d[ch] - sCol[ch] - corr[ch]) ** 2) * (ring.length / n);
-        }
-        // the donor patch itself must be clean: anything inside it that stands out from its
-        // own surroundings (another blemish, an edge) is penalized hard
-        const lum = (p: number[]) => 0.2126 * p[0] + 0.7152 * p[1] + 0.0722 * p[2];
+        let cost = 0;
+        for (const [d, sc] of pairs) for (let ch = 0; ch < 3; ch++) cost += (d[ch] - sc[ch] - corr[ch]) ** 2;
+        cost = (cost / n) * 56;
+        // the source itself must be clean: anything standing out from its own surroundings
+        // (another blemish, an edge) is penalized hard
         const ringL = lum(mean) / n;
-        let inner = 0, ni = 0;
-        for (const [ix, iy] of inside) {
-          const q = at(cx + ox + ix, cy + oy + iy);
-          if (!q) continue;
-          const dl = lum(q) - ringL;
+        let inner = 0;
+        for (const [x, y] of S.inside) {
+          const dl = lum(at(x + ox, y + oy)!) - ringL;
           inner += dl * dl;
-          ni++;
         }
-        if (ni) cost += (inner / ni) * ring.length * 6;
-        cost += Math.hypot(...corr) * 2 + dist * 0.002;
+        cost += (inner / S.inside.length) * 56 * 6 + Math.hypot(...corr) * 2 + (dist / S.rp) * 0.002;
         if (!best || cost < best.cost) best = { cost, ox, oy, corr };
       }
     }
     if (!best) return null;
-    return {
-      x: fx, y: fy, r,
-      ox: (best.ox / W) * c.w, oy: (best.oy / H) * c.h,
-      c: best.corr,
+    return { ox: (best.ox / W) * c.w, oy: (best.oy / H) * c.h, c: best.corr };
+  }
+
+  /** Color correction for a patch: the difference between the rings around target and source. */
+  private spotCorr(i: number): [number, number, number] {
+    const img = this.img!;
+    const sp = this.state.spots[i];
+    const { st, W, H } = this.healBase(i);
+    const c = this.state.geo.crop;
+    const S = this.patchSamples(sp, W, H);
+    const ox = (sp.ox / c.w) * W, oy = (sp.oy / c.h) * H;
+    const pad = S.ext + S.rp * 1.6;
+    const R = this.pipe.geometryRegion(img.preview, st, W, H, {
+      x: Math.min(S.mx, S.mx + ox) - pad, y: Math.min(S.my, S.my + oy) - pad, w: Math.abs(ox) + pad * 2, h: Math.abs(oy) + pad * 2,
+    });
+    const at = (x: number, y: number) => {
+      const ix = Math.round(x - R.x), iy = Math.round(y - R.y);
+      if (ix < 0 || iy < 0 || ix >= R.w || iy >= R.h) return null;
+      const o = (iy * R.w + ix) * 4;
+      return [R.px[o] / 255, R.px[o + 1] / 255, R.px[o + 2] / 255];
     };
+    const a = [0, 0, 0], b = [0, 0, 0];
+    let n = 0;
+    for (const [x, y] of S.ring) {
+      const p = at(x, y), q = at(x + ox, y + oy);
+      if (!p || !q) continue;
+      for (let ch = 0; ch < 3; ch++) {
+        a[ch] += p[ch];
+        b[ch] += q[ch];
+      }
+      n++;
+    }
+    return n ? [(a[0] - b[0]) / n, (a[1] - b[1]) / n, (a[2] - b[2]) / n] : [0, 0, 0];
   }
 
   private buildHealActs() {
     const row = $('acts');
-    const sizes: [string, number][] = [['Small', 12], ['Medium', 22], ['Large', 38], ['XL', 60]];
-    for (const [label, px] of sizes) {
-      const b = this.tile(row, `<i class="sz" style="width:${Math.min(24, px * 0.45 + 4)}px;height:${Math.min(24, px * 0.45 + 4)}px"></i>`, label, this.healSize === px ? 'on' : '', () => {
-        this.healSize = px;
-        this.refreshSection();
-      });
-      b.setAttribute('aria-label', `${label} spot`);
-    }
     const sel = this.state.spots[this.spotSel];
     if (sel) {
-      row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
       this.tile(row, ICONS.detail, 'Auto fill', '', () => {
-        const auto = this.findPatch(sel.x, sel.y, sel.r);
-        if (auto) Object.assign(sel, { ox: auto.ox, oy: auto.oy, c: auto.c });
+        const auto = this.findPatch(sel, this.spotSel);
+        if (auto) Object.assign(sel, auto);
         this.commit();
         this.refreshSection();
         this.requestRender();
@@ -2484,9 +2661,12 @@ export class App {
         this.refreshSection();
         this.requestRender();
       });
+      this.tile(row, ICONS.check, 'Done', '', () => {
+        this.spotSel = -1;
+        this.refreshSection();
+      });
     } else if (this.state.spots.length) {
-      row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
-      this.tile(row, ICONS.undo, 'Undo spot', '', () => {
+      this.tile(row, ICONS.undo, 'Undo fix', '', () => {
         this.state.spots.pop();
         this.commit();
         this.refreshSection();
@@ -2684,62 +2864,65 @@ export class App {
 
   private bindBack() {
     // the Android app asks this first when you swipe back: true = handled inside the editor
-    (window as unknown as { lumenBack: () => boolean }).lumenBack = () => {
-      if (history.state?.lumen) {
-        history.back();
-        return true;
-      }
-      return false;
-    };
+    (window as unknown as { lumenBack: () => boolean }).lumenBack = () => this.goBack();
+    // in the browser, one guard history entry stands in for "there's somewhere to go back to"
     window.addEventListener('popstate', () => {
-      if (this.ignorePop) {
-        this.ignorePop = false;
-        return;
-      }
-      if (this.camera.isOpen()) return this.camera.close(true);
-      if (this.homeOver) return this.closeHomeFromPop();
-      if (this.allOpen) return this.showAll(false, true);
-      const sheet = document.querySelector('.sheet.on');
-      if (sheet) {
-        sheet.classList.remove('on');
-        return;
-      }
-      if (this.tool) this.cancelSection();
+      if (this.goBack()) this.syncGuard();
     });
-    // sheets: give each open one a history entry so back closes it
     document.querySelectorAll<HTMLElement>('.sheet').forEach((el) => {
-      new MutationObserver(() => {
-        const on = el.classList.contains('on');
-        if (on && !el.dataset.nav) {
-          el.dataset.nav = '1';
-          history.pushState({ lumen: 'sheet' }, '');
-        } else if (!on && el.dataset.nav) {
-          delete el.dataset.nav;
-          if (history.state?.lumen === 'sheet') {
-            this.ignorePop = true;
-            history.back();
-          }
-        }
-      }).observe(el, { attributes: true, attributeFilter: ['class'] });
+      new MutationObserver(() => this.syncGuard()).observe(el, { attributes: true, attributeFilter: ['class'] });
     });
   }
 
-  private closeHomeFromPop() {
-    // the history entry is already gone; just hide the page
-    this.homeOver = false;
-    const el = $('empty');
-    el.classList.remove('over');
-    el.classList.add('hidden');
-    $('btnResume').hidden = true;
+  /** One step back: camera, sheet, picker, tool grid, section (dropping its changes), then home. */
+  goBack(): boolean {
+    if (this.camera.isOpen()) {
+      this.camera.close();
+      return true;
+    }
+    const sheet = document.querySelector('.sheet.on');
+    if (sheet) {
+      sheet.classList.remove('on');
+      return true;
+    }
+    if (this.menuTap) {
+      this.showMenu(false);
+      return true;
+    }
+    if (this.allOpen) {
+      this.showAll(false);
+      return true;
+    }
+    if (this.tool) {
+      this.cancelSection();
+      return true;
+    }
+    if (this.homeOver) {
+      if (!this.homeFromButton) return false; // home reached by going back: next back leaves
+      this.showHome(false);
+      return true;
+    }
+    if (this.img) {
+      this.showHome(true);
+      return true;
+    }
+    return false;
+  }
+
+  private canGoBack() {
+    return this.camera.isOpen() || !!document.querySelector('.sheet.on') || this.allOpen || !!this.tool ||
+      (this.homeOver ? this.homeFromButton : !!this.img);
+  }
+
+  /** Browser only: keep exactly one guard entry while back has something to do. */
+  private syncGuard() {
+    if (isNative) return;
+    if (this.canGoBack() && history.state?.lumen !== 'guard') history.pushState({ lumen: 'guard' }, '');
   }
 
   /** ✓: keep the changes and go back to the tool bar. */
   private closeSection() {
     this.setMode(null);
-    if (history.state?.lumen === 'section') {
-      this.ignorePop = true;
-      history.back();
-    }
   }
 
   /** Back: drop this section's changes. */
@@ -2861,6 +3044,7 @@ export class App {
       default: {
         const subs = t.subs ? t.subs.map((x) => x.id) : [''];
         for (const sub of subs) for (const p of t.params(sub)) v[p] = PARAM_MAP[p].def;
+        if (t.id === 'vignette') v.vigX = v.vigY = 0.5;
       }
     }
     this.commit();
@@ -2907,7 +3091,26 @@ export class App {
     }
   }
 
-  private lookState(base: EditState, L: Look, t: number): EditState {
+  /** Brightness / color measurements of the photo as edited so far (for adaptive looks). */
+  private statsCache: { key: string; s: ImgStats } | null = null;
+  private photoStats(base: EditState): ImgStats {
+    const img = this.img!;
+    const key = JSON.stringify([img.name, base.v, base.curves, base.geo]);
+    if (this.statsCache?.key !== key) {
+      const { w, h } = outputSize(base, img.thumb.w, img.thumb.h);
+      this.statsCache = { key, s: measure(this.pipe.renderPixels(img.thumb, base, w, h)) };
+    }
+    return this.statsCache.s;
+  }
+
+  /** A look's settings for this photo: adaptive looks look at it first. */
+  private resolveLook(base: EditState, L: Look): Look {
+    if (!L.auto || !this.img) return L;
+    return { ...L, ...L.auto(this.photoStats(base)) };
+  }
+
+  private lookState(base: EditState, L0: Look, t: number): EditState {
+    const L = this.resolveLook(base, L0);
     const s = cloneState(base);
     for (const [k, val] of Object.entries(L.v)) {
       if (!(k in s.v)) continue;
@@ -3032,7 +3235,7 @@ export class App {
       const d = defaultValues();
       const v: Record<string, number> = {};
       for (const [k, x] of Object.entries(this.state.v)) {
-        if (!['straighten', 'distortion', 'blurX', 'blurY'].includes(k) && !k.startsWith('dx') && x !== d[k]) v[k] = x;
+        if (!['straighten', 'distortion', 'blurX', 'blurY', 'vigX', 'vigY'].includes(k) && !k.startsWith('dx') && x !== d[k]) v[k] = x;
       }
       const looks = this.userLooks();
       looks.push({ name, v, curves: this.state.curves });
@@ -3318,6 +3521,31 @@ export class App {
     clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => t.classList.remove('on'), ms);
   }
+}
+
+/** A short name for what differs between two saved states (for the undo badge). */
+function describeChange(a: string, b: string): string {
+  try {
+    const A = JSON.parse(a) as EditState, B = JSON.parse(b) as EditState;
+    const ids = Object.keys(B.v).filter((k) => A.v[k] !== B.v[k]);
+    if (ids.length === 1 && PARAM_MAP[ids[0]]) {
+      const tool = TOOLS.find((t) => t.kind === 'params' && (t.subs ? t.subs.some((x) => t.params(x.id).includes(ids[0])) : t.params('').includes(ids[0])));
+      return (tool && tool.label !== PARAM_MAP[ids[0]].label ? tool.label + ' ' : '') + PARAM_MAP[ids[0]].label;
+    }
+    if (ids.length > 1) return 'Look';
+    if (JSON.stringify(A.masks) !== JSON.stringify(B.masks)) return 'Mask';
+    if (JSON.stringify(A.spots) !== JSON.stringify(B.spots)) return 'Remove';
+    if (JSON.stringify(A.curves) !== JSON.stringify(B.curves)) return 'Curves';
+    if (JSON.stringify(A.geo) !== JSON.stringify(B.geo)) return 'Crop';
+    if (JSON.stringify(A.overlay) !== JSON.stringify(B.overlay)) return 'Double';
+  } catch {
+    /* fall through */
+  }
+  return '';
+}
+
+function wrap90(deg: number) {
+  return ((((deg + 90) % 180) + 180) % 180) - 90;
 }
 
 function escapeHtml(t: string) {

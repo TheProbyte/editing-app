@@ -19,8 +19,8 @@
   --cyan: #45e0f0;
   --danger: #ff5245;
   --ease: cubic-bezier(0.22, 0.9, 0.25, 1);
-  --safe-t: env(safe-area-inset-top, 0px);
-  --safe-b: env(safe-area-inset-bottom, 0px);
+  --safe-t: var(--safe-area-inset-top, env(safe-area-inset-top, 0px));
+  --safe-b: var(--safe-area-inset-bottom, env(safe-area-inset-bottom, 0px));
   --top-h: 60px;
   --bot-h: 120px;
   --display: 'Michroma', 'Eurostile', 'Arial Black', system-ui, sans-serif;
@@ -55,7 +55,9 @@ svg { display: block; }
 #view.pixelated, #detail { image-rendering: pixelated; }
 #detail { position: absolute; display: none; pointer-events: none; }
 #detail.on { display: block; }
-#gridCanvas { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+#zoomView { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; display: none; }
+#zoomView.on { display: block; }
+#frame.zv #view, #frame.zv #detail { visibility: hidden; }
 #pixgrid {
   position: absolute; inset: 0; pointer-events: none; display: none; --line: 1px;
   background-image:
@@ -166,6 +168,7 @@ svg { display: block; }
 #menu {
   position: absolute; left: 50%; top: calc(var(--top-h) + (100% - var(--top-h) - var(--bot-h)) / 2); z-index: 6;
   width: 250px; height: 220px; border-radius: 0; overflow: hidden;
+  -webkit-mask-image: linear-gradient(transparent, #000 24%, #000 76%, transparent); mask-image: linear-gradient(transparent, #000 24%, #000 76%, transparent);
   background: rgba(11, 10, 9, 0.74); -webkit-backdrop-filter: blur(18px); backdrop-filter: blur(18px);
   opacity: 0; pointer-events: none; transform: translate(-50%, -50%) scale(0.97); transition: opacity 0.1s, transform 0.12s var(--ease);
 }

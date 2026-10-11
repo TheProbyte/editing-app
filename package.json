@@ -11,12 +11,15 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@capacitor/android": "^8.5.3",
+    "@capacitor/core": "^8.5.3",
     "@fontsource/chakra-petch": "^5.3.0",
     "@fontsource/michroma": "^5.3.0",
     "@fontsource/space-mono": "^5.3.0",
     "libraw-wasm": "1.6.0"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.5.3",
     "typescript": "5.6.3",
     "vite": "5.4.11"
   }

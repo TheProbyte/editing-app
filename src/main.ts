@@ -1,11 +1,12 @@
 import './styles.css';
 import { App } from './ui/app';
+import { isNative } from './native';
 
 // The RAW decoder needs a cross-origin isolated page. Static hosts (e.g. GitHub Pages)
 // can't send the required headers, so the service worker adds them; the first visit
 // reloads once after the worker takes control.
 async function ensureServiceWorker() {
-  if (!('serviceWorker' in navigator) || !import.meta.env.PROD || window.top !== window) return;
+  if (!('serviceWorker' in navigator) || !import.meta.env.PROD || window.top !== window || isNative) return;
   try {
     const reg = await navigator.serviceWorker.register('./sw.js');
     if (!self.crossOriginIsolated) {

@@ -17,6 +17,7 @@
   <body>
     <div id="app" data-mode="tools">
       <main id="stage">
+        <canvas id="zoomView"></canvas>
         <div id="frame" class="empty">
           <canvas id="view"></canvas>
           <div id="cropLayer"></div>
@@ -24,7 +25,6 @@
           <div id="blurLayer"></div>
           <canvas id="detail"></canvas>
         </div>
-        <canvas id="gridCanvas"></canvas>
         <div id="brushRing"></div>
         <canvas id="loupe"></canvas>
         <canvas id="hist"></canvas>
@@ -108,6 +108,7 @@
         <button data-a="paste">Paste edits</button>
         <button data-a="savePreset">Save as preset</button>
         <button data-a="resetAll" class="danger">Reset all edits</button>
+        <button data-a="getApp" id="getApp">Get the Android app <span class="state on">APK</span></button>
       </div>
     </div>
 

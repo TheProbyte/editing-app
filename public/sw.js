@@ -1,6 +1,6 @@
 // Lumen service worker: offline caching + cross-origin isolation headers
 // (needed for the multi-threaded RAW decoder on hosts that can't set headers).
-const CACHE = 'lumen-v1';
+const CACHE = 'lumen-v2';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => {
@@ -28,6 +28,7 @@ self.addEventListener('fetch', (e) => {
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+  if (url.pathname.endsWith('.apk')) return; // let Chrome download the app directly
   if (req.cache === 'only-if-cached' && req.mode !== 'same-origin') return;
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);

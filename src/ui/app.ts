@@ -20,6 +20,7 @@ import { Loupe } from './loupe';
 import { drawHistogram } from './histogram';
 import { tick } from './haptics';
 import { Camera } from './camera';
+import { isNative, Native, fileFromPath } from '../native';
 
 interface Img {
   full: Source;
@@ -100,7 +101,10 @@ export class App {
   private ignorePop = false;
   private healSize = 22; // spot radius in screen px
   private detailTimer = 0;
-  private detailKey = '';
+  /** full-res pixels of a region of the output, for deep zoom */
+  private detail: { px: Uint8Array; x: number; y: number; w: number; h: number; W: number; H: number; ver: number } | null = null;
+  private renderVer = 0;
+  private zv: { img: ImageData | null; on: boolean } = { img: null, on: false };
 
   constructor() {
     try {
@@ -284,6 +288,7 @@ export class App {
   // Rendering
 
   requestRender() {
+    this.renderVer++;
     if (this.raf) return;
     this.raf = requestAnimationFrame(() => {
       this.raf = 0;
@@ -349,92 +354,159 @@ export class App {
 
   private scheduleDetail(changed = false) {
     const det = $<HTMLCanvasElement>('detail');
-    if (changed && det.classList.contains('on')) {
-      // the image changed under the detail tile; refresh it shortly
-      this.detailKey = '';
-    }
     clearTimeout(this.detailTimer);
     // nothing to do at normal zoom — skip the timer entirely
-    if (this.zoom.s <= 1.01 && !det.classList.contains('on')) return;
-    this.detailTimer = window.setTimeout(() => {
-      this.renderDetail();
-      this.updatePixelGrid();
-    }, changed ? 260 : 140);
-  }
-
-  private renderDetail() {
-    const det = $<HTMLCanvasElement>('detail');
-    const hide = () => {
-      det.classList.remove('on');
-      this.detailKey = '';
-    };
-    if (!this.img || this.compare || this.kind() === 'crop' || this.zoom.s <= 1.01) return hide();
-    const dpr = window.devicePixelRatio || 1;
-    const fr = this.frame.getBoundingClientRect();
-    // preview pixels per screen pixel: if the preview is still sharp, nothing to do
-    if ((fr.width * dpr) / this.canvas.width < 1.2) return hide();
-    const { w: W, h: H } = this.outFull();
-    if (W <= this.canvas.width * 1.05) return hide();
-    const st = this.stage.getBoundingClientRect();
-    const u0 = Math.max(0, (st.left - fr.left) / fr.width), u1 = Math.min(1, (st.right - fr.left) / fr.width);
-    const v0 = Math.max(0, (st.top - fr.top) / fr.height), v1 = Math.min(1, (st.bottom - fr.top) / fr.height);
-    if (u1 <= u0 || v1 <= v0) return hide();
-    const x = Math.max(0, Math.floor(u0 * W) - 4), y = Math.max(0, Math.floor(v0 * H) - 4);
-    const w = Math.min(W - x, Math.ceil((u1 - u0) * W) + 8), h = Math.min(H - y, Math.ceil((v1 - v0) * H) + 8);
-    if (w * h > 6_000_000 || w < 2 || h < 2) return hide();
-    const key = JSON.stringify([this.hIdx, x, y, w, h, this.history[this.hIdx]?.length]);
-    if (key === this.detailKey && det.classList.contains('on')) return;
-    this.detailKey = key;
-    try {
-      this.atlas.sync(this.state.masks);
-      this.pipe.brushTex = this.atlas.tex;
-      const px = this.pipe.renderRegion(this.img.full, this.img.preview, this.viewState(), W, H, { x, y, w, h });
-      det.width = w;
-      det.height = h;
-      det.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(px.buffer), w, h), 0, 0);
-      Object.assign(det.style, { left: (x / W) * 100 + '%', top: (y / H) * 100 + '%', width: (w / W) * 100 + '%', height: (h / H) * 100 + '%' });
-      det.classList.add('on');
-    } catch (e) {
-      console.warn('detail render failed', e);
-      hide();
-    }
+    if (this.zoom.s <= 1.01 && !det.classList.contains('on') && !this.zv.on) return;
+    this.detailTimer = window.setTimeout(() => this.renderDetail(), changed ? 200 : 90);
   }
 
   /**
-   * Pixel grid, drawn in screen space from the photo's exact on-screen rectangle so the lines
-   * sit on real pixel edges at any zoom. It follows whatever is shown: the full-res detail
-   * tile when it's up, otherwise the preview's own pixels.
+   * Deep zoom. Below ~2 screen px per image pixel the transformed preview/detail canvas is
+   * fine. Beyond that the app paints the zoomed pixels itself into a screen-sized canvas,
+   * computing every pixel edge once and drawing the grid on those same edges, so pixels and
+   * grid can't disagree.
    */
-  private updatePixelGrid() {
-    const gc = $<HTMLCanvasElement>('gridCanvas');
-    const ctx = gc.getContext('2d')!;
+  private renderDetail() {
+    const det = $<HTMLCanvasElement>('detail');
+    const off = () => {
+      det.classList.remove('on');
+      this.setZoomView(false);
+    };
+    if (!this.img || this.compare || this.kind() === 'crop' || this.zoom.s <= 1.01) return off();
+    const dpr = window.devicePixelRatio || 1;
+    const fr = this.frame.getBoundingClientRect();
+    const { w: W, h: H } = this.outFull();
+    const cell = fr.width / W; // CSS px per image pixel
+    const deep = cell >= 2;
+    const blurry = (fr.width * dpr) / this.canvas.width >= 1.2 && W > this.canvas.width * 1.05;
+    if (!deep && !blurry) return off();
+    const st = this.stage.getBoundingClientRect();
+    const vx0 = Math.max(0, Math.floor(((st.left - fr.left) / fr.width) * W));
+    const vx1 = Math.min(W, Math.ceil(((st.right - fr.left) / fr.width) * W));
+    const vy0 = Math.max(0, Math.floor(((st.top - fr.top) / fr.height) * H));
+    const vy1 = Math.min(H, Math.ceil(((st.bottom - fr.top) / fr.height) * H));
+    if (vx1 <= vx0 || vy1 <= vy0) return off();
+    const D = this.detail;
+    const covered = D && D.ver === this.renderVer && D.W === W && D.H === H &&
+      D.x <= vx0 && D.y <= vy0 && D.x + D.w >= vx1 && D.y + D.h >= vy1;
+    if (!covered) {
+      // render the visible area plus a margin, so panning doesn't need a new render each time
+      const mw = Math.ceil((vx1 - vx0) * 0.6), mh = Math.ceil((vy1 - vy0) * 0.6);
+      const x = Math.max(0, vx0 - mw), y = Math.max(0, vy0 - mh);
+      const w = Math.min(W, vx1 + mw) - x, h = Math.min(H, vy1 + mh) - y;
+      if (w * h > 8_000_000 || w < 1 || h < 1) return off();
+      try {
+        this.atlas.sync(this.state.masks);
+        this.pipe.brushTex = this.atlas.tex;
+        const px = this.pipe.renderRegion(this.img.full, this.img.preview, this.viewState(), W, H, { x, y, w, h });
+        this.detail = { px, x, y, w, h, W, H, ver: this.renderVer };
+      } catch (e) {
+        console.warn('detail render failed', e);
+        return off();
+      }
+    }
+    const d = this.detail!;
+    if (deep) {
+      det.classList.remove('on');
+      this.setZoomView(true);
+      this.drawZoomView();
+    } else {
+      this.setZoomView(false);
+      det.width = d.w;
+      det.height = d.h;
+      det.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(d.px.buffer, d.px.byteOffset, d.w * d.h * 4), d.w, d.h), 0, 0);
+      Object.assign(det.style, { left: (d.x / W) * 100 + '%', top: (d.y / H) * 100 + '%', width: (d.w / W) * 100 + '%', height: (d.h / H) * 100 + '%' });
+      det.classList.add('on');
+    }
+  }
+
+  private setZoomView(on: boolean) {
+    if (this.zv.on === on) return;
+    this.zv.on = on;
+    $('zoomView').classList.toggle('on', on);
+    this.frame.classList.toggle('zv', on);
+  }
+
+  /** Paint the zoomed pixels (nearest neighbour) and the pixel grid at device resolution. */
+  private drawZoomView() {
+    const D = this.detail;
+    if (!this.zv.on || !D) return;
+    const cv = $<HTMLCanvasElement>('zoomView');
     const dpr = window.devicePixelRatio || 1;
     const sw = this.stage.clientWidth, sh = this.stage.clientHeight;
-    if (gc.width !== Math.round(sw * dpr) || gc.height !== Math.round(sh * dpr)) {
-      gc.width = Math.round(sw * dpr);
-      gc.height = Math.round(sh * dpr);
+    const CW = Math.round(sw * dpr), CH = Math.round(sh * dpr);
+    if (cv.width !== CW || cv.height !== CH) {
+      cv.width = CW;
+      cv.height = CH;
+      this.zv.img = null;
     }
-    ctx.clearRect(0, 0, gc.width, gc.height);
-    if (!this.img || this.kind() === 'crop' || this.compare) return;
+    const ctx = cv.getContext('2d')!;
+    if (!this.zv.img) this.zv.img = ctx.createImageData(CW, CH);
+    const out = new Uint32Array(this.zv.img.data.buffer);
+    const src = new Uint32Array(D.px.buffer, D.px.byteOffset, D.w * D.h);
     const fr = this.frame.getBoundingClientRect();
-    const det = $('detail').classList.contains('on');
-    const srcW = det ? this.outFull().w : this.canvas.width;
-    const srcH = det ? this.outFull().h : this.canvas.height;
-    const cell = fr.width / srcW; // CSS px per shown pixel
-    this.canvas.classList.toggle('pixelated', cell >= 3);
-    if (cell < 10) return;
     const st = this.stage.getBoundingClientRect();
-    const ox = fr.left - st.left, oy = fr.top - st.top;
-    const cellY = fr.height / srcH;
-    ctx.globalAlpha = Math.min(1, (cell - 10) / 10) * 0.32;
-    ctx.fillStyle = '#efe9df';
-    const x0 = Math.max(0, Math.ceil(-ox / cell)), x1 = Math.min(srcW, Math.floor((sw - ox) / cell));
-    const y0 = Math.max(0, Math.ceil(-oy / cellY)), y1 = Math.min(srcH, Math.floor((sh - oy) / cellY));
-    const top = Math.max(0, oy) * dpr, bottom = Math.min(sh, oy + fr.height) * dpr;
-    const left = Math.max(0, ox) * dpr, right = Math.min(sw, ox + fr.width) * dpr;
-    for (let i = x0; i <= x1; i++) ctx.fillRect(Math.round((ox + i * cell) * dpr), top, 1, bottom - top);
-    for (let j = y0; j <= y1; j++) ctx.fillRect(left, Math.round((oy + j * cellY) * dpr), right - left, 1);
-    ctx.globalAlpha = 1;
+    const cellX = (fr.width / D.W) * dpr, cellY = (fr.height / D.H) * dpr;
+    const ox = (fr.left - st.left) * dpr, oy = (fr.top - st.top) * dpr;
+    // device column/row -> source column/row (or -1), from rounded pixel edges
+    const colOf = new Int32Array(CW).fill(-1);
+    const rowOf = new Int32Array(CH).fill(-1);
+    const gridCols: number[] = [], gridRows: number[] = [];
+    for (let i = D.x; i <= D.x + D.w; i++) {
+      const e0 = Math.round(ox + i * cellX), e1 = Math.round(ox + (i + 1) * cellX);
+      if (e1 <= 0 || e0 >= CW) continue;
+      if (i < D.x + D.w) for (let x = Math.max(0, e0); x < Math.min(CW, e1); x++) colOf[x] = i - D.x;
+      if (e0 >= 0 && e0 < CW) gridCols.push(e0);
+    }
+    for (let j = D.y; j <= D.y + D.h; j++) {
+      const e0 = Math.round(oy + j * cellY), e1 = Math.round(oy + (j + 1) * cellY);
+      if (e1 <= 0 || e0 >= CH) continue;
+      if (j < D.y + D.h) for (let y = Math.max(0, e0); y < Math.min(CH, e1); y++) rowOf[y] = j - D.y;
+      if (e0 >= 0 && e0 < CH) gridRows.push(e0);
+    }
+    const BG = 0xff090a0b; // #0b0a09 as little-endian ABGR
+    let prevRow = -2;
+    for (let y = 0; y < CH; y++) {
+      const r = rowOf[y];
+      const base = y * CW;
+      if (r === prevRow && y > 0) {
+        out.copyWithin(base, base - CW, base);
+        continue;
+      }
+      prevRow = r;
+      if (r < 0) {
+        out.fill(BG, base, base + CW);
+        continue;
+      }
+      const sBase = r * D.w;
+      for (let x = 0; x < CW; x++) {
+        const c = colOf[x];
+        out[base + x] = c < 0 ? BG : src[sBase + c];
+      }
+    }
+    // grid: same edges as the pixels, faded in as pixels get bigger
+    const cellCss = fr.width / D.W;
+    if (cellCss >= 10) {
+      const a = Math.min(1, (cellCss - 10) / 10) * 0.3;
+      const blend = (p: number) => {
+        const r = p & 255, g = (p >>> 8) & 255, b = (p >>> 16) & 255;
+        return (0xff << 24) | (Math.round(b + (223 - b) * a) << 16) | (Math.round(g + (233 - g) * a) << 8) | Math.round(r + (239 - r) * a);
+      };
+      for (const x of gridCols) for (let y = 0; y < CH; y++) if (rowOf[y] >= 0) out[y * CW + x] = blend(out[y * CW + x]);
+      for (const y of gridRows) {
+        const base = y * CW;
+        for (let x = 0; x < CW; x++) if (colOf[x] >= 0) out[base + x] = blend(out[base + x]);
+      }
+    }
+    ctx.putImageData(this.zv.img, 0, 0);
+  }
+
+  private updatePixelGrid() {
+    // the grid is part of the zoom view now; keep the preview crisp when magnified
+    if (!this.img) return;
+    const fr = this.frame.getBoundingClientRect();
+    this.canvas.classList.toggle('pixelated', fr.width / this.canvas.width >= 3);
+    if (this.zv.on) this.drawZoomView();
   }
 
   private scheduleHist() {
@@ -501,7 +573,8 @@ export class App {
     if (z.s > 1.01) b.textContent = this.img && this.pxPerOut() * z.s >= 1 ? `${Math.round(this.pxPerOut() * z.s * 100)}%` : Math.round(z.s * 100) + '%';
     this.redrawOverlays();
     if (this.img) {
-      this.updatePixelGrid();
+      if (animate) this.setZoomView(false);
+      else this.updatePixelGrid();
       this.scheduleDetail();
     }
   }
@@ -646,7 +719,21 @@ export class App {
   private bindChrome() {
     $('btnOpen').innerHTML = ICONS.open;
     $('btnCam').innerHTML = ICONS.camera;
-    const shoot = () => {
+    const shoot = async () => {
+      if (isNative) {
+        try {
+          const r = await Native.captureRaw();
+          this.busy('Loading RAW');
+          const f = await fileFromPath(r.path, r.name, 'image/x-adobe-dng');
+          await this.open(f);
+          if (r.savedToGallery) this.toast('RAW saved to Pictures/Lumen · editing it now', 2600);
+        } catch (e) {
+          const m = (e as Error).message;
+          if (m && m !== 'cancelled') this.toast(m, 4000);
+          this.busy(null);
+        }
+        return;
+      }
       if (!this.camera.supported) return this.toast('This browser has no camera access');
       this.camera.open((f) => this.open(f));
     };
@@ -710,7 +797,6 @@ export class App {
     $('badge').textContent = 'ORIGINAL';
     $('badge').classList.toggle('on', on);
     this.requestRender();
-    this.updatePixelGrid();
   }
 
   private updateChrome() {
@@ -2162,6 +2248,7 @@ export class App {
       el.textContent = on ? 'On' : 'Off';
       el.classList.toggle('on', on);
     };
+    if (isNative || !/Android/i.test(navigator.userAgent)) $('getApp').style.display = 'none';
     $('btnMore').onclick = () => sheet.classList.add('on');
     sheet.onclick = (e) => {
       if (e.target === sheet) sheet.classList.remove('on');
@@ -2172,6 +2259,16 @@ export class App {
         const a = b.dataset.a;
         if (a === 'open') return $('btnOpen').click();
         if (a === 'openRaw') return $('btnOpenRaw').click();
+        if (a === 'getApp') {
+          const a2 = document.createElement('a');
+          a2.href = 'lumen.apk';
+          a2.download = 'Lumen.apk';
+          document.body.appendChild(a2);
+          a2.click();
+          a2.remove();
+          this.toast('Downloading Lumen.apk — open it when it finishes to install');
+          return;
+        }
         if (a === 'hist') {
           this.showHist = !this.showHist;
           $('hist').classList.toggle('on', this.showHist);
@@ -2352,6 +2449,7 @@ export class App {
       const name = `${img.name.replace(/\.[^.]+$/, '')}-lumen.${this.exportOpts.format === 'png' ? 'png' : 'jpg'}`;
       const how = await saveOrShare(blob, name);
       if (how === 'shown') this.showResult(blob);
+      else if (how === 'gallery') this.toast('Saved to your gallery · Pictures/Lumen', 2600);
       else if (how === 'shared') this.toast('Shared');
       else this.toast(/Android/i.test(navigator.userAgent) ? `Saved to your phone · Downloads/${name}` : `Saved ${name}`, 3200);
     } catch (e) {

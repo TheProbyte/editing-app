@@ -1,0 +1,17 @@
+{
+  "appId": "app.lumen.editor",
+  "appName": "Lumen",
+  "webDir": "dist",
+  "android": {
+    "backgroundColor": "#0b0a09",
+    "allowMixedContent": false
+  },
+  "server": {
+    "androidScheme": "https"
+  },
+  "plugins": {
+    "SystemBars": {
+      "style": "DARK"
+    }
+  }
+}

@@ -23,8 +23,27 @@ jobs:
         with:
           node-version: 22
           cache: npm
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+          cache: gradle
+      - uses: android-actions/setup-android@v3
       - run: npm ci
       - run: npm run build
+      - run: npx cap sync android
+      - name: Build APK
+        working-directory: android
+        env:
+          VERSION_CODE: ${{ github.run_number }}
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+      - run: cp android/app/build/outputs/apk/release/app-release.apk dist/lumen.apk
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lumen-apk
+          path: dist/lumen.apk
       - uses: actions/upload-pages-artifact@v3
         with:
           path: dist

@@ -1,3 +1,4 @@
+import { isNative, writeBlob } from '../native';
 import type { Pipeline, Source } from '../gl/pipeline';
 import type { EditState } from '../params';
 
@@ -67,7 +68,11 @@ export const framed = (() => {
   }
 })();
 
-export async function saveOrShare(blob: Blob, name: string): Promise<'shared' | 'downloaded' | 'shown'> {
+export async function saveOrShare(blob: Blob, name: string): Promise<'shared' | 'downloaded' | 'shown' | 'gallery'> {
+  if (isNative) {
+    await writeBlob(blob, name, 'gallery');
+    return 'gallery';
+  }
   if (framed) return 'shown';
   // Android: save straight to the phone (Downloads, which Google Photos shows on-device)
   if (/Android/i.test(navigator.userAgent)) return download(blob, name);

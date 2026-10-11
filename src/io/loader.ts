@@ -1,3 +1,4 @@
+import { isNative, Native, writeBlob, fileFromPath } from '../native';
 export const RAW_EXT = [
   'dng', 'cr2', 'cr3', 'crw', 'nef', 'nrw', 'arw', 'srf', 'sr2', 'raf', 'orf', 'rw2', 'pef', 'srw',
   'x3f', '3fr', 'iiq', 'rwl', 'mrw', 'erf', 'kdc', 'dcr', 'mef', 'mos', 'raw', 'gpr',
@@ -18,7 +19,20 @@ export async function loadFile(file: File, maxDim: number, onStatus: (s: string)
     try {
       return await decodeRaw(file, maxDim);
     } catch (err) {
-      console.warn('Full RAW decode failed, using embedded preview', err);
+      console.warn('Full RAW decode failed', err);
+      if (isNative) {
+        // the Android app can develop DNGs itself
+        try {
+          onStatus('Developing RAW (Android)…');
+          const { path } = await writeBlob(file, 'in_' + Date.now() + '_' + file.name.replace(/[^\w.]/g, '_'), 'cache');
+          const out = await Native.decodeFile({ path: path! });
+          const jpg = await fileFromPath(out.path, 'decoded.jpg', 'image/jpeg');
+          const bmp = await toBitmap(jpg, maxDim);
+          return { kind: 'bitmap', bitmap: bmp, w: bmp.width, h: bmp.height, info: `${bmp.width}×${bmp.height} RAW (Android)`, note: 'Developed by Android’s RAW decoder (8-bit).' };
+        } catch (e2) {
+          console.warn('Native RAW decode failed', e2);
+        }
+      }
       onStatus('Using RAW preview…');
       const prev = await embeddedPreview(file, maxDim);
       if (prev) {
@@ -101,7 +115,8 @@ async function viaImageElement(blob: Blob, maxDim: number): Promise<ImageBitmap>
 // RAW decoding with LibRaw (WebAssembly, runs in a worker)
 
 function decodeRaw(file: File, maxDim: number): Promise<Loaded> {
-  if (!self.crossOriginIsolated) return Promise.reject(new Error('not cross-origin isolated'));
+  // the threaded WASM build needs SharedArrayBuffer
+  if (typeof SharedArrayBuffer === 'undefined') return Promise.reject(new Error('SharedArrayBuffer unavailable'));
   return new Promise(async (resolve, reject) => {
     let worker: Worker;
     try {

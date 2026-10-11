@@ -3,3 +3,4 @@ dist
 public/libraw
 *.log
 .DS_Store
+public/mediapipe

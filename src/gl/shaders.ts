@@ -63,6 +63,28 @@ uniform int uSpotCount;
 uniform vec4 uSpot[32];   // x, y, r (frame heights), -
 uniform vec4 uSpotOff[32];// offset x, y (frame coords); correction r, g in zw
 uniform float uSpotCorrB[32];
+// double exposure
+uniform int uOvOn;
+uniform sampler2D uOv;
+uniform sampler2D uOvMask;  // .r = hidden (painted) areas, frame coords
+uniform float uOvMaskOn;
+uniform vec2 uOvC;          // centre, frame coords
+uniform vec2 uOvHalf;       // half size, frame px (same scale as uFrameSize)
+uniform float uOvRot;
+uniform float uOvOpacity;
+uniform int uOvBlend;
+
+vec3 blendMode(vec3 b, vec3 o, int m) {
+  if (m == 1) return max(b, o);
+  if (m == 2) return 1.0 - (1.0 - b) * (1.0 - o);
+  if (m == 3) return b * o;
+  if (m == 4) return min(b, o);
+  if (m == 5) return mix(2.0 * b * o, 1.0 - 2.0 * (1.0 - b) * (1.0 - o), step(0.5, b));
+  if (m == 6) return (1.0 - 2.0 * o) * b * b + 2.0 * o * b;
+  if (m == 7) return min(b + o, 1.0);
+  if (m == 8) return abs(b - o);
+  return o;
+}
 
 /** Frame coordinates (0..1 over the turned, uncropped frame) -> linear source color. */
 vec3 srcAt(vec2 fr) {
@@ -98,6 +120,23 @@ void main() {
       vec4 o = uSpotOff[i];
       vec3 donor = max(srcAt(fr + o.xy) + vec3(o.z, o.w, uSpotCorrB[i]), 0.0);
       col = mix(col, donor, 1.0 - smoothstep(0.5, 1.0, dd));
+    }
+  }
+  if (uOvOn == 1) {
+    vec2 P = (fr - uOvC) * uFrameSize;
+    float c = cos(-uOvRot), s = sin(-uOvRot);
+    vec2 q = mat2(c, s, -s, c) * P;
+    vec2 ouv = q / (2.0 * uOvHalf) + 0.5;
+    // soft 1.5px edge so a rotated overlay doesn't stair-step
+    vec2 px = 1.5 / (2.0 * uOvHalf);
+    vec2 e = smoothstep(vec2(0.0), px, ouv) * smoothstep(vec2(0.0), px, 1.0 - ouv);
+    float a = uOvOpacity * e.x * e.y;
+    if (uOvMaskOn > 0.5) a *= 1.0 - texture(uOvMask, fr).r;
+    if (a > 0.0) {
+      // blend like a photo editor does: on display-referred (gamma) values
+      vec3 b = clamp(toPerc(col), 0.0, 1.0);
+      vec3 o = toPerc(srgbToLin(texture(uOv, clamp(ouv, 0.0, 1.0)).rgb));
+      col = mix(col, toLin(blendMode(b, o, uOvBlend)), a);
     }
   }
   outColor = vec4(col, 1.0);
@@ -479,7 +518,7 @@ void main() {
     p = lift * tint + p * (1.0 - lift - uFade * 0.05);
   }
 
-  if (uShowMask >= 0) p = mix(p, vec3(0.15, 0.9, 1.0), overlay * 0.55);
+  if (uShowMask >= 0) p = mix(p, vec3(1.0, 0.78, 0.24), overlay * 0.55);
   outColor = vec4(min(toLin(p), vec3(16.0)), 1.0);
 }`;
 

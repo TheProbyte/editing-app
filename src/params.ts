@@ -98,6 +98,14 @@ export const PARAMS: ParamDef[] = [
   p('blurAngle', 'Angle', -90, 90, 0, { fmt: (v) => Math.round(v) + '°' }),
   p('blurX', 'Focus X', 0, 1, 0.5),
   p('blurY', 'Focus Y', 0, 1, 0.55),
+  // Double exposure
+  p('dxOpacity', 'Opacity', 0, 100, 60),
+  p('dxScale', 'Size', 10, 300, 100, { fmt: (v) => Math.round(v) + '%' }),
+  p('dxRot', 'Rotate', -180, 180, 0, { fmt: (v) => Math.round(v) + '°' }),
+  p('dxBlend', 'Blend', 0, 8, 0),
+  p('dxBrush', 'Brush size', 1, 100, 30),
+  p('dxX', 'Position X', 0, 1, 0.5),
+  p('dxY', 'Position Y', 0, 1, 0.5),
   // Remove (spot healing)
   p('healSize', 'Spot size', 1, 100, 25),
   // Geometry (crop tool)
@@ -141,7 +149,7 @@ export interface Geometry {
   flipV: boolean;
 }
 
-export type MaskType = 'radial' | 'linear' | 'brush' | 'luma' | 'color';
+export type MaskType = 'radial' | 'linear' | 'brush' | 'luma' | 'color' | 'subject';
 
 export interface Stroke {
   /** radius in frame heights */
@@ -167,6 +175,8 @@ export interface Mask {
   /** adjustments inside the mask (see MASK_ADJ) */
   a: Values;
   strokes: Stroke[];
+  /** AI selection ('subject' masks): include/exclude strokes for the subject model, or a people part */
+  ai?: { strokes: { neg: boolean; pts: number[] }[]; part?: number };
 }
 
 /** A healed spot: frame coords, radius in frame heights, source offset and a color correction. */
@@ -188,7 +198,11 @@ export interface EditState {
   geo: Geometry;
   masks: Mask[];
   spots: Spot[];
+  /** double exposure: the second photo (stored on the device by id) and its hide/show brush */
+  overlay?: { id: string; aspect: number; strokes: Stroke[] } | null;
 }
+
+export const BLEND_MODES = ['Normal', 'Lighten', 'Screen', 'Multiply', 'Darken', 'Overlay', 'Soft light', 'Add', 'Difference'];
 
 export const LINEAR: CurvePoint[] = [[0, 0], [1, 1]];
 
@@ -205,6 +219,7 @@ export function defaultState(): EditState {
     geo: { crop: { x: 0, y: 0, w: 1, h: 1 }, quarter: 0, flipH: false, flipV: false },
     masks: [],
     spots: [],
+    overlay: null,
   };
 }
 
@@ -256,8 +271,9 @@ export const MASK_TYPE_SETTINGS: Record<MaskType, string[]> = {
   brush: ['size', 'hard', 'flow', 'amount'],
   luma: ['lo', 'hi', 'soft', 'amount'],
   color: ['hue', 'range', 'amount'],
+  subject: ['size', 'hard', 'flow', 'amount'],
 };
 
 export const MASK_LABEL: Record<MaskType, string> = {
-  radial: 'Radial', linear: 'Gradient', brush: 'Brush', luma: 'Light range', color: 'Color range',
+  radial: 'Radial', linear: 'Gradient', brush: 'Brush', luma: 'Light range', color: 'Color range', subject: 'Subject',
 };

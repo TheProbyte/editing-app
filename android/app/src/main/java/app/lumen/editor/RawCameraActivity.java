@@ -33,6 +33,7 @@ import android.util.Size;
 import android.util.TypedValue;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
+import android.view.OrientationEventListener;
 import android.view.Surface;
 import android.view.TextureView;
 import android.view.View;
@@ -54,8 +55,8 @@ import java.util.Locale;
 public class RawCameraActivity extends Activity {
 
     private static final int REQ_CAM = 41;
-    private static final int ORANGE = 0xFFFF6A13;
-    private static final int CREAM = 0xFFF2E6D0;
+    private static final int ORANGE = 0xFFFFC83D;
+    private static final int CREAM = 0xFFF4F4F2;
 
     private TextureView preview;
     private TextView status;
@@ -75,6 +76,9 @@ public class RawCameraActivity extends Activity {
     private Image pendingImage;
     private TotalCaptureResult pendingResult;
     private boolean busy;
+    /** device rotation (0/90/180/270, clockwise from portrait) tracked from the sensors */
+    private int deviceDeg;
+    private OrientationEventListener orientationListener;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -118,6 +122,12 @@ public class RawCameraActivity extends Activity {
         root.addView(shutter, bl);
 
         setContentView(root);
+        orientationListener = new OrientationEventListener(this) {
+            @Override public void onOrientationChanged(int o) {
+                if (o == ORIENTATION_UNKNOWN) return;
+                deviceDeg = ((o + 45) / 90 * 90) % 360;
+            }
+        };
     }
 
     private TextView text(String s, int sp) {
@@ -135,6 +145,7 @@ public class RawCameraActivity extends Activity {
     @Override
     protected void onResume() {
         super.onResume();
+        if (orientationListener.canDetectOrientation()) orientationListener.enable();
         thread = new HandlerThread("lumen-raw");
         thread.start();
         bg = new Handler(thread.getLooper());
@@ -155,6 +166,7 @@ public class RawCameraActivity extends Activity {
 
     @Override
     protected void onPause() {
+        orientationListener.disable();
         closeCamera();
         if (thread != null) {
             thread.quitSafely();
@@ -353,7 +365,8 @@ public class RawCameraActivity extends Activity {
 
     private int exifOrientation() {
         Integer so = chars.get(CameraCharacteristics.SENSOR_ORIENTATION);
-        int deg = so == null ? 90 : so; // activity is locked to portrait
+        // back camera: sensor orientation plus how the phone is being held
+        int deg = (so == null ? 90 : so) + deviceDeg;
         switch ((deg % 360 + 360) % 360) {
             case 90: return ExifInterface.ORIENTATION_ROTATE_90;
             case 180: return ExifInterface.ORIENTATION_ROTATE_180;

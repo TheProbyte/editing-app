@@ -1,6 +1,7 @@
 package app.lumen.editor;
 
 import android.os.Bundle;
+import androidx.activity.OnBackPressedCallback;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
 import android.webkit.WebView;
@@ -31,6 +32,21 @@ public class MainActivity extends BridgeActivity {
                     r.setResponseHeaders(h);
                 }
                 return r;
+            }
+        });
+        // Back goes back a page inside the editor (closes a sheet or section, returns from
+        // the home screen); only when there's nowhere left to go does it leave the app.
+        getOnBackPressedDispatcher().addCallback(this, new OnBackPressedCallback(true) {
+            @Override
+            public void handleOnBackPressed() {
+                WebView wv = bridge.getWebView();
+                wv.evaluateJavascript("(function(){try{return !!(window.lumenBack&&window.lumenBack())}catch(e){return false}})()", (handled) -> {
+                    if (!"true".equals(handled)) {
+                        setEnabled(false);
+                        getOnBackPressedDispatcher().onBackPressed();
+                        setEnabled(true);
+                    }
+                });
             }
         });
     }

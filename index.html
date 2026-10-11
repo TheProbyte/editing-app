@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
-    <meta name="theme-color" content="#0b0a09" />
+    <meta name="theme-color" content="#0e0e0e" />
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
@@ -23,6 +23,7 @@
           <div id="cropLayer"></div>
           <div id="maskLayer"></div>
           <div id="blurLayer"></div>
+          <div id="healLayer"></div>
           <canvas id="detail"></canvas>
         </div>
         <div id="brushRing"></div>
@@ -37,43 +38,47 @@
         <section id="empty">
           <img class="logo" src="icon.svg" alt="" />
           <h1>LUMEN</h1>
-          <p>RAW and phone photos. Masks, blur, grain, halation, curves and color.</p>
-          <button class="btn-orange big" id="btnOpenBig">Open photo</button>
-          <button class="btn-dark big" id="btnCamera">Take photo</button>
-          <button class="btn-dark big" id="btnResume" hidden>Continue editing</button>
-          <button class="link" id="btnOpenRaw">Open a RAW file</button>
+          <div class="start-actions">
+            <button class="btn-accent big" id="btnOpenBig">Open photo</button>
+            <button class="btn-dark big" id="btnCamera">Take photo</button>
+            <button class="btn-dark big" id="btnResume" hidden>Continue editing</button>
+          </div>
         </section>
       </main>
 
       <header class="top ui">
-        <button class="ic" id="btnOpen" aria-label="Open photo"></button>
-        <button class="ic" id="btnCam" aria-label="Take photo"></button>
+        <button class="ic" id="btnHome" aria-label="Home"></button>
         <div class="title" id="title"></div>
         <button class="ic" id="btnUndo" aria-label="Undo"></button>
         <button class="ic" id="btnRedo" aria-label="Redo"></button>
         <button class="ic" id="btnMore" aria-label="More"></button>
-        <button class="btn-orange" id="btnExport">Export</button>
+        <button class="btn-accent" id="btnExport">Export</button>
       </header>
 
       <footer id="dock" class="ui">
+        <div id="grab" aria-hidden="true"><i></i></div>
         <nav id="tools"></nav>
         <section id="section">
           <div id="subs" class="row"></div>
           <div id="acts" class="row"></div>
+          <div id="slider" aria-label="Adjust value"><div class="track"><i class="fill"></i><b class="thumb"></b></div></div>
           <div id="secBar">
             <button class="round" id="secReset" aria-label="Reset this section"></button>
             <div id="pill">
-              <div class="line">
-                <button id="paramName" aria-label="Choose adjustment"></button>
-                <button id="paramValue" aria-label="Type a value"></button>
-                <input id="paramInput" type="text" inputmode="decimal" hidden />
-              </div>
-              <div class="ruler"><i></i><b></b></div>
+              <button id="paramName" aria-label="Choose adjustment"></button>
+              <button id="paramValue" aria-label="Type a value"></button>
+              <input id="paramInput" type="text" inputmode="decimal" hidden />
             </div>
-            <button class="round orange" id="secDone" aria-label="Done"></button>
+            <button class="round accent" id="secDone" aria-label="Done"></button>
           </div>
         </section>
       </footer>
+
+      <div id="allTools">
+        <div class="all-tabs" id="allTabs"></div>
+        <div class="all-grid" id="allGrid"></div>
+        <button class="all-close" id="allClose">Close</button>
+      </div>
     </div>
 
     <div id="busy"><div class="spin"></div><div class="msg"></div></div>
@@ -93,7 +98,7 @@
         <p class="hint" id="exHint"></p>
         <div class="sheet-actions">
           <button class="btn-dark" id="exCancel">Cancel</button>
-          <button class="btn-orange" id="exGo">Save</button>
+          <button class="btn-accent" id="exGo">Save</button>
         </div>
       </div>
     </div>
@@ -101,7 +106,7 @@
     <div id="moreSheet" class="sheet">
       <div class="sheet-card list">
         <button data-a="open">Open photo</button>
-        <button data-a="openRaw">Open RAW file</button>
+        <button data-a="camera">Take photo</button>
         <button data-a="hist">Histogram <span class="state" id="histState">Off</span></button>
         <button data-a="clip">Clipping warnings <span class="state" id="clipState">Off</span></button>
         <button data-a="copy">Copy edits</button>
@@ -119,7 +124,7 @@
         <input id="presetName" type="text" maxlength="28" placeholder="Preset name" />
         <div class="sheet-actions">
           <button class="btn-dark" id="presetCancel">Cancel</button>
-          <button class="btn-orange" id="presetSave">Save</button>
+          <button class="btn-accent" id="presetSave">Save</button>
         </div>
       </div>
     </div>
@@ -130,7 +135,7 @@
         <p class="hint" id="confirmText"></p>
         <div class="sheet-actions">
           <button class="btn-dark" id="confirmNo">Cancel</button>
-          <button class="btn-orange" id="confirmYes">Delete</button>
+          <button class="btn-accent" id="confirmYes">Delete</button>
         </div>
       </div>
     </div>
@@ -148,13 +153,13 @@
         <p class="hint">Press and hold the photo, then choose Save to Photos.</p>
         <img id="resultImg" alt="Edited photo" />
         <div class="sheet-actions">
-          <button class="btn-orange" id="resultDone">Done</button>
+          <button class="btn-accent" id="resultDone">Done</button>
         </div>
       </div>
     </div>
 
     <input type="file" id="file" accept="image/*" hidden />
-    <input type="file" id="fileRaw" hidden />
+    <input type="file" id="fileOverlay" accept="image/*" hidden />
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

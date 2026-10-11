@@ -6,6 +6,8 @@ interface Slot {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
   id: number;
+  /** AI selection drawn underneath the strokes */
+  base: CanvasImageSource | null;
   /** strokes drawn so far, points drawn in the last of them, and a fingerprint of them */
   n: number;
   lastPts: number;
@@ -34,6 +36,8 @@ export class BrushAtlas {
   private slots: (Slot | null)[] = new Array(8).fill(null);
   private packed: [Uint8Array, Uint8Array];
   private dabs = new Map<number, HTMLCanvasElement>();
+  /** Raster for an AI ('subject') mask, or null while it's being computed. */
+  getBase: (m: Mask) => CanvasImageSource | null = () => null;
 
   constructor(private gl: WebGL2RenderingContext) {
     this.tex = [this.mkTex(), this.mkTex()];
@@ -73,11 +77,11 @@ export class BrushAtlas {
   sync(masks: Mask[]) {
     for (let i = 0; i < 8; i++) {
       const m = masks[i];
-      if (!m || m.type !== 'brush') {
+      if (!m || (m.type !== 'brush' && m.type !== 'subject')) {
         if (this.slots[i]) this.clearSlot(i);
         continue;
       }
-      this.syncSlot(i, m.id, m.strokes);
+      this.syncSlot(i, m.id, m.strokes, m.type === 'subject' ? this.getBase(m) : null);
     }
   }
 
@@ -86,23 +90,25 @@ export class BrushAtlas {
     this.writeChannel(i, null, 0, 0, this.w, this.h);
   }
 
-  private syncSlot(i: number, id: number, strokes: Stroke[]) {
+  private syncSlot(i: number, id: number, strokes: Stroke[], base: CanvasImageSource | null) {
     let s = this.slots[i];
     if (!s) {
       const canvas = document.createElement('canvas');
       canvas.width = this.w;
       canvas.height = this.h;
-      s = { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true })!, id, n: 0, lastPts: 0, fp: 0 };
+      s = { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true })!, id, base: null, n: 0, lastPts: 0, fp: 0 };
       this.slots[i] = s;
     }
     const incremental =
-      s.id === id && strokes.length >= s.n &&
+      s.id === id && s.base === base && strokes.length >= s.n &&
       (s.n === 0 || strokes[s.n - 1].pts.length >= s.lastPts) &&
       fingerprint(strokes, s.n) === s.fp;
     if (incremental && strokes.length === s.n && (s.n === 0 || strokes[s.n - 1].pts.length === s.lastPts)) return;
     const box = { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity };
     if (!incremental) {
       s.ctx.clearRect(0, 0, this.w, this.h);
+      if (base) s.ctx.drawImage(base, 0, 0, this.w, this.h);
+      s.base = base;
       for (const st of strokes) this.drawStroke(s.ctx, st, 0, box);
     } else {
       if (s.n > 0) this.drawStroke(s.ctx, strokes[s.n - 1], Math.max(0, s.lastPts - 2), box);

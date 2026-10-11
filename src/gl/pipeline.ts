@@ -64,6 +64,9 @@ export class Pipeline {
   showMask = -1;
   /** Highlight clipped highlights/shadows on screen. */
   clip = false;
+  /** Double exposure: the second photo's texture (sRGB) and its hide-brush (atlas, red channel). */
+  overlay: { tex: WebGLTexture; id: string } | null = null;
+  overlayMask: WebGLTexture | null = null;
 
   constructor(g: GL) {
     this.g = g;
@@ -189,6 +192,22 @@ export class Pipeline {
       gl.uniform4fv(p.loc('uSpot'), S0);
       gl.uniform4fv(p.loc('uSpotOff'), S1);
       gl.uniform1fv(p.loc('uSpotCorrB'), S2);
+      const ov = state.overlay;
+      const on = !!(ov && this.overlay && this.overlay.id === ov.id && state.v.dxOpacity > 0);
+      gl.uniform1i(p.loc('uOvOn'), on ? 1 : 0);
+      this.g.bindTex(p, 'uOv', on ? this.overlay!.tex : this.black);
+      this.g.bindTex(p, 'uOvMask', this.overlayMask ?? this.black);
+      if (on) {
+        const v = state.v;
+        // at 100% the second photo just covers the frame
+        const k = Math.max(f.w / ov!.aspect, f.h) * (v.dxScale / 100);
+        gl.uniform2f(p.loc('uOvC'), v.dxX, v.dxY);
+        gl.uniform2f(p.loc('uOvHalf'), (ov!.aspect * k) / 2, k / 2);
+        gl.uniform1f(p.loc('uOvRot'), (v.dxRot * Math.PI) / 180);
+        gl.uniform1f(p.loc('uOvOpacity'), v.dxOpacity / 100);
+        gl.uniform1i(p.loc('uOvBlend'), Math.round(v.dxBlend));
+        gl.uniform1f(p.loc('uOvMaskOn'), ov!.strokes.length && this.overlayMask ? 1 : 0);
+      }
     });
   }
 
@@ -207,7 +226,11 @@ export class Pipeline {
   }
 
   private geoKey(src: Source, state: EditState, w: number, h: number) {
-    return JSON.stringify([src.w, src.h, w, h, state.geo, state.v.straighten, state.v.distortion, state.spots]);
+    const v = state.v;
+    const ov = state.overlay && this.overlay?.id === state.overlay.id
+      ? [state.overlay, v.dxOpacity, v.dxScale, v.dxRot, v.dxBlend, v.dxX, v.dxY]
+      : null;
+    return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, state.spots, ov]);
   }
 
   /** The full-frame analysis image and its large blurs, at (w, h). Cached by geometry. */
@@ -436,10 +459,11 @@ export class Pipeline {
     const A0 = new Float32Array(32), A1 = new Float32Array(32), A2 = new Float32Array(32);
     masks.forEach((m, i) => {
       const g = m.g, a = m.a, o = i * 4;
-      types[i] = { radial: 1, linear: 2, brush: 3, luma: 4, color: 5 }[m.type];
+      // subject (AI) masks are rasterized into the brush atlas, so they render like brushes
+      types[i] = { radial: 1, linear: 2, brush: 3, luma: 4, color: 5, subject: 3 }[m.type];
       if (m.type === 'radial') G0.set([g.cx, g.cy, g.rx, g.ry], o);
       else if (m.type === 'linear') G0.set([g.x0, g.y0, g.x1, g.y1], o);
-      else if (m.type === 'brush') G0.set([i, 0, 0, 0], o);
+      else if (m.type === 'brush' || m.type === 'subject') G0.set([i, 0, 0, 0], o);
       else if (m.type === 'luma') {
         const lo = g.lo / 100, hi = g.hi / 100, soft = 0.01 + (g.soft / 100) * 0.35;
         G0.set([Math.min(lo, hi), Math.max(lo, hi), soft, 0], o);

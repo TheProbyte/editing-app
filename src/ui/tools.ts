@@ -1,4 +1,4 @@
-import { BAND_COLORS, GRADE_ZONES, HSL_BANDS } from '../params';
+import { BAND_COLORS, BLEND_MODES, GRADE_ZONES, HSL_BANDS } from '../params';
 import { ICONS } from './icons';
 
 export { ICONS };
@@ -14,7 +14,7 @@ export interface ToolDef {
   id: string;
   label: string;
   icon: string;
-  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur' | 'heal';
+  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur' | 'heal' | 'double';
   subs?: Chip[];
   params: (sub: string) => string[];
   /** quick presets / one-tap actions shown in the section */
@@ -66,6 +66,11 @@ export const TOOLS: ToolDef[] = [
     params: (z) => [`cg_${z}_hue`, `cg_${z}_sat`, `cg_${z}_lum`, 'cg_blend', 'cg_balance'],
   },
   { id: 'bw', label: 'B&W', icon: ICONS.bw, kind: 'params', params: list('bw', ...HSL_BANDS.map((b) => `bw_${b}`), 'bw_toneHue', 'bw_toneAmt') },
+  {
+    id: 'double', label: 'Double', icon: ICONS.double, kind: 'double',
+    subs: BLEND_MODES.map((m, i) => ({ id: String(i), label: m })),
+    params: () => ['dxOpacity', 'dxScale', 'dxRot'],
+  },
   {
     id: 'blur', label: 'Blur', icon: ICONS.blur, kind: 'blur',
     subs: [

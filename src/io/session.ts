@@ -58,3 +58,20 @@ export async function loadSession(): Promise<{ file: File; state: string } | nul
     return null;
   }
 }
+
+/** Extra photos used by an edit (double exposure), kept on the device by id. */
+export async function saveBlob(key: string, blob: Blob) {
+  try {
+    await tx('readwrite', (st) => st.put(blob, 'blob:' + key));
+  } catch {
+    /* best effort */
+  }
+}
+
+export async function loadBlob(key: string): Promise<Blob | null> {
+  try {
+    return ((await tx<Blob | undefined>('readonly', (st) => st.get('blob:' + key))) ?? null);
+  } catch {
+    return null;
+  }
+}

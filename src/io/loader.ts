@@ -5,8 +5,13 @@ export const RAW_EXT = [
 ];
 
 export type Loaded =
-  | { kind: 'bitmap'; bitmap: ImageBitmap; w: number; h: number; info: string; note?: string }
-  | { kind: 'raw'; data: Uint16Array; w: number; h: number; info: string; note?: string };
+  | { kind: 'bitmap'; bitmap: ImageBitmap; w: number; h: number; info: string; note?: string; quarter?: number }
+  | { kind: 'raw'; data: Uint16Array; w: number; h: number; info: string; note?: string; quarter?: number };
+
+/** EXIF/LibRaw orientation -> clockwise quarter turns (mirrored variants are rare; ignored). */
+function flipToQuarter(flip: number | undefined) {
+  return flip === 6 ? 1 : flip === 3 ? 2 : flip === 5 ? 3 : 0;
+}
 
 export function isRaw(file: File) {
   const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
@@ -160,6 +165,8 @@ function decodeRaw(file: File, maxDim: number): Promise<Loaded> {
         userQual: 3,
         noAutoBright: false,
         autoBrightThr: 0.003,
+        // never rotate the pixels; the orientation becomes a (non-destructive) quarter turn
+        userFlip: 0,
       });
       const meta = await call('metadata', false).catch(() => null);
       const img = await call('imageData');
@@ -183,7 +190,7 @@ function decodeRaw(file: File, maxDim: number): Promise<Loaded> {
           (meta.aperture ? ` · f/${(+meta.aperture).toFixed(1)}` : '') +
           ` · ${w}×${h} RAW`
         : `${w}×${h} RAW`;
-      resolve({ kind: 'raw', data, w, h, info });
+      resolve({ kind: 'raw', data, w, h, info, quarter: flipToQuarter(meta?.flip) });
     } catch (e) {
       reject(e);
     } finally {

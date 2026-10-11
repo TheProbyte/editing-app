@@ -4,8 +4,10 @@
  */
 export class Loupe {
   private ctx: CanvasRenderingContext2D;
-  private size = 112;
-  private zoom = 3.2;
+  private size = 128;
+  zoom = 3.2;
+  /** radius (screen px) of a ring to draw at the centre, e.g. the Remove spot; 0 = crosshair */
+  ring = 0;
   pos: { x: number; y: number } | null = null;
   color = '#fff';
 
@@ -50,7 +52,7 @@ export class Loupe {
     c.beginPath();
     c.arc(W / 2, W / 2, W / 2 - W * 0.04, 0, Math.PI * 2);
     c.clip();
-    c.fillStyle = '#0b0a09';
+    c.fillStyle = '#0e0e0e';
     c.fillRect(0, 0, W, W);
     c.imageSmoothingEnabled = false;
     try {
@@ -59,11 +61,12 @@ export class Loupe {
       /* canvas not ready */
     }
     c.restore();
-    // crosshair
+    // crosshair, or the spot being removed at its real size
+    const rr = this.ring > 0 ? Math.min(W * 0.44, this.ring * (W / span)) : W * 0.07;
     c.strokeStyle = 'rgba(0,0,0,.55)';
     c.lineWidth = W * 0.03;
     c.beginPath();
-    c.arc(W / 2, W / 2, W * 0.07, 0, Math.PI * 2);
+    c.arc(W / 2, W / 2, rr, 0, Math.PI * 2);
     c.stroke();
     c.strokeStyle = '#fff';
     c.lineWidth = W * 0.014;

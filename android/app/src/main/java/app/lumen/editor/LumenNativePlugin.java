@@ -7,6 +7,8 @@ import android.content.Intent;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.ImageDecoder;
+import android.graphics.Matrix;
+import android.media.ExifInterface;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Environment;
@@ -184,6 +186,20 @@ public class LumenNativePlugin extends Plugin {
                 bmp = BitmapFactory.decodeFile(path);
             }
             if (bmp == null) throw new IOException("Android can't decode this file");
+            // Some decoders ignore the DNG orientation; phone sensors are landscape, so a
+            // still-landscape result with a 90/270 tag hasn't been turned yet.
+            int rot = 0;
+            try {
+                int o = new ExifInterface(path).getAttributeInt(ExifInterface.TAG_ORIENTATION, ExifInterface.ORIENTATION_NORMAL);
+                rot = o == ExifInterface.ORIENTATION_ROTATE_90 ? 90 : o == ExifInterface.ORIENTATION_ROTATE_270 ? 270 : 0;
+            } catch (Exception ignored) {}
+            if (rot != 0 && bmp.getWidth() > bmp.getHeight()) {
+                Matrix m = new Matrix();
+                m.postRotate(rot);
+                Bitmap r = Bitmap.createBitmap(bmp, 0, 0, bmp.getWidth(), bmp.getHeight(), m, true);
+                bmp.recycle();
+                bmp = r;
+            }
             File outFile = new File(getContext().getCacheDir(), "decoded_" + System.currentTimeMillis() + ".jpg");
             try (FileOutputStream os = new FileOutputStream(outFile)) {
                 bmp.compress(Bitmap.CompressFormat.JPEG, 98, os);

@@ -44,6 +44,9 @@ export const ICONS = {
   film: I('<path fill-rule="evenodd" d="M5 3h14a1 1 0 0 1 1 1v16a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V4a1 1 0 0 1 1-1zm1 2v2h2V5zm0 4v2h2V9zm0 4v2h2v-2zm0 4v2h2v-2zM16 5v2h2V5zm0 4v2h2V9zm0 4v2h2v-2zm0 4v2h2v-2zM9.5 6v12h5V6z"/>'),
   crop: I('<path d="M5 2h2.4v14.6H22V19H5z"/><path d="M8.6 5H19v10.4h-2.4V7.4H8.6z" opacity=".55"/>'),
 
+  heal: I('<path d="M14.6 3.3a3.4 3.4 0 0 1 4.8 0l1.3 1.3a3.4 3.4 0 0 1 0 4.8L9.4 20.7a3.4 3.4 0 0 1-4.8 0l-1.3-1.3a3.4 3.4 0 0 1 0-4.8z" opacity=".45"/><circle cx="10.2" cy="10.2" r="1.1"/><circle cx="13.8" cy="13.8" r="1.1"/><circle cx="13.8" cy="10.2" r="1.1"/><circle cx="10.2" cy="13.8" r="1.1"/>'),
+  camera: I('<path fill-rule="evenodd" d="M8.6 4h6.8l1.6 2.4H20a2 2 0 0 1 2 2V18a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V8.4a2 2 0 0 1 2-2h3zM12 9a4.2 4.2 0 1 0 0 8.4A4.2 4.2 0 0 0 12 9z"/>'),
+  flipCam: I(L('M4 11a8 8 0 0 1 14.3-4.6', 2.2) + '<path d="M19.8 3.4l.4 5-5-.6z"/>' + L('M20 13a8 8 0 0 1-14.3 4.6', 2.2) + '<path d="M4.2 20.6l-.4-5 5 .6z"/>'),
   // --- masks
   mRadial: I('<ellipse cx="12" cy="12" rx="9" ry="7" fill="none" stroke-width="2"/><circle cx="12" cy="12" r="2.6"/>'),
   mLinear: I('<rect x="3" y="4" width="18" height="3.2" rx="1.6"/><rect x="3" y="10.4" width="18" height="3.2" rx="1.6" opacity=".55"/><rect x="3" y="16.8" width="18" height="3.2" rx="1.6" opacity=".22"/>'),

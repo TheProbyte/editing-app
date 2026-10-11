@@ -69,6 +69,8 @@ export const framed = (() => {
 
 export async function saveOrShare(blob: Blob, name: string): Promise<'shared' | 'downloaded' | 'shown'> {
   if (framed) return 'shown';
+  // Android: save straight to the phone (Downloads, which Google Photos shows on-device)
+  if (/Android/i.test(navigator.userAgent)) return download(blob, name);
   const file = new File([blob], name, { type: blob.type });
   const nav = navigator as Navigator & { canShare?: (d: ShareData) => boolean };
   if (nav.canShare && nav.canShare({ files: [file] }) && /Android|iPhone|iPad|iPod/i.test(navigator.userAgent)) {
@@ -79,6 +81,10 @@ export async function saveOrShare(blob: Blob, name: string): Promise<'shared' | 
       if ((e as Error).name === 'AbortError') throw e;
     }
   }
+  return download(blob, name);
+}
+
+function download(blob: Blob, name: string): 'downloaded' {
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

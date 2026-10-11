@@ -98,6 +98,8 @@ export const PARAMS: ParamDef[] = [
   p('blurAngle', 'Angle', -90, 90, 0, { fmt: (v) => Math.round(v) + '°' }),
   p('blurX', 'Focus X', 0, 1, 0.5),
   p('blurY', 'Focus Y', 0, 1, 0.55),
+  // Remove (spot healing)
+  p('healSize', 'Spot size', 1, 100, 25),
   // Geometry (crop tool)
   p('straighten', 'Straighten', -45, 45, 0, { fmt: straighten, swipe: 30 }),
   // Grading
@@ -167,11 +169,25 @@ export interface Mask {
   strokes: Stroke[];
 }
 
+/** A healed spot: frame coords, radius in frame heights, source offset and a color correction. */
+export interface Spot {
+  x: number;
+  y: number;
+  r: number;
+  ox: number;
+  oy: number;
+  /** linear RGB added to the copied patch so it matches its new surroundings */
+  c: [number, number, number];
+}
+
+export const MAX_SPOTS = 32;
+
 export interface EditState {
   v: Values;
   curves: Curves;
   geo: Geometry;
   masks: Mask[];
+  spots: Spot[];
 }
 
 export const LINEAR: CurvePoint[] = [[0, 0], [1, 1]];
@@ -188,6 +204,7 @@ export function defaultState(): EditState {
     curves: { rgb: [...LINEAR], r: [...LINEAR], g: [...LINEAR], b: [...LINEAR] },
     geo: { crop: { x: 0, y: 0, w: 1, h: 1 }, quarter: 0, flipH: false, flipV: false },
     masks: [],
+    spots: [],
   };
 }
 

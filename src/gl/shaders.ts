@@ -58,6 +58,24 @@ uniform vec2 uFlip;
 uniform float uDistort;
 uniform vec2 uFull;       // output (cropped) image size in px
 uniform vec4 uTile;       // tile offset.xy, size.zw in output px
+// spot healing
+uniform int uSpotCount;
+uniform vec4 uSpot[32];   // x, y, r (frame heights), -
+uniform vec4 uSpotOff[32];// offset x, y (frame coords); correction r, g in zw
+uniform float uSpotCorrB[32];
+
+/** Frame coordinates (0..1 over the turned, uncropped frame) -> linear source color. */
+vec3 srcAt(vec2 fr) {
+  vec2 q = fr * uFrameSize - 0.5 * uFrameSize;
+  float c = cos(-uAngle), s = sin(-uAngle);
+  q = mat2(c, s, -s, c) * q / uCover;
+  q *= uFlip;
+  for (int i = 0; i < 3; i++) {
+    if (i < uQuarter) q = vec2(q.y, -q.x);
+  }
+  vec3 col = texture(uSrc, (q + 0.5 * uSrcSize) / uSrcSize).rgb;
+  return uSrcLinear < 0.5 ? srgbToLin(col) : col;
+}
 
 void main() {
   vec2 g = (uTile.xy + vUv * uTile.zw) / uFull;
@@ -69,16 +87,19 @@ void main() {
     float f = (1.0 - k * r2) / (k < 0.0 ? 1.0 - k : 1.0);
     g = 0.5 + (g - 0.5) * f;
   }
-  vec2 q = (uCrop.xy + g * uCrop.zw) * uFrameSize - 0.5 * uFrameSize;
-  float c = cos(-uAngle), s = sin(-uAngle);
-  q = mat2(c, s, -s, c) * q / uCover;
-  q *= uFlip;
-  for (int i = 0; i < 3; i++) {
-    if (i < uQuarter) q = vec2(q.y, -q.x);
+  vec2 fr = uCrop.xy + g * uCrop.zw;
+  vec3 col = srcAt(fr);
+  float fa = uFrameSize.x / uFrameSize.y;
+  for (int i = 0; i < 32; i++) {
+    if (i >= uSpotCount) break;
+    vec4 sp = uSpot[i];
+    float dd = length((fr - sp.xy) * vec2(fa, 1.0)) / sp.z;
+    if (dd < 1.0) {
+      vec4 o = uSpotOff[i];
+      vec3 donor = max(srcAt(fr + o.xy) + vec3(o.z, o.w, uSpotCorrB[i]), 0.0);
+      col = mix(col, donor, 1.0 - smoothstep(0.5, 1.0, dd));
+    }
   }
-  vec2 suv = (q + 0.5 * uSrcSize) / uSrcSize;
-  vec3 col = texture(uSrc, suv).rgb;
-  if (uSrcLinear < 0.5) col = srgbToLin(col);
   outColor = vec4(col, 1.0);
 }`;
 

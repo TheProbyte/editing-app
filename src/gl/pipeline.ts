@@ -1,7 +1,7 @@
 import { GL, Program, Target } from './glutil';
 import { BLUR, BRIGHT, DEVELOP, DOWNSAMPLE, FINISH, GEOMETRY } from './shaders';
 import { buildCurveLut, isIdentity, LUT_SIZE } from '../curves';
-import { EditState, GRADE_ZONES, HSL_BANDS, Geometry, MAX_MASKS } from '../params';
+import { EditState, GRADE_ZONES, HSL_BANDS, Geometry, MAX_MASKS, MAX_SPOTS } from '../params';
 
 export interface Source {
   tex: WebGLTexture;
@@ -178,11 +178,36 @@ export class Pipeline {
       gl.uniform1f(p.loc('uDistort'), (state.v.distortion / 100) * 0.3);
       gl.uniform2f(p.loc('uFull'), full.w, full.h);
       gl.uniform4f(p.loc('uTile'), tile.x, tile.y, tile.w, tile.h);
+      const spots = (state.spots ?? []).slice(0, MAX_SPOTS);
+      const S0 = new Float32Array(MAX_SPOTS * 4), S1 = new Float32Array(MAX_SPOTS * 4), S2 = new Float32Array(MAX_SPOTS);
+      spots.forEach((sp, i) => {
+        S0.set([sp.x, sp.y, sp.r, 0], i * 4);
+        S1.set([sp.ox, sp.oy, sp.c[0], sp.c[1]], i * 4);
+        S2[i] = sp.c[2];
+      });
+      gl.uniform1i(p.loc('uSpotCount'), spots.length);
+      gl.uniform4fv(p.loc('uSpot'), S0);
+      gl.uniform4fv(p.loc('uSpotOff'), S1);
+      gl.uniform1fv(p.loc('uSpotCorrB'), S2);
     });
   }
 
+  /** Read a rectangle of the unedited, geometry-applied image (linear, 8-bit). */
+  geometryRegion(src: Source, state: EditState, w: number, h: number, rect: Tile) {
+    const t = this.g.acquire(w, h, false);
+    this.geometryPass(src, state, { w, h }, { x: 0, y: 0, w, h }, t);
+    const gl = this.g.gl;
+    const x = Math.max(0, Math.floor(rect.x)), y = Math.max(0, Math.floor(rect.y));
+    const rw = Math.max(1, Math.min(w - x, Math.ceil(rect.w))), rh = Math.max(1, Math.min(h - y, Math.ceil(rect.h)));
+    const px = new Uint8Array(rw * rh * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, t.fbo);
+    gl.readPixels(x, y, rw, rh, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    this.g.release(t);
+    return { px, x, y, w: rw, h: rh };
+  }
+
   private geoKey(src: Source, state: EditState, w: number, h: number) {
-    return JSON.stringify([src.w, src.h, w, h, state.geo, state.v.straighten, state.v.distortion]);
+    return JSON.stringify([src.w, src.h, w, h, state.geo, state.v.straighten, state.v.distortion, state.spots]);
   }
 
   /** The full-frame analysis image and its large blurs, at (w, h). Cached by geometry. */
@@ -491,18 +516,9 @@ export class Pipeline {
     return out;
   }
 
-  /**
-   * Full-resolution, tiled export. `analysisSrc` is a smaller copy of the source used
-   * for the image-wide blurs (they're far larger than a tile and resolution independent).
-   */
-  async exportTiled(
-    full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number,
-    onStrip: (px: Uint8Array, y: number, rows: number) => void | Promise<void>,
-    progress: (f: number) => void,
-  ) {
+  /** Image-wide passes for exports and full-res detail: blurs, halation, glow, lens blur. */
+  private prepareGlobal(full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number) {
     const g = this.g;
-    const gl = g.gl;
-    // analysis resolution: same aspect as the output, long edge ≤ 2048
     const k = Math.min(1, 2048 / Math.max(outW, outH));
     const aw = Math.max(16, Math.round(outW * k));
     const ah = Math.max(16, Math.round(outH * k));
@@ -514,11 +530,65 @@ export class Pipeline {
     g.release(Bg);
     g.release(smallG.sharp.t);
     g.release(smallG.noise.t);
+    return { glb, fx };
+  }
 
+  private releaseGlobal(p: ReturnType<Pipeline['prepareGlobal']>) {
+    this.releaseFx(p.fx);
+    this.releaseGlobals(p.glb);
+  }
+
+  /** Render one rectangle of the full-resolution output to RGBA8 (top row first). */
+  private renderTile(full: Source, state: EditState, outW: number, outH: number, r: Tile, P: ReturnType<Pipeline['prepareGlobal']>) {
+    const g = this.g;
+    const gl = g.gl;
+    const S = Math.min(outW, outH);
+    const pad = Math.ceil(S * 0.012) + 8;
+    const fullSize = { w: outW, h: outH };
+    const { x, y, w, h } = r;
+    const pw = w + pad * 2;
+    const ph = h + pad * 2;
+    const ptile = { x: x - pad, y: y - pad, w: pw, h: ph };
+    const A = g.acquire(pw, ph);
+    this.geometryPass(full, state, fullSize, ptile, A);
+    const small = this.smallBlurs(A, state, S, null);
+    const B = g.acquire(pw, ph);
+    this.developPass(A, state, P.glb, fullSize, ptile, small, B, full.linear, aspectOf(full, state));
+    g.release(A);
+    g.release(small.sharp.t);
+    g.release(small.noise.t);
+    const out = g.acquire(w, h, false);
+    this.finishPass(B, [pad / pw, pad / ph, w / pw, h / ph], state, fullSize, { x, y, w, h }, P.fx, out, false);
+    g.release(B);
+    const px = new Uint8Array(w * h * 4);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, out.fbo);
+    gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
+    g.release(out);
+    return px;
+  }
+
+  /** Full-resolution pixels for a region of the output (used for pixel-level zoom). */
+  renderRegion(full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number, r: Tile) {
+    const P = this.prepareGlobal(full, analysisSrc, state, outW, outH);
+    const px = this.renderTile(full, state, outW, outH, r, P);
+    this.releaseGlobal(P);
+    return px;
+  }
+
+  /**
+   * Full-resolution, tiled export. `analysisSrc` is a smaller copy of the source used
+   * for the image-wide blurs (they're far larger than a tile and resolution independent).
+   */
+  async exportTiled(
+    full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number,
+    onStrip: (px: Uint8Array, y: number, rows: number) => void | Promise<void>,
+    progress: (f: number) => void,
+  ) {
+    const g = this.g;
+    const P = this.prepareGlobal(full, analysisSrc, state, outW, outH);
     const S = Math.min(outW, outH);
     const pad = Math.ceil(S * 0.012) + 8;
     const T = Math.min(2048, g.maxTex - pad * 2);
-    const fullSize = { w: outW, h: outH };
     const tilesX = Math.ceil(outW / T);
     const tilesY = Math.ceil(outH / T);
     let done = 0;
@@ -529,24 +599,7 @@ export class Pipeline {
       for (let tx = 0; tx < tilesX; tx++) {
         const x = tx * T;
         const w = Math.min(T, outW - x);
-        const pw = w + pad * 2;
-        const ph = h + pad * 2;
-        const ptile = { x: x - pad, y: y - pad, w: pw, h: ph };
-        const A = g.acquire(pw, ph);
-        this.geometryPass(full, state, fullSize, ptile, A);
-        const small = this.smallBlurs(A, state, S, null);
-        const B = g.acquire(pw, ph);
-        this.developPass(A, state, glb, fullSize, ptile, small, B, full.linear, aspectOf(full, state));
-        g.release(A);
-        g.release(small.sharp.t);
-        g.release(small.noise.t);
-        const out = g.acquire(w, h, false);
-        this.finishPass(B, [pad / pw, pad / ph, w / pw, h / ph], state, fullSize, { x, y, w, h }, fx, out, false);
-        g.release(B);
-        const px = new Uint8Array(w * h * 4);
-        gl.bindFramebuffer(gl.FRAMEBUFFER, out.fbo);
-        gl.readPixels(0, 0, w, h, gl.RGBA, gl.UNSIGNED_BYTE, px);
-        g.release(out);
+        const px = this.renderTile(full, state, outW, outH, { x, y, w, h }, P);
         for (let r = 0; r < h; r++) strip.set(px.subarray(r * w * 4, (r + 1) * w * 4), (r * outW + x) * 4);
         done++;
         progress(done / (tilesX * tilesY));
@@ -554,8 +607,7 @@ export class Pipeline {
       }
       await onStrip(strip, y, h);
     }
-    this.releaseFx(fx);
-    this.releaseGlobals(glb);
+    this.releaseGlobal(P);
     g.trim(2048 * 2048);
   }
 }

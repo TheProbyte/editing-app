@@ -14,7 +14,7 @@ export interface ToolDef {
   id: string;
   label: string;
   icon: string;
-  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur';
+  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur' | 'heal';
   subs?: Chip[];
   params: (sub: string) => string[];
   /** quick presets / one-tap actions shown in the section */
@@ -30,6 +30,7 @@ export const TOOLS: ToolDef[] = [
     params: list('exposure', 'contrast', 'brightness', 'highlights', 'shadows', 'whites', 'blacks'),
   },
   { id: 'color', label: 'Color', icon: ICONS.color, kind: 'params', params: list('temp', 'tint', 'vibrance', 'saturation') },
+  { id: 'heal', label: 'Remove', icon: ICONS.heal, kind: 'heal', params: list('healSize') },
   { id: 'masks', label: 'Masks', icon: ICONS.masks, kind: 'masks', params: () => [] },
   {
     id: 'detail', label: 'Detail', icon: ICONS.detail, kind: 'params',

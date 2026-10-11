@@ -14,15 +14,19 @@ Tap a tool in the bottom bar to open its section. Everything in a section is don
 | **Tap** | Hide / show all controls |
 | **Double-tap** | Reset the current adjustment |
 | **Press & hold** | Show the original |
-| **Pinch** | Zoom |
+| **Pinch** | Zoom — all the way to single pixels (a faint pixel grid appears) |
+| **One finger, zoomed in** | Pan around |
+| **Back gesture** | Leave the section without keeping its changes |
 | Tap the value at the bottom | Type an exact number |
-| ✓ (bottom right) | Done — back to the tool bar · ↺ (bottom left) resets the section |
+| ✓ (bottom right) | Keep changes — back to the tool bar · ↺ (bottom left) resets the section |
 
 ## Features
 
 - **Formats:** JPEG, HEIC (Safari), PNG, WebP, and **RAW** — DNG, CR2, CR3, NEF, ARW, RAF, ORF,
   RW2, PEF and more, decoded with LibRaw (WebAssembly) in 16-bit linear. If full RAW decoding
   isn't possible on a device, the camera's embedded full-size JPEG is used instead.
+- **Remove:** tap blemishes, dust or small objects to heal them (auto-picks a matching patch).
+- **Camera:** take a photo in-app — a plain full-resolution capture from the camera without the phone's HDR/computational processing (swipe for exposure).
 - **Blur:** tilt-shift and radial focus blur with a draggable focus point (true linear-light lens blur).
 - **Masks & selective edits:** up to 8 per photo — Radial, Gradient, Brush (paint/erase with size,
   hardness, flow), Selective point (Snapseed-style, follows similar colors), Light range and Color
@@ -49,8 +53,7 @@ Tap a tool in the bottom bar to open its section. Everything in a section is don
 - **Film & Lens:** Fade (with warmth), color fringing, lens distortion.
 - **Crop & rotate:** free or fixed aspect ratios, straighten, rotate 90°, flip.
 - Undo/redo, histogram, copy/paste edits, **full-resolution export** (JPEG/PNG, tiled rendering
-  plus a streaming JPEG encoder, so even 40+ MP files export on a phone), Share sheet to save to
-  Photos.
+  plus a streaming JPEG encoder, so even 40+ MP files export on a phone), saves straight to the phone on Android (Downloads), Share sheet on iPhone.
 - Works offline once loaded, and autosaves — reopen the app and tap **Continue editing**.
 - Clipping warnings, per-tool Reset, zoom badge (tap to fit).
 

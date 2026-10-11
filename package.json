@@ -16,7 +16,8 @@
     "@fontsource/pixelify-sans": "^5.3.0",
     "@fontsource/silkscreen": "^5.3.0",
     "@mediapipe/tasks-vision": "^1.1.0",
-    "libraw-wasm": "1.6.0"
+    "libraw-wasm": "1.6.0",
+    "onnxruntime-web": "^1.30.0"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.5.3",

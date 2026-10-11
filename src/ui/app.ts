@@ -25,6 +25,7 @@ import { tick } from './haptics';
 import { Camera } from './camera';
 import { isNative, Native, fileFromPath } from '../native';
 import { Segmenter, PEOPLE_PARTS, refineMask } from '../ai/segment';
+import { NeuralFill } from '../ai/neural';
 
 interface Img {
   full: Source;
@@ -106,6 +107,7 @@ export class App {
   // AI selection: the segmenter, rasters for subject masks (by selection key), the latest
   // raster per mask (shown while a new one is computed) and the photo as the models see it
   private seg = new Segmenter();
+  private neural = new NeuralFill();
   private bases = new Map<string, HTMLCanvasElement>();
   private lastBase = new Map<number, HTMLCanvasElement>();
   private baseJobs = new Set<string>();
@@ -711,6 +713,28 @@ export class App {
     b.classList.add('kick');
   }
 
+  /** Every step of the edit, newest first. Tap one to jump there. */
+  private openHistory() {
+    const list = $('histList');
+    list.innerHTML = '';
+    for (let i = this.history.length - 1; i >= 0; i--) {
+      const label = i === 0 ? 'Opened' : describeChange(this.history[i - 1], this.history[i]) || 'Edit';
+      const b = document.createElement('button');
+      b.className = 'hrow' + (i === this.hIdx ? ' on' : i > this.hIdx ? ' future' : '');
+      b.innerHTML = `<span class="n">${i}</span><span class="t">${escapeHtml(label)}</span>${i === this.hIdx ? '<span class="m">NOW</span>' : ''}`;
+      b.onclick = () => {
+        $('historySheet').classList.remove('on');
+        if (i === this.hIdx) return;
+        this.restore(i);
+        tick(true);
+        this.flash(`Back to · ${label}`);
+      };
+      list.appendChild(b);
+    }
+    $('historySheet').classList.add('on');
+    (list.querySelector('.on') as HTMLElement | null)?.scrollIntoView({ block: 'center' });
+  }
+
   private flashTimer = 0;
   private flash(text: string) {
     const el = $('flash');
@@ -842,6 +866,11 @@ export class App {
     $('btnCamera').onclick = () => this.takePhoto();
     $('btnUndo').innerHTML = ICONS.undo;
     $('btnRedo').innerHTML = ICONS.redo;
+    $('btnHistory').innerHTML = ICONS.history;
+    $('btnHistory').onclick = () => {
+      tick();
+      this.openHistory();
+    };
     $('btnMore').innerHTML = ICONS.more;
     $('secReset').innerHTML = ICONS.reset;
     $('secDone').innerHTML = ICONS.check;
@@ -947,6 +976,7 @@ export class App {
     this.appEl.classList.toggle('noimg', !has);
     ($('btnUndo') as HTMLButtonElement).disabled = !has || this.hIdx <= 0;
     ($('btnRedo') as HTMLButtonElement).disabled = !has || this.hIdx >= this.history.length - 1;
+    ($('btnHistory') as HTMLButtonElement).disabled = !has || this.history.length < 2;
     ($('btnExport') as HTMLButtonElement).disabled = !has;
     $('tools').classList.toggle('disabled', !has);
     document.querySelectorAll<HTMLButtonElement>('#tools button').forEach((b) => {
@@ -1221,7 +1251,7 @@ export class App {
       this.sub[t.id] = id;
       if (t.kind === 'heal') {
         this.spotSel = -1;
-        this.toast(id === 'fill' ? 'Paint over the object · let go and it’s filled from the surroundings' : 'Paint over a blemish · drag the yellow copy to pick the source', 3000);
+        this.toast(id === 'fill' ? 'Paint over the object · let go and the AI rebuilds what’s behind it' : 'Paint over a blemish · drag the yellow copy to pick the source', 3000);
         this.healOv.draw();
       }
       if (t.kind === 'curves') {
@@ -3193,7 +3223,15 @@ export class App {
       const mask = new Uint8Array(W * H);
       for (let i = 0; i < mask.length; i++) mask[i] = md[i * 4] > 127 ? 1 : 0;
 
-      const out = await new Promise<Uint8ClampedArray>((res, rej) => {
+      let out: Uint8ClampedArray;
+      try {
+        // the neural network (MI-GAN); it keeps the originals' copies so the classic fill can step in
+        out = await this.neural.fill(rgba.slice(), W, H, mask.slice(), (m) => this.busy(m));
+      } catch (err) {
+        console.warn('Neural fill failed, using the classic fill', err);
+        this.toast('The AI model couldn’t run here, so the classic fill was used', 3500);
+        this.busy('Filling');
+      out = await new Promise<Uint8ClampedArray>((res, rej) => {
         const wk = new Worker(new URL('../ai/inpaintWorker.ts', import.meta.url), { type: 'module' });
         wk.onmessage = (e) => {
           if (e.data.progress !== undefined) this.busy(`Filling ${Math.round(e.data.progress * 100)}%`);
@@ -3211,6 +3249,7 @@ export class App {
         };
         wk.postMessage({ rgba, w: W, h: H, mask }, [rgba.buffer]);
       });
+      }
       if (this.img !== img) return;
       const gl = this.g.gl;
       const tex = this.g.texture(W, H, 'u8');
@@ -3904,21 +3943,37 @@ export class App {
   }
 }
 
-/** A short name for what differs between two saved states (for the undo badge). */
+/** A short name for what differs between two saved states (for the undo badge and history). */
 function describeChange(a: string, b: string): string {
   try {
     const A = JSON.parse(a) as EditState, B = JSON.parse(b) as EditState;
-    const ids = Object.keys(B.v).filter((k) => A.v[k] !== B.v[k]);
-    if (ids.length === 1 && PARAM_MAP[ids[0]]) {
-      const tool = TOOLS.find((t) => t.kind === 'params' && (t.subs ? t.subs.some((x) => t.params(x.id).includes(ids[0])) : t.params('').includes(ids[0])));
-      return (tool && tool.label !== PARAM_MAP[ids[0]].label ? tool.label + ' ' : '') + PARAM_MAP[ids[0]].label;
+    const toolFor = (id: string) => {
+      if (id.startsWith('dx')) return 'Double';
+      if (id.startsWith('lk')) return 'Leaks';
+      if (id.startsWith('blur')) return 'Blur';
+      const t = TOOLS.find((x) => x.kind === 'params' && (x.subs ? x.subs.some((s) => x.params(s.id).includes(id)) : x.params('').includes(id)));
+      return t?.label ?? '';
+    };
+    const ids = Object.keys(B.v).filter((k) => A.v[k] !== B.v[k] && !['healSize', 'vigX', 'vigY', 'blurX', 'blurY'].includes(k));
+    const tools = [...new Set(ids.map(toolFor).filter(Boolean))];
+    const other = () => {
+      const j = (x: unknown) => JSON.stringify(x);
+      if (j(A.fills) !== j(B.fills)) return (B.fills?.length ?? 0) > (A.fills?.length ?? 0) ? 'AI fill' : 'Fill removed';
+      if (j(A.spots) !== j(B.spots)) return 'Remove';
+      if (j(A.masks) !== j(B.masks)) return 'Mask';
+      if (j(A.curves) !== j(B.curves)) return 'Curves';
+      if (j(A.geo) !== j(B.geo)) return 'Crop';
+      if (j(A.overlay) !== j(B.overlay)) return 'Double';
+      if (j(A.leak) !== j(B.leak)) return 'Leak';
+      return '';
+    };
+    if (ids.length === 1) {
+      const lab = PARAM_MAP[ids[0]]?.label ?? '';
+      return tools[0] && tools[0] !== lab ? `${tools[0]} · ${lab}` : lab;
     }
-    if (ids.length > 1) return 'Look';
-    if (JSON.stringify(A.masks) !== JSON.stringify(B.masks)) return 'Mask';
-    if (JSON.stringify(A.spots) !== JSON.stringify(B.spots)) return 'Remove';
-    if (JSON.stringify(A.curves) !== JSON.stringify(B.curves)) return 'Curves';
-    if (JSON.stringify(A.geo) !== JSON.stringify(B.geo)) return 'Crop';
-    if (JSON.stringify(A.overlay) !== JSON.stringify(B.overlay)) return 'Double';
+    if (tools.length === 1) return tools[0];
+    if (tools.length > 1) return ids.length > 8 ? 'Look' : tools.slice(0, 2).join(' + ');
+    return other();
   } catch {
     /* fall through */
   }

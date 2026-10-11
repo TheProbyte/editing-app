@@ -1,6 +1,6 @@
 // Lumen service worker: offline caching + cross-origin isolation headers
 // (needed for the multi-threaded RAW decoder on hosts that can't set headers).
-const CACHE = 'lumen-v4';
+const CACHE = 'lumen-v5';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => {
@@ -32,7 +32,7 @@ self.addEventListener('fetch', (e) => {
   if (req.cache === 'only-if-cached' && req.mode !== 'same-origin') return;
   e.respondWith((async () => {
     const cache = await caches.open(CACHE);
-    const immutable = url.pathname.includes('/assets/') || url.pathname.includes('/libraw/');
+    const immutable = ['/assets/', '/libraw/', '/models/', '/ort/', '/mediapipe/'].some((d) => url.pathname.includes(d));
     if (immutable) {
       const hit = await cache.match(req);
       if (hit) return isolate(hit);

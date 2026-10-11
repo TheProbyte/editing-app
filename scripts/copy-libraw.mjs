@@ -15,4 +15,6 @@ copy(join(root, 'node_modules', '@mediapipe', 'tasks-vision', 'wasm'), join(root
   'vision_wasm_internal.js',
   'vision_wasm_internal.wasm',
 ]);
-console.log('libraw + mediapipe copied to public/');
+// ONNX Runtime Web (runs the neural object-removal model)
+copy(join(root, 'node_modules', 'onnxruntime-web', 'dist'), join(root, 'public', 'ort'), ['ort-wasm-simd-threaded.wasm', 'ort-wasm-simd-threaded.mjs']);
+console.log('libraw + mediapipe + onnxruntime copied to public/');

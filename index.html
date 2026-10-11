@@ -53,6 +53,7 @@
         <button class="ic" id="btnHome" aria-label="Home"></button>
         <div class="title" id="title"></div>
         <button class="ic" id="btnUndo" aria-label="Undo"></button>
+        <button class="ic" id="btnHistory" aria-label="History"></button>
         <button class="ic" id="btnRedo" aria-label="Redo"></button>
         <button class="ic" id="btnMore" aria-label="More"></button>
         <button class="btn-accent" id="btnExport">Export</button>
@@ -117,6 +118,14 @@
         <button data-a="savePreset">Save as preset</button>
         <button data-a="resetAll" class="danger">Reset all edits</button>
         <button data-a="getApp" id="getApp">Get the Android app <span class="state on">APK</span></button>
+      </div>
+    </div>
+
+    <div id="historySheet" class="sheet">
+      <div class="sheet-card">
+        <h2>History</h2>
+        <p class="hint">Tap a step to go back (or forward) to it.</p>
+        <div id="histList"></div>
       </div>
     </div>
 

@@ -25,7 +25,7 @@ function rng(seed: number) {
   };
 }
 
-function dilate(mask: Uint8Array, w: number, h: number, r: number) {
+export function dilate(mask: Uint8Array, w: number, h: number, r: number) {
   let cur = mask;
   for (let k = 0; k < r; k++) {
     const next = new Uint8Array(cur);
@@ -267,6 +267,23 @@ function refine(l: Lvl, prev: { l: Lvl; nx: Int32Array; ny: Int32Array } | null,
   return { nx, ny };
 }
 
+/** A soft 0..1 edge for a fill: the (grown) mask blurred a little. */
+export function featherAlpha(grown: Uint8Array, w: number, h: number) {
+  const alpha = new Float32Array(w * h);
+  for (let i = 0; i < alpha.length; i++) alpha[i] = grown[i];
+  for (let pass = 0; pass < 2; pass++) {
+    const src = alpha.slice();
+    for (let y = 1; y < h - 1; y++) {
+      for (let x = 1; x < w - 1; x++) {
+        let s = 0;
+        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) s += src[(y + dy) * w + x + dx];
+        alpha[y * w + x] = s / 9;
+      }
+    }
+  }
+  return alpha;
+}
+
 export interface InpaintResult {
   /** RGBA, same size as the input: filled colors, alpha = how much of the fill to use */
   rgba: Uint8ClampedArray;
@@ -335,19 +352,7 @@ export function inpaint(rgba: Uint8ClampedArray | Uint8Array, w: number, h: numb
   }
   const res = levels[0];
 
-  // feathered alpha from the (grown) mask
-  const alpha = new Float32Array(w * h);
-  for (let i = 0; i < alpha.length; i++) alpha[i] = grown[i];
-  for (let pass = 0; pass < 2; pass++) {
-    const src = alpha.slice();
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        let s = 0;
-        for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) s += src[(y + dy) * w + x + dx];
-        alpha[y * w + x] = s / 9;
-      }
-    }
-  }
+  const alpha = featherAlpha(grown, w, h);
   // write back at full size (bilinear when the work was scaled down)
   for (let y = y0; y <= y1; y++) {
     for (let x = x0; x <= x1; x++) {

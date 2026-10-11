@@ -40,7 +40,7 @@
 
 /* every control is a pixel block */
 .btn-accent, .btn-dark, .round, .tile .b, .chip, .look .th, .seg button, .all-tabs button, .all-close, #zoomBadge, #toast,
-#flash, #badge, .mask-tile, #paramInput, input[type=text], .sheet-card.list button, #hist, .ic, #tools button, .all-grid button {
+#flash, #badge, .hrow, .mask-tile, #paramInput, input[type=text], .sheet-card.list button, #hist, .ic, #tools button, .all-grid button {
   border-radius: 0 !important; clip-path: var(--px);
 }
 .sheet-card, #menu { border-radius: 0 !important; clip-path: var(--px2); }
@@ -367,6 +367,18 @@ svg { display: block; }
 .all-grid svg { width: 32px; height: 32px; }
 .all-grid span { font-size: 12.5px; color: var(--ink); }
 .all-grid button.mod::after { content: ''; position: absolute; top: 6px; left: calc(50% + 16px); width: 6px; height: 6px; background: var(--accent); }
+
+/* ---------------------------------------------------------------- history */
+#histList { display: grid; gap: 4px; max-height: 56vh; overflow-y: auto; margin-top: 12px; overscroll-behavior: contain; scrollbar-width: none; }
+#histList::-webkit-scrollbar { display: none; }
+.hrow { display: flex; align-items: center; gap: 14px; width: 100%; padding: 13px 14px; background: var(--tile); text-align: left; font-size: 16px; transition: transform 0.1s var(--spring), background 0.15s; }
+.hrow:active { transform: scale(0.98); }
+.hrow .n { font: 500 14px var(--mono); color: var(--faint); min-width: 2.2em; }
+.hrow .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-transform: uppercase; letter-spacing: 0.04em; }
+.hrow .m { font: 700 11px var(--block); letter-spacing: 0.06em; }
+.hrow.on { background: var(--accent); color: var(--accent-ink); }
+.hrow.on .n { color: rgba(28, 21, 0, 0.55); }
+.hrow.future { opacity: 0.45; }
 
 /* ---------------------------------------------------------------- busy + sheets */
 #busy { position: fixed; inset: 0; background: rgba(14, 14, 14, 0.45); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); display: none; place-items: center; align-content: center; gap: 18px; z-index: 20; }

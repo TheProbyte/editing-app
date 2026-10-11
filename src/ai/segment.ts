@@ -44,7 +44,7 @@ function fileset() {
   return { wasmLoaderPath: base + 'vision_wasm_internal.js', wasmBinaryPath: base + 'vision_wasm_internal.wasm' };
 }
 
-async function fetchModel(url: string, progress: (f: number) => void): Promise<Uint8Array> {
+export async function fetchModel(url: string, progress: (f: number) => void): Promise<Uint8Array> {
   let cache: Cache | null = null;
   try {
     cache = await caches.open(CACHE);

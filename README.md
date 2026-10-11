@@ -31,9 +31,10 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 - **Remove:** press on a blemish, slide to place it (a loupe shows it close up), let go to remove it.
   Each fix shows where it copied from — drag that yellow ring to choose the source yourself (e.g. a clean
   bit of chain over a necklace clasp); Auto fill and Delete for the selected spot.
-- **Fill (in Remove):** paint over a bigger object and let go: it's rebuilt from the rest of the photo
-  (multi-scale PatchMatch content-aware fill, on the phone, no download). Best on backgrounds like sky,
-  grass, walls and sand.
+- **AI fill (in Remove):** paint over an object and let go: a neural network (MI-GAN) rebuilds what's
+  behind it, on the phone. The 28 MB model ships with the app (`public/models/migan.onnx`) and runs with
+  ONNX Runtime Web (one thread; `public/ort/` is copied from `node_modules` at build). If the model can't
+  run on a device, it falls back to a classic PatchMatch fill (`src/ai/inpaint.ts`).
 - **Light leaks:** 22 built-in leaks (flares, burns, prisms, streaks, orbs) drawn on the fly; move, scale,
   rotate (drag, corner square or pinch), blend modes, and a Hide/Show brush.
 - **Double exposure:** add a second photo, drag to place it, size/rotate/opacity, 9 blend modes, and
@@ -57,7 +58,7 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 - **Vignette:** Amount, Size, Feather, Roundness, highlight protection.
 - **Film & Lens:** Fade (with warmth), color fringing, lens distortion.
 - **Crop & rotate:** free or fixed aspect ratios, straighten, rotate 90°, flip.
-- Undo/redo, histogram, copy/paste edits, **full-resolution export** (JPEG/PNG, tiled rendering
+- Undo/redo with a history list (tap any step to jump there), histogram, copy/paste edits, **full-resolution export** (JPEG/PNG, tiled rendering
   plus a streaming JPEG encoder, so even 40+ MP files export on a phone), saves straight to the phone on Android (Downloads), Share sheet on iPhone.
 - Works offline once loaded, and autosaves — reopen the app and tap **Continue editing**.
 - Clipping warnings, per-tool Reset, zoom badge (tap to fit).
@@ -109,3 +110,11 @@ Code map:
 - `src/io/` — file loading (incl. RAW), export, streaming JPEG encoder.
 - `public/sw.js` — offline cache + the cross-origin isolation headers the multi-threaded RAW
   decoder needs on static hosts like GitHub Pages.
+
+## Credits and licences
+
+- **MI-GAN** (Picsart AI Research, MIT) — the `migan_pipeline_v2.onnx` weights used for AI fill, taken from the
+  `migan-onnx` npm package. The weights were trained on Places2 / FFHQ research datasets, so treat this as a
+  personal-use app.
+- **LibRaw** (via `libraw-wasm`), **MediaPipe Tasks Vision** (Apache-2.0) for subject / people selection,
+  **ONNX Runtime Web** (MIT), Pixelify Sans and Silkscreen (OFL).

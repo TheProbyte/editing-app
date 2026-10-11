@@ -34,7 +34,7 @@ export const TOOLS: ToolDef[] = [
     id: 'heal', label: 'Remove', icon: ICONS.heal, kind: 'heal', params: list('healSize'),
     subs: [
       { id: 'heal', label: 'Heal' },
-      { id: 'fill', label: 'Fill' },
+      { id: 'fill', label: 'AI fill' },
     ],
   },
   { id: 'masks', label: 'Masks', icon: ICONS.masks, kind: 'masks', params: () => [] },

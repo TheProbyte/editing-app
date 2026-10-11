@@ -4,3 +4,4 @@ public/libraw
 *.log
 .DS_Store
 public/mediapipe
+public/ort

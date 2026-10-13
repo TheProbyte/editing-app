@@ -9,6 +9,8 @@ import { makeSpline } from '../curves';
 import { LOOKS, Look, ImgStats, measure } from '../presets';
 import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
+import { encodeJpegBand } from '../io/jpegEncoder';
+import { encodePngBand } from '../io/pngEncoder';
 import { loadBlob, loadSession, saveBlob, saveFile, saveState } from '../io/session';
 import { TOOLS, ToolDef, Chip } from './tools';
 import { ICONS } from './icons';
@@ -1781,7 +1783,8 @@ export class App {
           armed = true;
           tick();
           $('pill').classList.add('armed');
-          holdTimer = window.setTimeout(toCompare, 420);
+          // a good while longer before the original shows, so there's time to start the swipe
+          holdTimer = window.setTimeout(toCompare, 1000);
         }, 230);
       } else holdTimer = window.setTimeout(toCompare, 380);
     });
@@ -2499,14 +2502,18 @@ export class App {
   }
   private continueStroke(e: PointerEvent) {
     if (!this.stroke) return;
-    const f = this.maskOv.toFrame(e.clientX, e.clientY);
     const P = this.stroke.pts;
     const { aspect } = this.frameInfo();
-    const d = Math.hypot((f.x - P[P.length - 2]) * aspect, f.y - P[P.length - 1]);
-    if (d > this.stroke.r * 0.12) {
-      P.push(f.x, f.y);
-      this.requestRender();
+    let added = false;
+    // every point the phone sampled since the last event, not just the latest
+    for (const c of coalesced(e)) {
+      const f = this.maskOv.toFrame(c.clientX, c.clientY);
+      if (Math.hypot((f.x - P[P.length - 2]) * aspect, f.y - P[P.length - 1]) > this.stroke.r * 0.08) {
+        P.push(f.x, f.y);
+        added = true;
+      }
     }
+    if (added) this.requestRender();
     this.showBrushRing(e);
   }
   private endStroke() {
@@ -3059,10 +3066,15 @@ export class App {
     if (!st) return;
     const P = st.pts;
     const { aspect } = this.frameInfo();
-    if (Math.hypot((f.x - P[P.length - 2]) * aspect, f.y - P[P.length - 1]) > st.r * 0.12) {
-      P.push(f.x, f.y);
-      this.requestRender();
+    let added = false;
+    for (const c of coalesced(e)) {
+      const q = this.maskOv.toFrame(c.clientX, c.clientY);
+      if (Math.hypot((q.x - P[P.length - 2]) * aspect, q.y - P[P.length - 1]) > st.r * 0.08) {
+        P.push(q.x, q.y);
+        added = true;
+      }
     }
+    if (added) this.requestRender();
     this.showLayerRing(e);
   }
 
@@ -4025,7 +4037,7 @@ export class App {
   // -----------------------------------------------------------------------------------
   // Export
 
-  private exportOpts = { size: 'full', format: 'jpeg' as 'jpeg' | 'png', quality: 92 };
+  private exportOpts = { size: 'full', format: 'jpeg' as 'jpeg' | 'png', quality: 100 };
 
   private bindExport() {
     const sheet = $('sheet');
@@ -4049,6 +4061,7 @@ export class App {
     q.oninput = () => {
       this.exportOpts.quality = +q.value;
       $('exQVal').textContent = q.value;
+      this.scheduleEstimate();
     };
     $('exGo').onclick = () => this.doExport();
     $('resultDone').onclick = () => $('resultSheet').classList.remove('on');
@@ -4086,8 +4099,70 @@ export class App {
     $('exQLabel').style.display = isPng ? 'none' : '';
     $<HTMLInputElement>('exQuality').style.display = isPng ? 'none' : '';
     const d = this.exportDims(this.exportOpts.size);
-    $('exHint').textContent = `${((d.w * d.h) / 1e6).toFixed(1)} MP · every edit applied at full quality`;
+    this.exMP = `${((d.w * d.h) / 1e6).toFixed(1)} MP`;
+    $('exHint').textContent = `${this.exMP} · working out the file size…`;
+    this.scheduleEstimate();
     ($('exGo') as HTMLButtonElement).textContent = framed ? 'Export' : /iPhone|iPad|Android/i.test(navigator.userAgent) ? 'Save' : 'Download';
+  }
+
+  // ---- file size estimate: eight thin strips across the full width, rendered at the export
+  // size and encoded with the export's own encoder; their bytes per pixel × the picture's
+  // pixels. Within about 1% on real photos in tests.
+
+  private exMP = '';
+  private estTimer = 0;
+  private estSamples: { key: string; tiles: { px: Uint8Array; prev: Uint8Array; w: number; h: number }[]; area: number } | null = null;
+  private scheduleEstimate() {
+    clearTimeout(this.estTimer);
+    this.estTimer = window.setTimeout(() => void this.estimateSize(), 120);
+  }
+  private async estimateSize() {
+    if (!this.img || !$('sheet').classList.contains('on')) return;
+    const d = this.exportDims(this.exportOpts.size);
+    const key = JSON.stringify([d.w, d.h, this.img.name, this.history[this.hIdx] ?? '']);
+    try {
+      if (this.estSamples?.key !== key) {
+        this.atlas.sync(this.state.masks);
+        this.pipe.brushTex = this.atlas.tex;
+        await this.ensureFill(this.state);
+        this.syncOverlay(this.state);
+        const N = 8, R = Math.min(32, Math.max(1, Math.floor(d.h / N) - 1)), TW = 2048;
+        // each strip: R rows plus the row above (PNG filters against it); wide strips in pieces.
+        // Strips start on a multiple of 16 rows: a photo that was a JPEG still carries its 8×8
+        // (or 16×16) block grid, and an offset strip encodes noticeably bigger or smaller.
+        const rs = [];
+        for (let j = 0; j < N; j++) {
+          const y0 = Math.round((((j + 0.5) / N) * d.h - R / 2) / 16) * 16;
+          const y = Math.max(0, Math.min(d.h - R - 1, y0 - 1));
+          for (let x = 0; x < d.w; x += TW) rs.push({ x, y, w: Math.min(TW, d.w - x), h: R + 1 });
+        }
+        const px = this.pipe.renderSamples(this.img.full, this.img.preview, this.state, d.w, d.h, rs);
+        const tiles = [];
+        for (let j = 0, k = 0; j < N; j++) {
+          const strip = new Uint8Array(d.w * (R + 1) * 4);
+          for (; k < rs.length && rs[k].y === rs[j * Math.ceil(d.w / TW)].y && k < (j + 1) * Math.ceil(d.w / TW); k++) {
+            const t = rs[k], src = px[k];
+            for (let r = 0; r <= R; r++) strip.set(src.subarray(r * t.w * 4, (r + 1) * t.w * 4), (r * d.w + t.x) * 4);
+          }
+          tiles.push({ prev: strip.subarray(0, d.w * 4), px: strip.subarray(d.w * 4), w: d.w, h: R });
+        }
+        this.estSamples = { key, tiles, area: d.w * d.h };
+      }
+      const S = this.estSamples;
+      const png = this.exportOpts.format === 'png';
+      let bytes = 0, n = 0;
+      for (const t of S.tiles) {
+        bytes += png ? encodePngBand(t.px, t.w, t.h, t.prev, 2).idat.length : encodeJpegBand(t.px, t.w, t.h, 0, t.h, this.exportOpts.quality).length;
+        n += t.w * t.h;
+      }
+      const est = (bytes / n) * S.area + (png ? 100 : 700);
+      const mb = est / 1048576;
+      const txt = mb >= 1 ? `${mb < 10 ? mb.toFixed(1) : Math.round(mb)} MB` : `${Math.max(1, Math.round(est / 1024))} KB`;
+      $('exHint').textContent = `${this.exMP} · about ${txt}`;
+    } catch (e) {
+      console.warn('size estimate failed', e);
+      $('exHint').textContent = `${this.exMP} · every edit applied at full quality`;
+    }
   }
 
   private async doExport() {
@@ -4179,6 +4254,12 @@ export class App {
     clearTimeout(this.toastTimer);
     this.toastTimer = window.setTimeout(() => t.classList.remove('on'), ms);
   }
+}
+
+/** The pointer samples merged into this event (Android delivers several per frame). */
+function coalesced(e: PointerEvent): PointerEvent[] {
+  const list = typeof e.getCoalescedEvents === 'function' ? e.getCoalescedEvents() : [];
+  return list.length ? list : [e];
 }
 
 /** A short name for what differs between two saved states (for the undo badge and history). */

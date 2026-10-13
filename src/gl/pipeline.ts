@@ -693,6 +693,14 @@ export class Pipeline {
     return px;
   }
 
+  /** Several small regions of the output at full quality (for estimating the file size). */
+  renderSamples(full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number, rs: Tile[]) {
+    const P = this.prepareGlobal(full, analysisSrc, state, outW, outH);
+    const out = rs.map((r) => this.renderTile(full, state, outW, outH, r, P));
+    this.releaseGlobal(P);
+    return out;
+  }
+
   /**
    * Full-resolution, tiled export. `analysisSrc` is a smaller copy of the source used
    * for the image-wide blurs (they're far larger than a tile and resolution independent).

@@ -12,6 +12,8 @@ interface Slot {
   n: number;
   lastPts: number;
   fp: number;
+  /** where the last dab of the last stroke landed (atlas px), so painting carries on from there */
+  tail: { x: number; y: number } | null;
 }
 
 /** Cheap fingerprint of the first n strokes (catches undo/redo replacing strokes). */
@@ -96,7 +98,7 @@ export class BrushAtlas {
       const canvas = document.createElement('canvas');
       canvas.width = this.w;
       canvas.height = this.h;
-      s = { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true })!, id, base: null, n: 0, lastPts: 0, fp: 0 };
+      s = { canvas, ctx: canvas.getContext('2d', { willReadFrequently: true })!, id, base: null, n: 0, lastPts: 0, fp: 0, tail: null };
       this.slots[i] = s;
     }
     const incremental =
@@ -109,10 +111,12 @@ export class BrushAtlas {
       s.ctx.clearRect(0, 0, this.w, this.h);
       if (base) s.ctx.drawImage(base, 0, 0, this.w, this.h);
       s.base = base;
-      for (const st of strokes) this.drawStroke(s.ctx, st, 0, box);
+      s.tail = null;
+      for (const st of strokes) s.tail = this.drawStroke(s.ctx, st, null, 0, box);
     } else {
-      if (s.n > 0) this.drawStroke(s.ctx, strokes[s.n - 1], Math.max(0, s.lastPts - 2), box, false);
-      for (let k = s.n; k < strokes.length; k++) this.drawStroke(s.ctx, strokes[k], 0, box);
+      // the stroke being painted: new points only, continuing from its last dab
+      if (s.n > 0 && strokes[s.n - 1].pts.length > s.lastPts) s.tail = this.drawStroke(s.ctx, strokes[s.n - 1], s.tail, s.lastPts, box);
+      for (let k = s.n; k < strokes.length; k++) s.tail = this.drawStroke(s.ctx, strokes[k], null, 0, box);
     }
     s.id = id;
     s.n = strokes.length;
@@ -147,37 +151,59 @@ export class BrushAtlas {
     return c;
   }
 
-  /** Dabs along a stroke from point `start`; `first` = also stamp that starting point (a tap paints one dab). */
-  private drawStroke(ctx: CanvasRenderingContext2D, st: Stroke, start: number, box: { x0: number; y0: number; x1: number; y1: number }, first = true) {
+  /**
+   * Dabs along a stroke, evenly spaced. With `from` (the last dab so far) it carries on from
+   * there through points `start`..; otherwise the whole stroke from its first point (a tap is
+   * one dab). Returns where the last dab landed.
+   */
+  private drawStroke(ctx: CanvasRenderingContext2D, st: Stroke, from: { x: number; y: number } | null, start: number, box: { x0: number; y0: number; x1: number; y1: number }) {
+    const P = st.pts;
+    if (P.length < 2) return from;
     const r = Math.max(1, st.r * this.h);
     const dab = this.dab(st.hard);
     ctx.globalCompositeOperation = st.erase ? 'destination-out' : 'source-over';
     ctx.globalAlpha = Math.min(1, 0.08 + st.flow * 0.5);
     const step = Math.max(1, r * 0.22);
-    const P = st.pts;
-    if (P.length < 2 || start + 1 >= P.length) return box;
-    let px = P[start] * this.w, py = P[start + 1] * this.h;
+    let last = from ?? { x: P[0] * this.w, y: P[1] * this.h };
     const put = (x: number, y: number) => {
+      last = { x, y };
       ctx.drawImage(dab, x - r, y - r, r * 2, r * 2);
       box.x0 = Math.min(box.x0, x - r);
       box.y0 = Math.min(box.y0, y - r);
       box.x1 = Math.max(box.x1, x + r);
       box.y1 = Math.max(box.y1, y + r);
     };
-    if (first && start === 0) put(px, py);
-    for (let k = start + 2; k < P.length; k += 2) {
+    let px: number, py: number, k: number;
+    if (from) {
+      px = from.x;
+      py = from.y;
+      k = start;
+    } else {
+      px = P[0] * this.w;
+      py = P[1] * this.h;
+      put(px, py);
+      k = 2;
+    }
+    // walk the polyline, dropping a dab every `step` px of travel (the remainder carries over
+    // to the next segment, so slow, short moves still paint)
+    let carry = 0;
+    for (; k + 1 < P.length; k += 2) {
       const x = P[k] * this.w, y = P[k + 1] * this.h;
       const d = Math.hypot(x - px, y - py);
-      const n = Math.floor(d / step);
-      for (let j = 1; j <= n; j++) put(px + ((x - px) * j) / n, py + ((y - py) * j) / n);
-      if (n > 0) {
-        px = x;
-        py = y;
+      if (d < 1e-6) continue;
+      let t = step - carry;
+      while (t <= d) {
+        put(px + ((x - px) * t) / d, py + ((y - py) * t) / d);
+        t += step;
       }
+      carry = d - (t - step);
+      px = x;
+      py = y;
     }
     ctx.globalCompositeOperation = 'source-over';
     ctx.globalAlpha = 1;
-    return box;
+    // the next update carries on from the last dab, so spacing stays even across updates
+    return last;
   }
 
   /** Copy one slot's alpha into its texture channel for the given rect and upload it. */

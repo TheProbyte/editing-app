@@ -111,7 +111,7 @@ export class BrushAtlas {
       s.base = base;
       for (const st of strokes) this.drawStroke(s.ctx, st, 0, box);
     } else {
-      if (s.n > 0) this.drawStroke(s.ctx, strokes[s.n - 1], Math.max(0, s.lastPts - 2), box);
+      if (s.n > 0) this.drawStroke(s.ctx, strokes[s.n - 1], Math.max(0, s.lastPts - 2), box, false);
       for (let k = s.n; k < strokes.length; k++) this.drawStroke(s.ctx, strokes[k], 0, box);
     }
     s.id = id;
@@ -147,14 +147,15 @@ export class BrushAtlas {
     return c;
   }
 
-  private drawStroke(ctx: CanvasRenderingContext2D, st: Stroke, start: number, box: { x0: number; y0: number; x1: number; y1: number }) {
+  /** Dabs along a stroke from point `start`; `first` = also stamp that starting point (a tap paints one dab). */
+  private drawStroke(ctx: CanvasRenderingContext2D, st: Stroke, start: number, box: { x0: number; y0: number; x1: number; y1: number }, first = true) {
     const r = Math.max(1, st.r * this.h);
     const dab = this.dab(st.hard);
     ctx.globalCompositeOperation = st.erase ? 'destination-out' : 'source-over';
     ctx.globalAlpha = Math.min(1, 0.08 + st.flow * 0.5);
     const step = Math.max(1, r * 0.22);
     const P = st.pts;
-    if (P.length < 2) return box;
+    if (P.length < 2 || start + 1 >= P.length) return box;
     let px = P[start] * this.w, py = P[start + 1] * this.h;
     const put = (x: number, y: number) => {
       ctx.drawImage(dab, x - r, y - r, r * 2, r * 2);
@@ -163,7 +164,7 @@ export class BrushAtlas {
       box.x1 = Math.max(box.x1, x + r);
       box.y1 = Math.max(box.y1, y + r);
     };
-    if (start === 0) put(px, py);
+    if (first && start === 0) put(px, py);
     for (let k = start + 2; k < P.length; k += 2) {
       const x = P[k] * this.w, y = P[k + 1] * this.h;
       const d = Math.hypot(x - px, y - py);
@@ -185,13 +186,20 @@ export class BrushAtlas {
     const ch = i % 4;
     const buf = this.packed[ti];
     const src = ctx ? ctx.getImageData(x, y, w, h).data : null;
-    const sub = new Uint8Array(w * h * 4);
+    const full = x === 0 && y === 0 && w === this.w && h === this.h;
+    // a full update uploads the packed buffer as is; a partial one goes through a small copy
+    const sub = full ? buf : new Uint8Array(w * h * 4);
     for (let r = 0; r < h; r++) {
-      const row = (y + r) * this.w;
-      for (let c = 0; c < w; c++) {
-        const o = (row + x + c) * 4;
-        buf[o + ch] = src ? src[(r * w + c) * 4 + 3] : 0;
-        sub.set(buf.subarray(o, o + 4), (r * w + c) * 4);
+      let o = ((y + r) * this.w + x) * 4;
+      let q = r * w * 4;
+      for (let c = 0; c < w; c++, o += 4, q += 4) {
+        buf[o + ch] = src ? src[q + 3] : 0;
+        if (!full) {
+          sub[q] = buf[o];
+          sub[q + 1] = buf[o + 1];
+          sub[q + 2] = buf[o + 2];
+          sub[q + 3] = buf[o + 3];
+        }
       }
     }
     const gl = this.gl;

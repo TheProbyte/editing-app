@@ -111,7 +111,8 @@ Code map:
 - `src/params.ts` — every adjustment, with its range and default.
 - `src/presets.ts` — the Looks.
 - `src/ui/` — app controller, gestures, curve editor, crop overlay, histogram.
-- `src/io/` — file loading (incl. RAW), export, streaming JPEG encoder.
+- `src/io/` — file loading (incl. RAW), export, and the JPEG / PNG encoders that split an export
+  into bands of rows and encode them on every core while the GPU is still rendering.
 - `public/sw.js` — offline cache + the cross-origin isolation headers the multi-threaded RAW
   decoder needs on static hosts like GitHub Pages.
 
@@ -121,4 +122,4 @@ Code map:
   `migan-onnx` npm package. **LaMa** (Samsung AI Center, Apache-2.0) is fetched on request. The weights were trained on Places2 / FFHQ research datasets, so treat this as a
   personal-use app.
 - **LibRaw** (via `libraw-wasm`), **MediaPipe Tasks Vision** (Apache-2.0) for subject / people selection,
-  **ONNX Runtime Web** (MIT), Pixelify Sans and Silkscreen (OFL).
+  **ONNX Runtime Web** (MIT), **fflate** (MIT) for PNG compression, Pixelify Sans and Silkscreen (OFL).

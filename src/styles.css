@@ -72,6 +72,8 @@ svg { display: block; }
 #view.pixelated, #detail { image-rendering: pixelated; }
 #detail { position: absolute; display: none; pointer-events: none; }
 #detail.on { display: block; }
+#orig { position: absolute; left: 0; top: 0; width: 100%; height: 100%; display: none; pointer-events: none; }
+#orig.on { display: block; }
 #zoomView { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; display: none; }
 #zoomView.on { display: block; }
 #frame.zv #view, #frame.zv #detail { visibility: hidden; }
@@ -328,6 +330,9 @@ svg { display: block; }
 #secReset.gone { opacity: 0; pointer-events: none; transform: scale(0.7); }
 #pill { flex: 1; min-width: 0; display: flex; align-items: baseline; justify-content: center; gap: 12px; height: 50px; align-items: center; }
 #pill.gone { visibility: hidden; }
+#pill { transition: transform 0.15s var(--ease); }
+#pill.armed { transform: scale(1.08); }
+#pill.armed #paramName { color: var(--accent); }
 #paramName { font-size: 14px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; padding: 8px 0; }
 #paramValue { font: 600 22px var(--mono); color: var(--accent); font-variant-numeric: tabular-nums; padding: 4px 0; flex: none; min-width: 2.2em; text-align: left; }
 #paramInput { width: 84px; font: 600 20px var(--mono); color: var(--accent); background: var(--tile); border: 0; border-radius: 10px; padding: 4px 8px; text-align: center; -webkit-user-select: text; user-select: text; }
@@ -383,8 +388,14 @@ svg { display: block; }
 /* ---------------------------------------------------------------- busy + sheets */
 #busy { position: fixed; inset: 0; background: rgba(14, 14, 14, 0.45); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); display: none; place-items: center; align-content: center; gap: 18px; z-index: 20; }
 #busy.on { display: grid; }
-#busy .spin { width: 24px; height: 24px; background: var(--accent); clip-path: var(--px); animation: pixspin 0.9s steps(4) infinite; }
-@keyframes pixspin { to { transform: rotate(360deg); } }
+/* the logo's sun: it rises row by row with the progress, or shimmers when there's no number */
+#busy .sun { width: 80px; height: 88px; justify-self: center; image-rendering: pixelated; overflow: visible; }
+#busy .sun .s { opacity: 0.14; transition: opacity 0.2s steps(2); }
+#busy .sun .s.lit { opacity: 1; }
+#busy.ind .sun .s { animation: sunwave 1.3s steps(1) infinite; animation-delay: calc(var(--i) * 0.1s); }
+#busy:not(.ind) .sun .s.lit.top { animation: sunblink 0.5s steps(1) infinite; }
+@keyframes sunwave { 0% { opacity: 0.14; } 30% { opacity: 1; } 70% { opacity: 0.55; } }
+@keyframes sunblink { 50% { opacity: 0.45; } }
 #busy .msg { font: 500 15px var(--display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink); font-variant-numeric: tabular-nums; }
 
 .sheet { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.3); display: none; align-items: flex-end; z-index: 15; }

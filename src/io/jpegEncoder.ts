@@ -1,5 +1,7 @@
-// Streaming baseline JPEG encoder (4:4:4). Rows are fed in strips so that huge exports
-// never need one giant canvas or one giant pixel buffer.
+// Baseline JPEG encoder (4:4:4) that works in horizontal bands, so several workers can
+// encode one picture at once. Every row of 8×8 blocks ends with a restart marker (the
+// restart interval is one block row), which resets the DC predictors and byte-aligns the
+// stream: bands encoded separately just get joined end to end.
 
 const ZIGZAG = [
   0, 1, 5, 6, 14, 15, 27, 28, 2, 4, 7, 13, 16, 26, 29, 42, 3, 8, 12, 17, 25, 30, 41, 43, 9, 11, 18, 24, 31, 40, 44, 53,
@@ -33,7 +35,8 @@ function hex(s: string) {
   return out;
 }
 
-function huff(counts: number[], values: number[]) {
+interface Huff { code: Int32Array; len: Int32Array }
+function huff(counts: number[], values: number[]): Huff {
   const code = new Int32Array(256);
   const len = new Int32Array(256);
   let c = 0;
@@ -57,205 +60,217 @@ const HUFF = {
   acC: huff(AC_C_N, AC_C_V),
 };
 
-export class JpegStreamEncoder {
-  private chunks: Uint8Array[] = [];
-  private buf = new Uint8Array(1 << 20);
-  private pos = 0;
-  private bitBuf = 0;
-  private bitCnt = 0;
-  private qY = new Uint8Array(64);
-  private qC = new Uint8Array(64);
-  private fY = new Float32Array(64);
-  private fC = new Float32Array(64);
-  private pw: number;
-  private planes: Float32Array[];
-  private pending = 0;
-  private dc = [0, 0, 0];
-  private blk = new Float32Array(64);
-  private du = new Int32Array(64);
-
-  constructor(private w: number, private h: number, quality: number) {
-    const q = Math.max(1, Math.min(100, Math.round(quality)));
-    const sf = q < 50 ? Math.floor(5000 / q) : Math.floor(200 - q * 2);
-    for (let i = 0; i < 64; i++) {
-      this.qY[ZIGZAG[i]] = clampQ(Math.floor((Y_QT[i] * sf + 50) / 100));
-      this.qC[ZIGZAG[i]] = clampQ(Math.floor((C_QT[i] * sf + 50) / 100));
-    }
-    for (let r = 0, k = 0; r < 8; r++) {
-      for (let c = 0; c < 8; c++, k++) {
-        const s = AASF[r] * AASF[c] * 8;
-        this.fY[k] = 1 / (this.qY[ZIGZAG[k]] * s);
-        this.fC[k] = 1 / (this.qC[ZIGZAG[k]] * s);
-      }
-    }
-    this.pw = Math.ceil(w / 8) * 8;
-    this.planes = [0, 1, 2].map(() => new Float32Array(this.pw * 8));
-    this.writeHeaders();
+function quantTables(quality: number) {
+  const q = Math.max(1, Math.min(100, Math.round(quality)));
+  const sf = q < 50 ? Math.floor(5000 / q) : Math.floor(200 - q * 2);
+  const qY = new Uint8Array(64), qC = new Uint8Array(64);
+  for (let i = 0; i < 64; i++) {
+    qY[ZIGZAG[i]] = clampQ(Math.floor((Y_QT[i] * sf + 50) / 100));
+    qC[ZIGZAG[i]] = clampQ(Math.floor((C_QT[i] * sf + 50) / 100));
   }
+  const fY = new Float32Array(64), fC = new Float32Array(64);
+  for (let r = 0, k = 0; r < 8; r++) {
+    for (let c = 0; c < 8; c++, k++) {
+      const s = AASF[r] * AASF[c] * 8;
+      fY[k] = 1 / (qY[ZIGZAG[k]] * s);
+      fC[k] = 1 / (qC[ZIGZAG[k]] * s);
+    }
+  }
+  return { qY, qC, fY, fC };
+}
 
-  /** Feed `rows` rows of RGBA pixels (width = this.w). */
-  addRows(rgba: Uint8Array, rows: number) {
-    const { w, pw } = this;
-    const [Y, U, V] = this.planes;
-    for (let r = 0; r < rows; r++) {
-      const off = this.pending * pw;
-      let i = r * w * 4;
+/** Growable byte writer with JPEG bit packing (0xFF bytes in entropy data get a 0 stuffed after them). */
+class Out {
+  buf: Uint8Array;
+  pos = 0;
+  private acc = 0;
+  private n = 0;
+  constructor(size: number) {
+    this.buf = new Uint8Array(Math.max(4096, size));
+  }
+  private room(k: number) {
+    if (this.pos + k <= this.buf.length) return;
+    const b = new Uint8Array(Math.max(this.buf.length * 2, this.pos + k));
+    b.set(this.buf.subarray(0, this.pos));
+    this.buf = b;
+  }
+  byte(b: number) {
+    this.room(1);
+    this.buf[this.pos++] = b;
+  }
+  word(w: number) {
+    this.byte((w >> 8) & 0xff);
+    this.byte(w & 0xff);
+  }
+  /** Append `len` (<= 16) bits of `code`, most significant first. */
+  bits(code: number, len: number) {
+    this.acc = (this.acc << len) | (code & ((1 << len) - 1));
+    this.n += len;
+    if (this.n < 8) return;
+    this.room(6);
+    const buf = this.buf;
+    while (this.n >= 8) {
+      this.n -= 8;
+      const b = (this.acc >>> this.n) & 0xff;
+      buf[this.pos++] = b;
+      if (b === 0xff) buf[this.pos++] = 0;
+    }
+    this.acc &= (1 << this.n) - 1;
+  }
+  /** Pad the last byte with 1 bits (as restart markers and the end need). */
+  align() {
+    if (this.n > 0) this.bits((1 << (8 - this.n)) - 1, 8 - this.n);
+  }
+  bytes() {
+    return this.buf.subarray(0, this.pos);
+  }
+}
+
+/** Everything before the image data (SOI … SOS), with a restart interval of one block row. */
+export function jpegHeader(w: number, h: number, quality: number): Uint8Array {
+  const { qY, qC } = quantTables(quality);
+  const o = new Out(1024);
+  o.word(0xffd8);
+  // APP0 JFIF
+  o.word(0xffe0);
+  o.word(16);
+  [0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0].forEach((b) => o.byte(b));
+  o.word(1);
+  o.word(1);
+  o.byte(0);
+  o.byte(0);
+  // DQT
+  o.word(0xffdb);
+  o.word(132);
+  o.byte(0);
+  qY.forEach((b) => o.byte(b));
+  o.byte(1);
+  qC.forEach((b) => o.byte(b));
+  // SOF0
+  o.word(0xffc0);
+  o.word(17);
+  o.byte(8);
+  o.word(h);
+  o.word(w);
+  o.byte(3);
+  for (let c = 1; c <= 3; c++) {
+    o.byte(c);
+    o.byte(0x11);
+    o.byte(c === 1 ? 0 : 1);
+  }
+  // DHT
+  const tables: [number, number[], number[]][] = [
+    [0x00, DC_L_N, DC_V], [0x10, AC_L_N, AC_L_V], [0x01, DC_C_N, DC_V], [0x11, AC_C_N, AC_C_V],
+  ];
+  let len = 2;
+  for (const [, , v] of tables) len += 17 + v.length;
+  o.word(0xffc4);
+  o.word(len);
+  for (const [id, n, v] of tables) {
+    o.byte(id);
+    n.forEach((b) => o.byte(b));
+    v.forEach((b) => o.byte(b));
+  }
+  // DRI: restart after every block row
+  o.word(0xffdd);
+  o.word(4);
+  o.word(Math.ceil(w / 8));
+  // SOS
+  o.word(0xffda);
+  o.word(12);
+  o.byte(3);
+  o.byte(1); o.byte(0x00);
+  o.byte(2); o.byte(0x11);
+  o.byte(3); o.byte(0x11);
+  o.byte(0); o.byte(63); o.byte(0);
+  return o.bytes().slice();
+}
+
+const tableCache = new Map<number, ReturnType<typeof quantTables>>();
+
+/**
+ * Encode `rows` rows of RGBA (width w) that start at pixel row y0 (a multiple of 8) of an
+ * image `h` rows tall. Returns the entropy-coded bytes for those block rows, restart
+ * markers included; the band holding the last row ends without one.
+ */
+export function encodeJpegBand(rgba: Uint8Array, w: number, rows: number, y0: number, h: number, quality: number): Uint8Array {
+  let T = tableCache.get(quality);
+  if (!T) tableCache.set(quality, (T = quantTables(quality)));
+  const { fY, fC } = T;
+  const pw = Math.ceil(w / 8) * 8;
+  const P = [new Float32Array(pw * 8), new Float32Array(pw * 8), new Float32Array(pw * 8)];
+  const [Y, U, V] = P;
+  const blk = new Float32Array(64);
+  const du = new Int32Array(64);
+  const out = new Out(Math.round(w * rows * 0.6));
+  const totalRows = Math.ceil(h / 8);
+  for (let r0 = 0; r0 < rows; r0 += 8) {
+    // colour convert one block row (the bottom edge repeats the last row, the right edge the last column)
+    for (let r = 0; r < 8; r++) {
+      const sr = Math.min(rows - 1, r0 + r);
+      const i = sr * w * 4;
+      const off = r * pw;
       for (let x = 0; x < pw; x++) {
-        const j = x < w ? i + x * 4 : i + (w - 1) * 4;
+        const j = i + (x < w ? x : w - 1) * 4;
         const R = rgba[j], G = rgba[j + 1], B = rgba[j + 2];
         Y[off + x] = 0.299 * R + 0.587 * G + 0.114 * B - 128;
         U[off + x] = -0.168736 * R - 0.331264 * G + 0.5 * B;
         V[off + x] = 0.5 * R - 0.418688 * G - 0.081312 * B;
       }
-      this.pending++;
-      if (this.pending === 8) this.flushBlockRow();
     }
-  }
-
-  finish(): Uint8Array[] {
-    if (this.pending > 0) {
-      const { pw } = this;
-      for (const p of this.planes) {
-        const last = (this.pending - 1) * pw;
-        for (let r = this.pending; r < 8; r++) p.copyWithin(r * pw, last, last + pw);
-      }
-      this.pending = 8;
-      this.flushBlockRow();
-    }
-    if (this.bitCnt > 0) this.writeBits((1 << (8 - this.bitCnt)) - 1, 8 - this.bitCnt);
-    this.word(0xffd9);
-    this.chunks.push(this.buf.slice(0, this.pos));
-    this.pos = 0;
-    return this.chunks;
-  }
-
-  private flushBlockRow() {
-    const { pw, blk, du } = this;
+    const dc = [0, 0, 0];
     for (let bx = 0; bx < pw; bx += 8) {
       for (let c = 0; c < 3; c++) {
-        const p = this.planes[c];
+        const p = P[c];
         for (let r = 0; r < 8; r++) {
           const o = r * pw + bx;
-          for (let k = 0; k < 8; k++) blk[r * 8 + k] = p[o + k];
+          const b = r * 8;
+          blk[b] = p[o]; blk[b + 1] = p[o + 1]; blk[b + 2] = p[o + 2]; blk[b + 3] = p[o + 3];
+          blk[b + 4] = p[o + 4]; blk[b + 5] = p[o + 5]; blk[b + 6] = p[o + 6]; blk[b + 7] = p[o + 7];
         }
-        fdctQuant(blk, c === 0 ? this.fY : this.fC, du);
-        this.dc[c] = this.encodeBlock(du, this.dc[c], c === 0 ? HUFF.dcL : HUFF.dcC, c === 0 ? HUFF.acL : HUFF.acC);
+        fdctQuant(blk, c === 0 ? fY : fC, du);
+        dc[c] = encodeBlock(out, du, dc[c], c === 0 ? HUFF.dcL : HUFF.dcC, c === 0 ? HUFF.acL : HUFF.acC);
       }
     }
-    this.pending = 0;
+    out.align();
+    const R = (y0 + r0) / 8;
+    if (R < totalRows - 1) out.word(0xffd0 + (R & 7));
   }
+  return out.bytes();
+}
 
-  private encodeBlock(du: Int32Array, prevDC: number, dcT: { code: Int32Array; len: Int32Array }, acT: { code: Int32Array; len: Int32Array }) {
-    const diff = du[0] - prevDC;
-    if (diff === 0) this.writeBits(dcT.code[0], dcT.len[0]);
-    else {
-      const cat = bitLen(diff);
-      this.writeBits(dcT.code[cat], dcT.len[cat]);
-      this.writeBits(diff < 0 ? diff + (1 << cat) - 1 : diff, cat);
-    }
-    let end = 63;
-    while (end > 0 && du[end] === 0) end--;
-    if (end === 0) {
-      this.writeBits(acT.code[0], acT.len[0]);
-      return du[0];
-    }
-    let i = 1;
-    while (i <= end) {
-      const start = i;
-      while (du[i] === 0 && i <= end) i++;
-      let zeros = i - start;
-      while (zeros >= 16) {
-        this.writeBits(acT.code[0xf0], acT.len[0xf0]);
-        zeros -= 16;
-      }
-      const v = du[i];
-      const cat = bitLen(v);
-      const sym = (zeros << 4) + cat;
-      this.writeBits(acT.code[sym], acT.len[sym]);
-      this.writeBits(v < 0 ? v + (1 << cat) - 1 : v, cat);
-      i++;
-    }
-    if (end !== 63) this.writeBits(acT.code[0], acT.len[0]);
+function encodeBlock(o: Out, du: Int32Array, prevDC: number, dcT: Huff, acT: Huff) {
+  const diff = du[0] - prevDC;
+  if (diff === 0) o.bits(dcT.code[0], dcT.len[0]);
+  else {
+    const cat = bitLen(diff);
+    o.bits(dcT.code[cat], dcT.len[cat]);
+    o.bits(diff < 0 ? diff + (1 << cat) - 1 : diff, cat);
+  }
+  let end = 63;
+  while (end > 0 && du[end] === 0) end--;
+  if (end === 0) {
+    o.bits(acT.code[0], acT.len[0]);
     return du[0];
   }
-
-  private writeBits(value: number, len: number) {
-    for (let b = len - 1; b >= 0; b--) {
-      this.bitBuf = (this.bitBuf << 1) | ((value >> b) & 1);
-      this.bitCnt++;
-      if (this.bitCnt === 8) {
-        this.byte(this.bitBuf);
-        if (this.bitBuf === 0xff) this.byte(0);
-        this.bitBuf = 0;
-        this.bitCnt = 0;
-      }
+  let i = 1;
+  while (i <= end) {
+    const start = i;
+    while (du[i] === 0 && i <= end) i++;
+    let zeros = i - start;
+    while (zeros >= 16) {
+      o.bits(acT.code[0xf0], acT.len[0xf0]);
+      zeros -= 16;
     }
+    const v = du[i];
+    const cat = bitLen(v);
+    const sym = (zeros << 4) + cat;
+    o.bits(acT.code[sym], acT.len[sym]);
+    o.bits(v < 0 ? v + (1 << cat) - 1 : v, cat);
+    i++;
   }
-
-  private byte(b: number) {
-    if (this.pos === this.buf.length) {
-      this.chunks.push(this.buf);
-      this.buf = new Uint8Array(1 << 20);
-      this.pos = 0;
-    }
-    this.buf[this.pos++] = b;
-  }
-  private word(w: number) {
-    this.byte((w >> 8) & 0xff);
-    this.byte(w & 0xff);
-  }
-
-  private writeHeaders() {
-    this.word(0xffd8);
-    // APP0 JFIF
-    this.word(0xffe0);
-    this.word(16);
-    [0x4a, 0x46, 0x49, 0x46, 0, 1, 1, 0].forEach((b) => this.byte(b));
-    this.word(1);
-    this.word(1);
-    this.byte(0);
-    this.byte(0);
-    // DQT
-    this.word(0xffdb);
-    this.word(132);
-    this.byte(0);
-    this.qY.forEach((b) => this.byte(b));
-    this.byte(1);
-    this.qC.forEach((b) => this.byte(b));
-    // SOF0
-    this.word(0xffc0);
-    this.word(17);
-    this.byte(8);
-    this.word(this.h);
-    this.word(this.w);
-    this.byte(3);
-    for (let c = 1; c <= 3; c++) {
-      this.byte(c);
-      this.byte(0x11);
-      this.byte(c === 1 ? 0 : 1);
-    }
-    // DHT
-    const tables: [number, number[], number[]][] = [
-      [0x00, DC_L_N, DC_V], [0x10, AC_L_N, AC_L_V], [0x01, DC_C_N, DC_V], [0x11, AC_C_N, AC_C_V],
-    ];
-    let len = 2;
-    for (const [, , v] of tables) len += 17 + v.length;
-    this.word(0xffc4);
-    this.word(len);
-    for (const [id, n, v] of tables) {
-      this.byte(id);
-      n.forEach((b) => this.byte(b));
-      v.forEach((b) => this.byte(b));
-    }
-    // SOS
-    this.word(0xffda);
-    this.word(12);
-    this.byte(3);
-    this.byte(1); this.byte(0x00);
-    this.byte(2); this.byte(0x11);
-    this.byte(3); this.byte(0x11);
-    this.byte(0); this.byte(63); this.byte(0);
-  }
+  if (end !== 63) o.bits(acT.code[0], acT.len[0]);
+  return du[0];
 }
 
 function clampQ(v: number) {
@@ -263,13 +278,7 @@ function clampQ(v: number) {
 }
 
 function bitLen(v: number) {
-  let a = Math.abs(v);
-  let n = 0;
-  while (a) {
-    n++;
-    a >>= 1;
-  }
-  return n;
+  return 32 - Math.clz32(v < 0 ? -v : v);
 }
 
 function fdctQuant(d: Float32Array, fdtbl: Float32Array, out: Int32Array) {

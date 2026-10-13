@@ -8,7 +8,7 @@ import {
 import { makeSpline } from '../curves';
 import { LOOKS, Look, ImgStats, measure } from '../presets';
 import { loadFile } from '../io/loader';
-import { CANVAS_LIMIT, framed, renderExport, saveOrShare } from '../io/export';
+import { framed, renderExport, saveOrShare } from '../io/export';
 import { loadBlob, loadSession, saveBlob, saveFile, saveState } from '../io/session';
 import { TOOLS, ToolDef, Chip } from './tools';
 import { ICONS } from './icons';
@@ -232,6 +232,7 @@ export class App {
     this.atlas = new BrushAtlas(this.g.gl);
     this.atlas.getBase = (m) => this.maskBase(m);
     this.ovAtlas = new BrushAtlas(this.g.gl);
+    this.ovAtlas.getBase = (m) => this.maskBase(m);
     this.canvas.addEventListener('webglcontextlost', (e) => {
       e.preventDefault();
       cancelAnimationFrame(this.raf);
@@ -242,6 +243,7 @@ export class App {
       this.atlas = new BrushAtlas(this.g.gl);
       this.atlas.getBase = (m) => this.maskBase(m);
       this.ovAtlas = new BrushAtlas(this.g.gl);
+      this.ovAtlas.getBase = (m) => this.maskBase(m);
       this.ovImg = null;
       this.lkTex.clear();
       this.fillCache = [];
@@ -407,9 +409,7 @@ export class App {
   /** What's on screen: the edit, the original (compare), or the uncropped frame (crop section). */
   private viewState(): EditState {
     let s = this.state;
-    if (this.compare) {
-      s = { v: { ...defaultValues(), straighten: s.v.straighten }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null, leak: null, fills: [] };
-    }
+    if (this.compare) s = this.origState();
     if (this.kind() === 'crop') s = { ...s, geo: { ...s.geo, crop: { x: 0, y: 0, w: 1, h: 1 } } };
     return s;
   }
@@ -436,10 +436,18 @@ export class App {
       console.error(e);
       this.toast('Render error: ' + (e as Error).message, 4000);
     }
+    // zoomed in, the sharp full-resolution copy on top is now out of date: show the live
+    // preview until it's redone (otherwise brush strokes and slider moves only appear once
+    // you stop)
+    if (this.detail && this.detail.ver !== this.renderVer) {
+      $('detail').classList.remove('on');
+      this.setZoomView(false);
+    }
     // the loupe copies from the canvas while its frame is still current
     if (this.loupe.pos) this.loupe.draw(this.canvas, this.stage.getBoundingClientRect());
     if (this.showHist || this.kind() === 'curves') this.scheduleHist();
     this.scheduleDetail(true);
+    if (!this.compare) this.scheduleOrig();
   }
 
   // ---- pixel-level zoom: render what's visible at full resolution when the preview runs out
@@ -481,6 +489,11 @@ export class App {
       this.setZoomView(false);
     };
     if (!this.img || this.compare || this.kind() === 'crop' || this.zoom.s <= 1.01) return off();
+    // mid-stroke or mid-drag: the full-resolution render would stall the finger; wait until it's done
+    if (this.stroke || this.dxStroke || this.vd || this.aiStroke || this.healPaint) {
+      this.detailTimer = window.setTimeout(() => this.renderDetail(), 160);
+      return;
+    }
     const dpr = window.devicePixelRatio || 1;
     const fr = this.frame.getBoundingClientRect();
     const { w: W, h: H } = this.outFull();
@@ -829,12 +842,23 @@ export class App {
     this.requestRender();
   }
 
+  /** Painting a brush or subject mask: the slider holds the brush settings. */
+  private brushing() {
+    const m = this.kind() === 'masks' ? this.selMask() : null;
+    return !!m && (m.type === 'brush' || m.type === 'subject') && (this.brushMode === 'paint' || this.brushMode === 'erase');
+  }
+  /** Which remembered slider position applies (the brush settings keep their own). */
+  private pkey() {
+    return this.brushing() ? 'masks:brush' : this.tool!.id;
+  }
+
   private params(): string[] {
     const t = this.tool;
     if (!t) return [];
     if (t.kind === 'masks') {
       const m = this.selMask();
       if (!m) return [];
+      if (this.brushing()) return ['mg.size', 'mg.hard', 'mg.flow'];
       return [...MASK_ADJ.map((d) => 'ma.' + d.id), ...MASK_TYPE_SETTINGS[m.type].map((k) => 'mg.' + k)];
     }
     if (t.kind === 'blur') return t.params(String(Math.round(this.state.v.blurType)));
@@ -842,7 +866,7 @@ export class App {
     if (t.kind === 'double' || t.kind === 'leak') {
       const k = t.kind === 'double' ? 'dx' : 'lk';
       if (!this.layerOf(k)) return [];
-      return this.dxMode === 'move' ? [k + 'Opacity', k + 'Scale', k + 'Rot', ...(k === 'lk' ? ['lkBlend'] : [])] : [k + 'Brush', k + 'Opacity'];
+      return this.dxMode === 'move' ? [k + 'Opacity', k + 'Scale', k + 'Rot', ...(k === 'lk' ? ['lkBlend'] : [])] : [k + 'Brush', k + 'Hard', k + 'Opacity'];
     }
     if (t.kind === 'looks') return this.look.idx > 0 ? ['lookAmt'] : [];
     return t.params(this.sub[t.id] ?? t.subs?.[0].id ?? '');
@@ -850,7 +874,7 @@ export class App {
   private currentParam(): string | null {
     const ps = this.params();
     if (!ps.length || !this.tool) return null;
-    return ps[Math.min(ps.length - 1, this.paramIdx[this.tool.id] ?? 0)];
+    return ps[Math.min(ps.length - 1, this.paramIdx[this.pkey()] ?? 0)];
   }
   private fmt(id: string, v = this.get(id)) {
     return (this.def(id).fmt ?? plain)(v);
@@ -995,12 +1019,70 @@ export class App {
     this.syncGuard();
   }
 
+  /**
+   * Hold for the original. The original is rendered once (it only depends on the photo and
+   * its geometry) into its own canvas over the edit, so holding and letting go are instant:
+   * the edit itself is never re-rendered. Deep zoom keeps the old path.
+   */
+  private cmpOn = false;
+  private origKey = '';
+  private origTimer = 0;
   private setCompare(on: boolean) {
-    if (this.compare === on || !this.img) return;
-    this.compare = on;
+    if (!this.img || (this.compare || this.cmpOn) === on) return;
     $('badge').textContent = 'ORIGINAL';
     $('badge').classList.toggle('on', on);
+    const orig = $('orig');
+    if (!on) {
+      orig.classList.remove('on');
+      if (this.cmpOn) {
+        this.cmpOn = false;
+        return;
+      }
+      this.compare = false;
+      this.requestRender();
+      return;
+    }
+    if (!this.zv.on && this.kind() !== 'crop' && this.prepareOrig()) {
+      this.cmpOn = true;
+      orig.classList.add('on');
+      return;
+    }
+    this.compare = true;
     this.requestRender();
+  }
+
+  /** What the original looks like at the current on-screen size (geometry only). */
+  private origState(): EditState {
+    const s = this.state;
+    return { v: { ...defaultValues(), straighten: s.v.straighten }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null, leak: null, fills: [] };
+  }
+  private prepareOrig() {
+    if (!this.img) return false;
+    const w = this.canvas.width, h = this.canvas.height;
+    const key = JSON.stringify([this.img.name, this.img.preview.w, this.state.geo, this.state.v.straighten, w, h]);
+    if (key === this.origKey) return true;
+    try {
+      const px = this.pipe.renderPixels(this.img.preview, this.origState(), w, h);
+      const c = $<HTMLCanvasElement>('orig');
+      c.width = w;
+      c.height = h;
+      c.getContext('2d')!.putImageData(new ImageData(new Uint8ClampedArray(px.buffer), w, h), 0, 0);
+      this.origKey = key;
+      return true;
+    } catch (e) {
+      console.warn('original render failed', e);
+      return false;
+    }
+  }
+  /** Get the original ready in a quiet moment, so the first hold is instant too. */
+  private scheduleOrig() {
+    clearTimeout(this.origTimer);
+    this.origTimer = window.setTimeout(() => {
+      if (!this.img || this.cmpOn || this.kind() === 'crop') return;
+      const run = () => this.prepareOrig();
+      if ('requestIdleCallback' in window) requestIdleCallback(run, { timeout: 1500 });
+      else run();
+    }, 900);
   }
 
   private updateChrome() {
@@ -1384,9 +1466,17 @@ export class App {
   private sizeTimer = 0;
   private showSizeRing(id: string) {
     const k = this.maskOv.pxPerFrameH();
-    const px = id === 'healSize' ? this.healPx() : id === 'mg.size' ? this.brushRadius() * k : id === 'dxBrush' || id === 'lkBrush' ? this.layerRadius(id.slice(0, 2) as 'dx' | 'lk') * k : 0;
+    const lay = id.slice(0, 2) as 'dx' | 'lk';
+    const px = id === 'healSize' ? this.healPx()
+      : id === 'mg.size' || id === 'mg.hard' || id === 'mg.flow' ? this.brushRadius() * k
+      : /^(dx|lk)(Brush|Hard)$/.test(id) ? this.layerRadius(lay) * k : 0;
     if (!px) return;
     const ring = $('brushRing');
+    // the inside shows how hard the edge is (and how strong each pass is)
+    const hard = id.startsWith('mg.') ? (this.selMask()?.g.hard ?? 25) / 100 : id === 'healSize' ? 0.6 : (this.state.v[lay + 'Hard'] ?? 35) / 100;
+    const flow = id.startsWith('mg.') ? (this.selMask()?.g.flow ?? 70) / 100 : 0.8;
+    const a = (0.2 + flow * 0.45).toFixed(2);
+    ring.style.background = `radial-gradient(closest-side, rgba(255,200,61,${a}) ${Math.round(Math.min(0.95, hard) * 100)}%, rgba(255,200,61,0) 100%)`;
     const st = this.stage.getBoundingClientRect();
     const cy = (this.region().top + st.height - this.region().bot) / 2;
     ring.style.width = ring.style.height = px * 2 + 'px';
@@ -1394,7 +1484,10 @@ export class App {
     ring.classList.remove('erase');
     ring.classList.add('on', 'size');
     clearTimeout(this.sizeTimer);
-    this.sizeTimer = window.setTimeout(() => ring.classList.remove('on', 'size'), 650);
+    this.sizeTimer = window.setTimeout(() => {
+      ring.classList.remove('on', 'size');
+      ring.style.background = '';
+    }, 650);
   }
   private endValue() {
     if (!this.vd) return;
@@ -1459,7 +1552,7 @@ export class App {
     this.menuTap = tapMode;
     const items = menu.querySelector('.items') as HTMLElement;
     items.innerHTML = '';
-    const cur = Math.min(ps.length - 1, this.paramIdx[this.tool.id] ?? 0);
+    const cur = Math.min(ps.length - 1, this.paramIdx[this.pkey()] ?? 0);
     ps.forEach((id, i) => {
       const b = document.createElement('button');
       const d = this.def(id);
@@ -1470,7 +1563,7 @@ export class App {
       b.onpointerup = (e) => {
         if (!this.menuTap) return;
         e.stopPropagation();
-        this.paramIdx[this.tool!.id] = i;
+        this.paramIdx[this.pkey()] = i;
         tick();
         this.showMenu(false);
         this.updateSecBar();
@@ -1558,6 +1651,7 @@ export class App {
     let pan0 = { x: 0, y: 0 };
     let anchorY = 0;
     let holdTimer = 0, tapTimer = 0;
+    let armed = false;
     let lastTap = { t: 0, x: 0, y: 0 };
 
     const stageXY = (cx: number, cy: number) => {
@@ -1670,14 +1764,26 @@ export class App {
         }
       }
       mode = 'pending';
+      armed = false;
       clearTimeout(holdTimer);
-      holdTimer = window.setTimeout(() => {
+      const toCompare = () => {
         if (mode === 'pending') {
           mode = 'compare';
           this.setCompare(true);
           tick(true);
         }
-      }, 380);
+      };
+      if (this.zoom.s > 1.01 && this.currentParam()) {
+        // zoomed in, a drag pans; hold a moment first (a tick) and the drag adjusts instead.
+        // keep holding still and it shows the original as usual
+        holdTimer = window.setTimeout(() => {
+          if (mode !== 'pending') return;
+          armed = true;
+          tick();
+          $('pill').classList.add('armed');
+          holdTimer = window.setTimeout(toCompare, 420);
+        }, 230);
+      } else holdTimer = window.setTimeout(toCompare, 380);
     });
 
     st.addEventListener('pointermove', (e) => {
@@ -1743,7 +1849,8 @@ export class App {
       const dy = e.clientY - sy;
       if (mode === 'pending' && Math.hypot(dx, dy) > 8) {
         clearTimeout(holdTimer);
-        if (this.zoom.s > 1.01) {
+        $('pill').classList.remove('armed');
+        if (this.zoom.s > 1.01 && !armed) {
           // zoomed in: one finger pans
           mode = 'pan';
           pan0 = { x: this.zoom.x, y: this.zoom.y };
@@ -1763,7 +1870,7 @@ export class App {
           if (this.kind() === 'blur') this.blurOv.guides = true;
         } else if (this.params().length > 1) {
           mode = 'menu';
-          startIdx = this.paramIdx[this.tool!.id] ?? 0;
+          startIdx = this.paramIdx[this.pkey()] ?? 0;
           lastStep = startIdx;
           anchorY = e.clientY;
           this.showMenu(true);
@@ -1798,7 +1905,7 @@ export class App {
         if (i !== lastStep) {
           lastStep = i;
           tick(true);
-          this.paramIdx[this.tool!.id] = i;
+          this.paramIdx[this.pkey()] = i;
           this.highlightMenu(i);
           this.showHud(this.currentParam()!);
         }
@@ -1809,6 +1916,9 @@ export class App {
       if (!pts.has(e.pointerId)) return;
       pts.delete(e.pointerId);
       clearTimeout(holdTimer);
+      $('pill').classList.remove('armed');
+      if (armed && mode === 'pending') mode = 'none'; // a hold that never moved isn't a tap
+      armed = false;
       if (mode === 'pinch') {
         if (pts.size === 0) mode = 'none';
         return;
@@ -2136,7 +2246,9 @@ export class App {
       this.tile(row, ICONS.erase, 'Erase', this.brushMode === 'erase' ? 'on' : '', () => this.setBrushMode('erase'));
       this.tile(row, ICONS.swipe, 'Adjust', this.brushMode === 'swipe' ? 'on' : '', () => this.setBrushMode('swipe'));
       sep();
-    } else if (m.type === 'luma' || m.type === 'color') {
+    }
+    if (this.brushing()) this.brushChips(row, sep);
+    if (m.type === 'luma' || m.type === 'color') {
       this.tile(row, ICONS.pick, 'Pick', this.pickMode === 'pick' ? 'on' : '', () => {
         this.pickMode = 'pick';
         this.toast('Drag on the photo to choose');
@@ -2156,6 +2268,18 @@ export class App {
     this.tile(row, ICONS.invert, 'Invert', m.invert ? 'hot' : '', () => this.maskAction('invert'));
     this.tile(row, ICONS.duplicate, 'Copy', '', () => this.maskAction('dup'));
     this.tile(row, ICONS.trash, 'Delete', 'danger', () => this.maskAction('delete'));
+  }
+
+  /** Size · Hardness · Flow: which one the slider changes. */
+  private brushChips(row: HTMLElement, sep: () => void) {
+    const ps = this.params();
+    const cur = this.currentParam();
+    ps.forEach((id, i) => this.chip(row, { id, label: id === 'mg.hard' ? 'Hardness' : this.def(id).label }, id === cur, () => {
+      this.paramIdx[this.pkey()] = i;
+      this.refreshSection();
+      this.showSizeRing(id);
+    }));
+    sep();
   }
 
   private setBrushMode(m: 'paint' | 'erase' | 'swipe' | 'aiAdd' | 'aiSub') {
@@ -2900,7 +3024,9 @@ export class App {
       if (mode === 'size') tick();
       return;
     }
-    this.dxStroke = { r: this.layerRadius(k), hard: 0.35, flow: 0.8, erase: this.dxMode === 'show', pts: [f.x, f.y] };
+    // the strokes paint the hidden part; with the mask inverted, Hide and Show swap so they still mean what they say
+    const show = this.dxMode === 'show';
+    this.dxStroke = { r: this.layerRadius(k), hard: (v[k + 'Hard'] ?? 35) / 100, flow: 0.8, erase: L.invert ? !show : show, pts: [f.x, f.y] };
     L.strokes.push(this.dxStroke);
     this.showLayerRing(e);
     this.requestRender();
@@ -2987,7 +3113,7 @@ export class App {
     if (!L) return;
     const mode = (m: 'move' | 'hide' | 'show') => () => {
       this.dxMode = m;
-      this.paramIdx[this.tool!.id] = 0;
+      this.paramIdx[this.pkey()] = 0;
       this.refreshSection();
       this.layerOv.draw();
       if (m !== 'move') this.toast(m === 'hide' ? 'Paint over the parts to hide' : 'Paint to bring parts back', 1800);
@@ -2996,6 +3122,23 @@ export class App {
     this.tile(row, ICONS.move, 'Move', this.dxMode === 'move' ? 'on' : '', mode('move'));
     this.tile(row, ICONS.erase, 'Hide', this.dxMode === 'hide' ? 'on' : '', mode('hide'));
     this.tile(row, ICONS.paint, 'Show', this.dxMode === 'show' ? 'on' : '', mode('show'));
+    const sep = () => row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
+    sep();
+    this.tile(row, ICONS.mPeople, 'Person', L.person ? 'hot' : '', () => {
+      L.person = !L.person;
+      // the classic double exposure: the photo shows inside the person
+      if (L.person && !L.strokes.length) L.invert = true;
+      if (L.person) this.toast(L.invert ? 'Shows inside the person · Invert for outside' : 'Hidden over the person · Invert for inside', 2600);
+      this.commit();
+      this.refreshSection();
+      this.requestRender();
+    });
+    this.tile(row, ICONS.invert, 'Invert', L.invert ? 'hot' : '', () => {
+      L.invert = !L.invert;
+      this.commit();
+      this.refreshSection();
+      this.requestRender();
+    });
     if (L.strokes.length) {
       this.tile(row, ICONS.reset, 'Clear brush', '', () => {
         L.strokes = [];
@@ -3174,8 +3317,12 @@ export class App {
     if (ov && this.ovImg?.id !== ov.id && this.ovLoading !== ov.id) void this.loadOverlay(ov.id);
     this.pipe.overlay = ov && this.ovImg?.id === ov.id ? this.ovImg : null;
     this.pipe.leak = lk ? { id: lk.id, tex: this.leakTexture(lk.id) } : null;
-    const slot = (L: typeof ov, id: number) => (L?.strokes.length ? ({ id, type: 'brush', strokes: L.strokes } as unknown as Mask) : ({ id: 0, type: 'radial', strokes: [] } as unknown as Mask));
-    this.ovAtlas.sync([slot(ov, 1), slot(lk, 2)]);
+    // a layer's mask: the person in the photo (AI, optional) plus its brush strokes
+    const slot = (L: typeof ov, id: number) =>
+      L?.person ? ({ id, type: 'subject', strokes: L.strokes, ai: { strokes: [], part: 0 } } as unknown as Mask)
+      : L?.strokes.length ? ({ id, type: 'brush', strokes: L.strokes } as unknown as Mask)
+      : ({ id: 0, type: 'radial', strokes: [] } as unknown as Mask);
+    this.ovAtlas.sync([slot(ov, -1), slot(lk, -2)]);
     this.pipe.overlayMask = this.ovAtlas.tex[0];
     this.syncFill(st);
   }
@@ -3859,7 +4006,7 @@ export class App {
       const n = this.params().length;
       if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
         e.preventDefault();
-        this.paramIdx[this.tool!.id] = Math.max(0, Math.min(n - 1, (this.paramIdx[this.tool!.id] ?? 0) + (e.key === 'ArrowUp' ? -1 : 1)));
+        this.paramIdx[this.pkey()] = Math.max(0, Math.min(n - 1, (this.paramIdx[this.pkey()] ?? 0) + (e.key === 'ArrowUp' ? -1 : 1)));
         this.updateSecBar();
         this.showHud(this.currentParam()!);
         this.hideHudSoon();
@@ -3913,7 +4060,6 @@ export class App {
     const long = Math.max(full.w, full.h);
     const target = size === 'full' ? long : +size;
     let k = Math.min(1, target / long);
-    if (this.exportOpts.format === 'png' && full.w * full.h * k * k > CANVAS_LIMIT) k = Math.sqrt(CANVAS_LIMIT / (full.w * full.h));
     return { w: Math.max(1, Math.round(full.w * k)), h: Math.max(1, Math.round(full.h * k)), k };
   }
 
@@ -3940,9 +4086,7 @@ export class App {
     $('exQLabel').style.display = isPng ? 'none' : '';
     $<HTMLInputElement>('exQuality').style.display = isPng ? 'none' : '';
     const d = this.exportDims(this.exportOpts.size);
-    $('exHint').textContent = isPng && d.k < 1 && this.exportOpts.size === 'full'
-      ? 'PNG is limited to ~16 MP on phones; use JPEG for full resolution.'
-      : `${((d.w * d.h) / 1e6).toFixed(1)} MP · every edit applied at full quality`;
+    $('exHint').textContent = `${((d.w * d.h) / 1e6).toFixed(1)} MP · every edit applied at full quality`;
     ($('exGo') as HTMLButtonElement).textContent = framed ? 'Export' : /iPhone|iPad|Android/i.test(navigator.userAgent) ? 'Save' : 'Download';
   }
 
@@ -3951,7 +4095,7 @@ export class App {
     $('sheet').classList.remove('on');
     const img = this.img;
     const d = this.exportDims(this.exportOpts.size);
-    this.busy('Rendering 0%');
+    this.busy('Exporting 0%');
     let tmp: Target | null = null;
     try {
       let full = img.full;
@@ -3967,8 +4111,8 @@ export class App {
       const blob = await renderExport({
         pipeline: this.pipe, full, analysis: img.preview, state: this.state, w: d.w, h: d.h,
         format: this.exportOpts.format, quality: this.exportOpts.quality,
-        // rendering fills the first 90%; after that the file is being encoded
-        progress: (f) => this.busy(f < 0.9 ? `Rendering ${Math.round((f / 0.9) * 100)}%` : this.exportOpts.format === 'png' ? 'Encoding PNG' : 'Encoding JPEG'),
+        // rendering and encoding run together (the encoders work while the GPU renders)
+        progress: (f) => this.busy(`Exporting ${Math.round(f * 100)}%`),
       });
       if (tmp) {
         this.g.destroy(tmp);
@@ -4006,10 +4150,25 @@ export class App {
   // -----------------------------------------------------------------------------------
   // Feedback
 
+  /** The busy screen. A percentage in the message drives the rising sun; without one it shimmers. */
+  private busyRows: SVGElement[] = [];
   private busy(msg: string | null) {
     const b = $('busy');
     b.classList.toggle('on', !!msg);
-    if (msg) (b.querySelector('.msg') as HTMLElement).textContent = msg;
+    if (!msg) return;
+    (b.querySelector('.msg') as HTMLElement).textContent = msg;
+    if (!this.busyRows.length) this.busyRows = [...b.querySelectorAll<SVGElement>('.sun .s')];
+    const m = /(\d+)%/.exec(msg);
+    b.classList.toggle('ind', !m);
+    const rows = this.busyRows;
+    const n = Math.max(...rows.map((r) => +r.style.getPropertyValue('--i'))) + 1;
+    // rows lit from the bottom up; the row being worked on blinks
+    const lit = m ? Math.min(n, Math.floor((+m[1] / 100) * n + 0.0001)) : 0;
+    for (const r of rows) {
+      const i = +r.style.getPropertyValue('--i');
+      r.classList.toggle('lit', !!m && i <= lit);
+      r.classList.toggle('top', !!m && i === Math.min(lit, n - 1));
+    }
   }
 
   private toastTimer = 0;

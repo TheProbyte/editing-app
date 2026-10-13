@@ -106,6 +106,7 @@ export const PARAMS: ParamDef[] = [
   p('dxRot', 'Rotate', -180, 180, 0, { fmt: (v) => Math.round(v) + '°' }),
   p('dxBlend', 'Blend', 0, 8, 0),
   p('dxBrush', 'Brush size', 1, 100, 30),
+  p('dxHard', 'Hardness', 0, 100, 35),
   p('dxX', 'Position X', 0, 1, 0.5),
   p('dxY', 'Position Y', 0, 1, 0.5),
   // Light leak
@@ -114,6 +115,7 @@ export const PARAMS: ParamDef[] = [
   p('lkRot', 'Rotate', -180, 180, 0, { fmt: (v) => Math.round(v) + '°' }),
   p('lkBlend', 'Blend', 0, 8, 2, { fmt: (v) => BLEND_MODES[Math.round(v)] }),
   p('lkBrush', 'Brush size', 1, 100, 30),
+  p('lkHard', 'Hardness', 0, 100, 35),
   p('lkX', 'Position X', 0, 1, 0.5),
   p('lkY', 'Position Y', 0, 1, 0.5),
   // Remove (spot healing)
@@ -236,6 +238,17 @@ export function spotCircles(sp: Spot, aspect: number, maxN = 48): [number, numbe
 
 export const MAX_SPOTS = 32;
 
+/** A placed layer (double exposure photo or light leak). Its mask = person (optional) + brush, optionally inverted. */
+export interface Layer {
+  id: string;
+  aspect: number;
+  strokes: Stroke[];
+  /** flip the mask: shown where it was hidden and the other way round */
+  invert?: boolean;
+  /** start the mask from the person in the photo (AI) */
+  person?: boolean;
+}
+
 export interface EditState {
   v: Values;
   curves: Curves;
@@ -243,9 +256,9 @@ export interface EditState {
   masks: Mask[];
   spots: Spot[];
   /** double exposure: the second photo (stored on the device by id) and its hide/show brush */
-  overlay?: { id: string; aspect: number; strokes: Stroke[] } | null;
+  overlay?: Layer | null;
   /** light leak: a built-in leak (by id), placed like the double-exposure photo */
-  leak?: { id: string; aspect: number; strokes: Stroke[] } | null;
+  leak?: Layer | null;
   /** content-aware fills: areas painted over, rebuilt from the rest of the photo */
   fills?: { pts: number[]; r: number }[];
 }

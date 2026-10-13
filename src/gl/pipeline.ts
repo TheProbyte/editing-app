@@ -46,6 +46,8 @@ export function outputSize(state: EditState, w: number, h: number) {
 }
 
 /** Settings only the finish pass reads (halation/glow/blur *amounts* are checked separately). */
+/** brush settings: they only change what the next stroke looks like */
+const BRUSH_ONLY = /^((dx|lk)(Brush|Hard)|healSize)$/;
 const FINISH_ONLY = /^(halation|halThreshold|halRadius|halHue|halSat|glow|glowThreshold|glowRadius|glowWarmth|vig\w*|grain\w*|ca|blur(Type|Amt|Size|Feather|Angle|X|Y))$/;
 
 export class Pipeline {
@@ -124,7 +126,7 @@ export class Pipeline {
   /** Everything that decides what the developed image looks like (i.e. all but the finish-pass settings). */
   private devKey(state: EditState, geoKey: string) {
     const v: Record<string, number> = {};
-    for (const k in state.v) if (!FINISH_ONLY.test(k)) v[k] = state.v[k];
+    for (const k in state.v) if (!FINISH_ONLY.test(k) && !BRUSH_ONLY.test(k)) v[k] = state.v[k];
     return JSON.stringify([geoKey, v, state.curves, state.masks, this.showMask]);
   }
 
@@ -246,7 +248,8 @@ export class Pipeline {
         rot[i] = (v[L.pre + 'Rot'] * Math.PI) / 180;
         op[i] = v[L.pre + 'Opacity'] / 100;
         bl[i] = Math.round(v[L.pre + 'Blend']);
-        maskOn[i] = L.st!.strokes.length && this.overlayMask ? 1 : 0;
+        const has = !!((L.st!.strokes.length || L.st!.person) && this.overlayMask);
+        maskOn[i] = L.st!.invert ? (has ? 2 : -1) : has ? 1 : 0;
       });
       gl.uniform1iv(p.loc('uLyOn'), on);
       gl.uniform1fv(p.loc('uLyMaskOn'), maskOn);
@@ -698,12 +701,14 @@ export class Pipeline {
     full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number,
     onStrip: (px: Uint8Array, y: number, rows: number) => void | Promise<void>,
     progress: (f: number) => void,
+    /** strips start on rows that are a multiple of this (the JPEG encoder needs 8) */
+    align = 1,
   ) {
     const g = this.g;
     const P = this.prepareGlobal(full, analysisSrc, state, outW, outH);
     const S = Math.min(outW, outH);
     const pad = Math.ceil(S * 0.012) + 8;
-    const T = Math.min(2048, g.maxTex - pad * 2);
+    const T = Math.floor(Math.min(2048, g.maxTex - pad * 2) / align) * align;
     const tilesX = Math.ceil(outW / T);
     const tilesY = Math.ceil(outH / T);
     let done = 0;

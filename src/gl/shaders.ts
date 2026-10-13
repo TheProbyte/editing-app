@@ -100,7 +100,10 @@ vec3 applyLayer(vec3 col, vec2 fr, sampler2D tex, int i) {
   float a = uLyOpacity[i] * e.x * e.y;
   if (uLyMaskOn[i] > 0.5) {
     vec2 m = texture(uLayerMask, fr).rg;
-    a *= 1.0 - (i == 0 ? m.r : m.g);
+    float hid = i == 0 ? m.r : m.g;
+    a *= uLyMaskOn[i] > 1.5 ? hid : 1.0 - hid; // 2 = inverted
+  } else if (uLyMaskOn[i] < -0.5) {
+    return col; // inverted and nothing painted: nothing shows
   }
   if (a <= 0.0) return col;
   // blend like a photo editor does: on display-referred (gamma) values

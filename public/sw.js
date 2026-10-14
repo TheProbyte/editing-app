@@ -1,6 +1,6 @@
 // Lumen service worker: offline caching + cross-origin isolation headers
 // (needed for the multi-threaded RAW decoder on hosts that can't set headers).
-const CACHE = 'lumen-v7';
+const CACHE = 'lumen-v8';
 
 self.addEventListener('install', () => self.skipWaiting());
 self.addEventListener('activate', (e) => {

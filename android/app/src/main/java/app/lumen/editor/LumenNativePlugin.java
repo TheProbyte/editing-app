@@ -128,18 +128,21 @@ public class LumenNativePlugin extends Plugin {
 
     static Uri insertMedia(ContentResolver cr, String name, String mime) throws IOException {
         ContentValues v = new ContentValues();
+        // videos go to Movies/Lumen in the video collection, pictures to Pictures/Lumen
+        boolean video = mime != null && mime.startsWith("video/");
+        String folder = video ? Environment.DIRECTORY_MOVIES : Environment.DIRECTORY_PICTURES;
         v.put(MediaStore.MediaColumns.DISPLAY_NAME, name);
         v.put(MediaStore.MediaColumns.MIME_TYPE, mime);
         if (Build.VERSION.SDK_INT >= 29) {
-            v.put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/Lumen");
+            v.put(MediaStore.MediaColumns.RELATIVE_PATH, folder + "/Lumen");
             v.put(MediaStore.MediaColumns.IS_PENDING, 1);
         } else {
-            File dir = new File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_PICTURES), "Lumen");
+            File dir = new File(Environment.getExternalStoragePublicDirectory(folder), "Lumen");
             //noinspection ResultOfMethodCallIgnored
             dir.mkdirs();
             v.put(MediaStore.MediaColumns.DATA, new File(dir, name).getAbsolutePath());
         }
-        Uri u = cr.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
+        Uri u = cr.insert(video ? MediaStore.Video.Media.EXTERNAL_CONTENT_URI : MediaStore.Images.Media.EXTERNAL_CONTENT_URI, v);
         if (u == null) throw new IOException("The gallery refused the file");
         return u;
     }

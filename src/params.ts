@@ -1,3 +1,4 @@
+import type { VideoProject } from './video/project';
 // The complete edit model: every slider the app knows about, plus curves and geometry.
 
 export interface ParamDef {
@@ -261,6 +262,8 @@ export interface EditState {
   leak?: Layer | null;
   /** content-aware fills: areas painted over, rebuilt from the rest of the photo */
   fills?: { pts: number[]; r: number }[];
+  /** set when editing a video: the timeline (the settings above apply to every frame) */
+  video?: VideoProject;
 }
 
 export const BLEND_MODES = ['Normal', 'Lighten', 'Screen', 'Multiply', 'Darken', 'Overlay', 'Soft light', 'Add', 'Difference'];

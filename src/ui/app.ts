@@ -28,6 +28,12 @@ import { Camera } from './camera';
 import { isNative, Native, fileFromPath } from '../native';
 import { Segmenter, PEOPLE_PARTS, refineMask } from '../ai/segment';
 import { NeuralFill, LAMA_MB, type NeuralKind } from '../ai/neural';
+// the video editor (and Mediabunny) load only when a video is opened
+import type { VideoMode, VideoHost } from '../video/mode';
+import { isVideoFile, newProject } from '../video/project';
+
+/** photo tools that don't apply to video */
+const VIDEO_HIDDEN = new Set(['heal', 'masks', 'double']);
 
 interface Img {
   full: Source;
@@ -67,6 +73,8 @@ export class App {
   private appEl = $('app');
   private img: Img | null = null;
   private file: File | null = null;
+  /** set while editing a video (see src/video) */
+  private video: VideoMode | null = null;
 
   state: EditState = defaultState();
   private history: string[] = [];
@@ -272,6 +280,10 @@ export class App {
   // Opening images
 
   async open(file: File, keepState = false, restoreState = '') {
+    if (this.video) {
+      this.setMode(null);
+      this.closeVideo();
+    }
     this.busy('Opening');
     try {
       const maxDim = Math.min(this.g.maxTex, 8192);
@@ -362,6 +374,13 @@ export class App {
 
   private disposeImage() {
     if (!this.img) return;
+    if (this.video) {
+      // the frame textures belong to the video editor
+      this.g.destroy(this.img.thumbT);
+      this.img = null;
+      this.pipe.invalidate();
+      return;
+    }
     const gl = this.g.gl;
     gl.deleteTexture(this.img.full.tex);
     this.g.destroy(this.img.previewT);
@@ -417,7 +436,7 @@ export class App {
   }
 
   private renderNow() {
-    if (!this.img) return;
+    if (!this.img || this.video?.exporting) return;
     const st = this.viewState();
     const full = outputSize(st, this.img.preview.w, this.img.preview.h);
     // render only as many pixels as the screen can show (a big saving while dragging sliders)
@@ -434,6 +453,7 @@ export class App {
     this.pipe.showMask = this.kind() === 'masks' && (this.maskOverlayOn || this.maskInteracting || aiMode) ? this.maskSel : -1;
     try {
       this.pipe.render(this.img.preview, st, w, h, null);
+      this.video?.afterRender(w, h);
     } catch (e) {
       console.error(e);
       this.toast('Render error: ' + (e as Error).message, 4000);
@@ -449,7 +469,7 @@ export class App {
     if (this.loupe.pos) this.loupe.draw(this.canvas, this.stage.getBoundingClientRect());
     if (this.showHist || this.kind() === 'curves') this.scheduleHist();
     this.scheduleDetail(true);
-    if (!this.compare) this.scheduleOrig();
+    if (!this.compare && !this.video) this.scheduleOrig();
   }
 
   // ---- pixel-level zoom: render what's visible at full resolution when the preview runs out
@@ -733,10 +753,11 @@ export class App {
     while (size > 60_000_000 && this.history.length > 3) size -= this.history.shift()!.length;
     this.hIdx = this.history.length - 1;
     this.updateChrome();
-    if (this.img) {
+    if (this.img && !this.video) {
       clearTimeout(this.saveTimer);
       this.saveTimer = window.setTimeout(() => saveState(this.history[this.hIdx]), 800);
     }
+    if (this.video) this.video.updateTitle();
   }
 
   private commitAndRefresh() {
@@ -802,6 +823,7 @@ export class App {
     this.syncAtlasSize();
     this.look.base = null;
     this.look.idx = -1;
+    this.video?.onRestore();
     this.requestRender();
     this.refreshSection();
     this.updateChrome();
@@ -813,12 +835,14 @@ export class App {
 
   private def(id: string): ParamDef {
     if (id === 'lookAmt') return LOOK_AMT;
+    if (id.startsWith('vd.') && this.video) return this.video.def(id);
     if (id.startsWith('ma.')) return MASK_ADJ_MAP[id.slice(3)];
     if (id.startsWith('mg.')) return MASK_SETTINGS[id.slice(3)];
     return PARAM_MAP[id];
   }
   private get(id: string) {
     if (id === 'lookAmt') return this.look.amt;
+    if (id.startsWith('vd.')) return this.video?.get(id) ?? 0;
     const m = this.selMask();
     if (id.startsWith('ma.')) return m ? m.a[id.slice(3)] ?? 0 : 0;
     if (id.startsWith('mg.')) return m ? m.g[id.slice(3)] ?? this.def(id).def : 0;
@@ -827,6 +851,11 @@ export class App {
   private set(id: string, v: number) {
     const d = this.def(id);
     v = Math.min(d.max, Math.max(d.min, v));
+    if (id.startsWith('vd.')) {
+      this.video?.set(id, v);
+      this.requestRender();
+      return;
+    }
     if (id === 'lookAmt') {
       this.look.amt = v;
       if (this.look.base && this.look.idx >= 0) this.applyLookValues();
@@ -905,6 +934,8 @@ export class App {
         return !!this.state.overlay;
       case 'leak':
         return !!this.state.leak;
+      case 'video':
+        return !!this.video?.isModified(t.id);
       default: {
         const subs = t.subs ? t.subs.map((s) => s.id) : [''];
         return subs.some((s) => t.params(s).some((p) => Math.abs(v[p] - PARAM_MAP[p].def) > 1e-6));
@@ -935,10 +966,7 @@ export class App {
 
     // image/* lets Android show its photo picker, which includes Google Photos (and DNGs)
     const input = $<HTMLInputElement>('file');
-    input.onchange = () => {
-      const f = input.files?.[0];
-      if (f) this.open(f);
-    };
+    input.onchange = () => this.openFiles([...(input.files ?? [])]);
     $('btnOpenBig').onclick = () => this.pickPhoto();
     $('btnUndo').onclick = () => this.undoRedo(-1);
     $('btnRedo').onclick = () => this.undoRedo(1);
@@ -958,8 +986,7 @@ export class App {
     window.addEventListener('dragover', (e) => e.preventDefault());
     window.addEventListener('drop', (e) => {
       e.preventDefault();
-      const f = e.dataTransfer?.files?.[0];
-      if (f) this.open(f);
+      this.openFiles([...(e.dataTransfer?.files ?? [])]);
     });
     this.bindValueInput();
     this.bindSlider();
@@ -968,6 +995,147 @@ export class App {
     this.bindPresets();
     this.bindMaskSheet();
     this.bindKeys();
+  }
+
+  /** Open media: one photo edits the photo; any video (or several files) starts a video. */
+  openFiles(files: File[]) {
+    if (!files.length) return;
+    if (files.length === 1 && !isVideoFile(files[0])) return void this.open(files[0]);
+    void this.openVideo(files);
+  }
+
+  private resetEdit() {
+    this.history = [];
+    this.hIdx = -1;
+    this.paramIdx = {};
+    this.sub = {};
+    this.look = { base: null, idx: -1, amt: 100 };
+    this.aspectId = 'free';
+    this.zoom = { s: 1, x: 0, y: 0 };
+    this.maskSel = -1;
+  }
+
+  /** Start a video project with these files. */
+  async openVideo(files: File[]) {
+    this.setMode(null);
+    if (this.video) this.closeVideo();
+    else this.disposeImage();
+    this.file = null;
+    this.state = defaultState();
+    this.state.video = newProject();
+    this.resetEdit();
+    this.busy('Opening');
+    let Mode: typeof VideoMode;
+    try {
+      Mode = (await import('../video/mode')).VideoMode;
+    } catch (e) {
+      this.busy(null);
+      this.toast('Couldn’t load the video editor: ' + (e as Error).message, 5000);
+      return;
+    }
+    this.appEl.classList.add('video');
+    this.video = new Mode(this.videoHost());
+    this.buildTools();
+    await this.video.addFiles(files);
+    if (!this.state.video?.clips.length) {
+      this.closeVideo();
+      this.updateChrome();
+      return;
+    }
+    this.analysisCache = null;
+    this.syncAtlasSize();
+    this.thumbsKey = '';
+    if (this.homeOver) this.showHome(false);
+    $('btnResume').hidden = true;
+    $('empty').classList.add('hidden');
+    this.frame.classList.remove('empty');
+    this.setMode(null);
+    this.layout();
+    this.requestRender();
+    this.updateChrome();
+    this.toast('Drag the timeline to scrub · tap a clip to edit it · tap the video to play', 3200);
+  }
+
+  /** Leave video mode (back to photos). */
+  private closeVideo() {
+    if (!this.video) return;
+    this.video.dispose();
+    this.video = null;
+    if (this.img) this.g.destroy(this.img.thumbT);
+    this.img = null;
+    this.pipe.invalidate();
+    this.appEl.classList.remove('video');
+    this.buildTools();
+  }
+
+  private videoHost(): VideoHost {
+    return {
+      g: this.g,
+      pipe: this.pipe,
+      canvas: this.canvas,
+      state: () => this.state,
+      commit: () => this.commit(),
+      requestRender: () => this.requestRender(),
+      frameChanged: (src, target, resized) => {
+        if (!this.img || resized) {
+          if (this.img) this.g.destroy(this.img.thumbT);
+          const kt = Math.min(1, 200 / Math.max(src.w, src.h));
+          const thumbT = this.pipe.resize(src, Math.round(src.w * kt), Math.round(src.h * kt));
+          this.img = {
+            full: src, preview: src, thumb: { tex: thumbT.tex, w: thumbT.w, h: thumbT.h, linear: false },
+            previewT: target, thumbT, name: 'Video', info: this.video?.info ?? 'Video',
+          };
+          this.thumbsKey = '';
+          this.analysisCache = null;
+        }
+        this.pipe.invalidate();
+        if (resized) {
+          this.syncAtlasSize();
+          requestAnimationFrame(() => this.layout());
+        }
+        this.requestRender();
+      },
+      toast: (m, ms) => this.toast(m, ms),
+      busy: (m) => this.busy(m),
+      refreshSection: () => this.refreshSection(),
+      openTool: (id) => {
+        const t = id ? this.toolList().find((x) => x.id === id) ?? null : null;
+        if (t !== this.tool) this.setMode(t);
+        else this.refreshSection();
+      },
+      toolId: () => this.tool?.id ?? null,
+      chip: (row, c, on, onClick) => this.chip(row, c, on, onClick),
+      tile: (row, icon, label, cls, onClick) => this.tile(row, icon, label, cls, onClick),
+      renderFull: (src, w, h) => {
+        this.syncOverlay(this.state);
+        this.pipe.brushTex = this.atlas.tex;
+        this.pipe.invalidate();
+        this.pipe.render(src, this.state, w, h, null);
+      },
+      save: async (blob, name) => {
+        const how = await saveOrShare(blob, name, (f) => this.busy(`Saving ${Math.round(f * 100)}%`));
+        if (how === 'shown') this.toast('Exported (downloads are blocked in this preview)', 3000);
+        else if (how === 'gallery') this.toast('Saved to your gallery · Movies/Lumen', 2600);
+        else if (how === 'shared') this.toast('Shared');
+        else this.toast(`Saved · Downloads/${name}`, 3000);
+      },
+    };
+  }
+
+  /** Looks thumbnails in a video come from the frame on screen. */
+  private refreshVideoThumb() {
+    if (!this.video || !this.img) return;
+    this.g.destroy(this.img.thumbT);
+    const src = this.img.preview;
+    const kt = Math.min(1, 200 / Math.max(src.w, src.h));
+    const thumbT = this.pipe.resize(src, Math.round(src.w * kt), Math.round(src.h * kt));
+    this.img.thumbT = thumbT;
+    this.img.thumb = { tex: thumbT.tex, w: thumbT.w, h: thumbT.h, linear: false };
+    this.thumbsKey = '';
+  }
+
+  private toolList(): ToolDef[] {
+    return this.video ? [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id))] : TOOLS;
   }
 
   pickPhoto() {
@@ -1011,7 +1179,8 @@ export class App {
       el.classList.remove('hidden');
       el.classList.add('over', 'ready');
       resume.hidden = false;
-      resume.textContent = 'Back to photo';
+      resume.textContent = this.video ? 'Back to video' : 'Back to photo';
+      if (this.video?.player.playing) this.video.togglePlay();
       resume.onclick = () => this.showHome(false);
     } else {
       el.classList.remove('over');
@@ -1044,7 +1213,7 @@ export class App {
       this.requestRender();
       return;
     }
-    if (!this.zv.on && this.kind() !== 'crop' && this.prepareOrig()) {
+    if (!this.zv.on && this.kind() !== 'crop' && !this.video && this.prepareOrig()) {
       this.cmpOn = true;
       orig.classList.add('on');
       return;
@@ -1096,15 +1265,15 @@ export class App {
     ($('btnExport') as HTMLButtonElement).disabled = !has;
     $('tools').classList.toggle('disabled', !has);
     document.querySelectorAll<HTMLButtonElement>('#tools button').forEach((b) => {
-      const t = TOOLS.find((x) => x.id === b.dataset.id)!;
-      b.classList.toggle('mod', this.toolModified(t));
+      const t = this.toolList().find((x) => x.id === b.dataset.id);
+      if (t) b.classList.toggle('mod', this.toolModified(t));
     });
   }
 
   private buildTools() {
     const nav = $('tools');
     nav.innerHTML = '';
-    for (const t of TOOLS) {
+    for (const t of this.toolList()) {
       const b = document.createElement('button');
       b.dataset.id = t.id;
       b.innerHTML = `${t.icon}<span>${t.label}</span>`;
@@ -1126,7 +1295,8 @@ export class App {
     const tabs = $('allTabs');
     const grid = $('allGrid');
     const groups: Record<string, string[]> = {
-      all: TOOLS.map((t) => t.id),
+      all: this.toolList().map((t) => t.id),
+      ...(this.video ? { video: this.video.tools.map((t) => t.id) } : {}),
       tone: ['light', 'color', 'curves', 'hsl', 'grade', 'bw'],
       fix: ['heal', 'crop', 'detail', 'masks'],
       style: ['looks', 'double', 'leak', 'blur', 'grain', 'halation', 'glow', 'vignette', 'film'],
@@ -1145,7 +1315,7 @@ export class App {
     }
     grid.innerHTML = '';
     groups[this.allTab].forEach((id, i) => {
-      const t = TOOLS.find((x) => x.id === id);
+      const t = this.toolList().find((x) => x.id === id);
       if (!t) return;
       const b = document.createElement('button');
       b.innerHTML = `${t.icon}<span>${t.label}</span>`;
@@ -1240,7 +1410,9 @@ export class App {
       sec.classList.add('enter');
       setTimeout(() => sec.classList.remove('enter'), 420);
     }
-    $('title').textContent = t ? t.label : this.img?.info ?? '';
+    $('title').textContent = t ? t.label : this.video ? this.video.info : this.img?.info ?? '';
+    if (t?.kind === 'video' && t !== prev) this.video?.onOpenTool(t.id);
+    if (t?.kind === 'looks' && this.video) this.refreshVideoThumb();
     if (prev?.kind === 'crop' || t?.kind === 'crop') this.zoom = { s: 1, x: 0, y: 0 };
     if (t?.kind === 'curves' && !this.sub.curves) this.sub.curves = 'rgb';
     this.curve.channel = (this.sub.curves ?? 'rgb') as keyof Curves;
@@ -1281,7 +1453,7 @@ export class App {
     const t = this.tool;
     this.updateChrome();
     if (!t) return;
-    $('secReset').classList.toggle('gone', !this.toolModified(t));
+    $('secReset').classList.toggle('gone', t.kind === 'video' || !this.toolModified(t));
     const id = this.currentParam();
     $('pill').classList.toggle('gone', !id);
     $('slider').classList.toggle('gone', !id);
@@ -1318,6 +1490,7 @@ export class App {
     const row = $('subs');
     row.innerHTML = '';
     const t = this.tool!;
+    if (t.kind === 'video') return this.video?.buildSubs(t, row);
     if (t.kind === 'looks') return this.buildLooks();
     if (t.kind === 'masks') return this.buildMaskList();
     if (t.kind === 'leak') return this.buildLeaks();
@@ -1383,6 +1556,7 @@ export class App {
     const row = $('acts');
     row.innerHTML = '';
     const t = this.tool!;
+    if (t.kind === 'video') return this.video?.buildActs(t, row);
     if (t.kind === 'masks') return this.buildMaskActs();
     if (t.kind === 'heal') return this.buildHealActs();
     if (t.kind === 'double') return this.buildLayerActs('dx');
@@ -1645,7 +1819,7 @@ export class App {
   private bindGestures() {
     const st = this.stage;
     const pts = new Map<number, { x: number; y: number }>();
-    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx' | 'vig' | 'shape' | 'lshape';
+    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx' | 'vig' | 'shape' | 'lshape' | 'vtext';
     let mode: Mode = 'none';
     let sx = 0, sy = 0, startIdx = 0, lastStep = 0;
     let lastX = 0, lastT = 0;
@@ -1733,6 +1907,10 @@ export class App {
       if (k === 'heal') {
         mode = 'heal';
         this.healDown(e);
+        return;
+      }
+      if (this.video?.stageDown(e, this.frame.getBoundingClientRect())) {
+        mode = 'vtext';
         return;
       }
       if ((k === 'double' || k === 'leak') && this.layerOf(this.layerKey()!)) {
@@ -1843,6 +2021,7 @@ export class App {
       if (mode === 'lshape' && pts.size >= 2 && this.lshape0) return this.layerPinch(pts);
       if (mode === 'pick') return this.pickAt(e);
       if (mode === 'heal') return this.healMove(e);
+      if (mode === 'vtext') return this.video?.stageMove(e, this.frame.getBoundingClientRect());
       if (mode === 'pan') {
         this.zoom = { ...this.zoom, x: pan0.x + e.clientX - sx, y: pan0.y + e.clientY - sy };
         this.applyZoom();
@@ -1968,6 +2147,8 @@ export class App {
         this.layerUp();
       } else if (mode === 'pick') {
         this.endPick(true);
+      } else if (mode === 'vtext') {
+        this.video?.stageUp();
       } else if (mode === 'heal') {
         this.healUp();
       } else if (mode === 'compare') {
@@ -2006,7 +2187,8 @@ export class App {
         } else {
           lastTap = { t: now, x: e.clientX, y: e.clientY };
           clearTimeout(tapTimer);
-          tapTimer = window.setTimeout(() => this.toggleUI(), 260);
+          // a tap plays / pauses a video; on a photo it hides the controls
+          tapTimer = window.setTimeout(() => (this.video ? this.video.togglePlay() : this.toggleUI()), 260);
         }
       }
       mode = 'none';
@@ -3530,9 +3712,11 @@ export class App {
 
   /** Back: drop this section's changes. */
   private cancelSection() {
+    if (this.tool?.kind === 'video') return this.setMode(null);
     if (this.sectionStart) {
       const before = JSON.parse(this.sectionStart) as EditState;
-      const changed = this.sectionStart !== JSON.stringify(this.state);
+      if (this.video) before.video = this.state.video;
+      const changed = JSON.stringify(before) !== JSON.stringify(this.state);
       this.state = before;
       this.maskSel = Math.min(this.maskSel, this.state.masks.length - 1);
       this.syncAtlasSize();
@@ -4003,13 +4187,17 @@ export class App {
 
   private bindKeys() {
     window.addEventListener('keydown', (e) => {
-      if (!this.img || (e.target as HTMLElement).tagName === 'INPUT') return;
+      if (!this.img || /^(INPUT|TEXTAREA)$/.test((e.target as HTMLElement).tagName)) return;
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         this.restore(this.hIdx + (e.shiftKey ? 1 : -1));
         return;
       }
       if (e.key === '\\') return this.setCompare(!this.compare);
+      if (e.key === ' ' && this.video && (e.target as HTMLElement).tagName !== 'TEXTAREA') {
+        e.preventDefault();
+        return this.video.togglePlay();
+      }
       if (e.key === 'Escape' && this.tool) return this.setMode(null);
       if (e.key === 'h') return this.toggleUI();
       const id = this.currentParam();
@@ -4043,6 +4231,7 @@ export class App {
     const sheet = $('sheet');
     $('btnExport').onclick = () => {
       if (!this.img) return;
+      if (this.video) return this.video.openExport();
       this.buildExportSizes();
       sheet.classList.add('on');
     };
@@ -4262,6 +4451,36 @@ function coalesced(e: PointerEvent): PointerEvent[] {
   return list.length ? list : [e];
 }
 
+/** What changed on the timeline, in a word or two. */
+function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditState['video']>): string {
+  const j = (x: unknown) => JSON.stringify(x);
+  if (b.clips.length > a.clips.length) {
+    const fresh = b.clips.filter((c) => !a.clips.some((x) => x.id === c.id));
+    if (fresh.length === 1) {
+      const n = fresh[0];
+      // a split: the new clip starts where an existing clip of the same source now ends
+      if (b.clips.some((c) => c.id !== n.id && c.src === n.src && Math.abs(c.out - n.in) < 1e-6)) return 'Split';
+      if (b.clips.some((c) => c.id !== n.id && c.src === n.src && c.in === n.in && c.out === n.out)) return 'Copy';
+    }
+    return fresh.length > 1 ? 'Clips added' : 'Clip added';
+  }
+  if (b.clips.length < a.clips.length) {
+    // undoing a split or copy reads as that, not as a deletion
+    const r = videoChange(b, a);
+    return r === 'Split' || r === 'Copy' ? r : 'Clip deleted';
+  }
+  if (j(a.clips.map((c) => c.id)) !== j(b.clips.map((c) => c.id))) return 'Clips moved';
+  for (let i = 0; i < b.clips.length; i++) {
+    const x = a.clips[i], y = b.clips[i];
+    if (x.speed !== y.speed) return 'Speed';
+    if (x.vol !== y.vol) return y.vol === 0 ? 'Mute' : 'Volume';
+    if (x.in !== y.in || x.out !== y.out) return 'Trim';
+  }
+  if (j(a.texts) !== j(b.texts)) return b.texts.length > a.texts.length ? 'Text added' : b.texts.length < a.texts.length ? 'Text deleted' : 'Text';
+  if (j(a.music) !== j(b.music)) return !a.music ? 'Music added' : !b.music ? 'Music removed' : 'Music';
+  return 'Canvas';
+}
+
 /** A short name for what differs between two saved states (for the undo badge and history). */
 function describeChange(a: string, b: string): string {
   try {
@@ -4284,6 +4503,7 @@ function describeChange(a: string, b: string): string {
       if (j(A.geo) !== j(B.geo)) return 'Crop';
       if (j(A.overlay) !== j(B.overlay)) return 'Double';
       if (j(A.leak) !== j(B.leak)) return 'Leak';
+      if (A.video && B.video && j(A.video) !== j(B.video)) return videoChange(A.video, B.video);
       return '';
     };
     if (ids.length === 1) {

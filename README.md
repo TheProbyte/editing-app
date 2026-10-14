@@ -5,13 +5,35 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 
 ## Using it
 
-- **Open** a photo (or **Take photo** — RAW/DNG in the Android app). The home button returns to the start page.
+- **Open media**: one photo opens the photo editor; a video (or several files) opens the **video editor**.
+  **Take photo** shoots RAW/DNG in the Android app. The home button returns to the start page.
 - **Tool bar**: tap a tool, or **swipe up** on the bar for a grid of every tool.
 - In a section: **swipe ↔ on the photo** or **drag the slider** to change the value (it sticks at 0 for a
   moment so it's easy to land back on it; double-tap the slider to reset). **Swipe ↕** to pick the adjustment.
   **✓** keeps it, **Back** (or the Android back gesture) drops the section's changes.
 - **Tap** the photo to hide/show the controls, **hold** to see the original, **pinch** to zoom (to pixel level,
   with a pixel grid), **one finger** pans when zoomed, **double-tap** zooms in/out.
+
+## Video
+
+Pick one or more videos (and photos, as 3-second stills) with **Open media**. Every look and adjustment
+from the photo editor applies to the whole video; the timeline sits above the tool bar.
+
+- **Timeline:** drag to scrub (flick to coast), pinch to zoom, tap a clip to select it, drag its yellow
+  handles to trim, hold a clip to pick it up and move it. **+** adds more clips (after the selected one).
+- **Edit:** Split at the playhead, Copy, Mute, Delete, **Speed** (0.25–4×) and **Volume** on the slider.
+- **Canvas:** Original, 9:16, 4:5, 1:1 or 16:9; Fit (with a blurred, black or white background) or Fill.
+- **Text:** titles with Pixel / Sans / Serif type, colours and a box; drag them on the video, and drag or
+  trim their bar in the timeline to set when they show.
+- **Music:** add a song (fades in/out), set its volume and where in the song to start.
+- **Play:** the play button or a tap on the video. Picture and sound share one clock, and the picture
+  allows for Bluetooth headphone delay.
+- **Export:** 720p / 1080p / 1440p / 4K (up to the source), 24 / 30 / 60 fps, MP4 with the phone's hardware
+  encoder (H.264 where available, else HEVC / VP9 / AV1) and AAC or Opus sound; saved to Movies/Lumen in the
+  Android app. Each frame goes through the same GPU pipeline as the preview, at full size.
+- Undo, redo and the history list cover timeline edits too.
+- Built on **Mediabunny** (demuxing, frame-exact decoding and MP4 muxing through WebCodecs), loaded only
+  when a video is opened. Video projects aren't autosaved yet.
 
 ## Features
 
@@ -122,4 +144,5 @@ Code map:
   `migan-onnx` npm package. **LaMa** (Samsung AI Center, Apache-2.0) is fetched on request. The weights were trained on Places2 / FFHQ research datasets, so treat this as a
   personal-use app.
 - **LibRaw** (via `libraw-wasm`), **MediaPipe Tasks Vision** (Apache-2.0) for subject / people selection,
-  **ONNX Runtime Web** (MIT), **fflate** (MIT) for PNG compression, Pixelify Sans and Silkscreen (OFL).
+  **ONNX Runtime Web** (MIT), **fflate** (MIT) for PNG compression, **Mediabunny** (MPL-2.0) for video,
+  Pixelify Sans and Silkscreen (OFL).

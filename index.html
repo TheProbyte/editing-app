@@ -43,7 +43,7 @@
           <img class="logo" src="icon.svg" alt="" />
           <h1>LUMEN</h1>
           <div class="start-actions">
-            <button class="btn-accent big" id="btnOpenBig">Open photo</button>
+            <button class="btn-accent big" id="btnOpenBig">Open media</button>
             <button class="btn-dark big" id="btnCamera">Take photo</button>
             <button class="btn-dark big" id="btnResume" hidden>Continue editing</button>
           </div>
@@ -62,6 +62,15 @@
 
       <footer id="dock" class="ui">
         <div id="grab" aria-hidden="true"><i></i></div>
+        <div id="timeline">
+          <div class="tl-bar">
+            <button class="round" id="tlPlay" aria-label="Play"></button>
+            <span id="tlTime"></span>
+            <span class="tl-sp"></span>
+            <button class="round" id="tlAdd" aria-label="Add clips"></button>
+          </div>
+          <div id="tlTrack"></div>
+        </div>
         <nav id="tools"></nav>
         <section id="section">
           <div id="subs" class="row"></div>
@@ -86,7 +95,7 @@
       </div>
     </div>
 
-    <div id="busy"><svg class="sun" viewBox="0 0 20 22" shape-rendering="crispEdges" aria-hidden="true"><rect class="s" style="--i:12" x="9" y="1" width="2" height="1" fill="#fff3b8"/><rect class="s" style="--i:11" x="6" y="2" width="8" height="1" fill="#fff3b8"/><rect class="s" style="--i:10" x="5" y="3" width="10" height="1" fill="#ffdf5c"/><rect class="s" style="--i:9" x="4" y="4" width="12" height="1" fill="#ffdf5c"/><rect class="s" style="--i:8" x="3" y="5" width="14" height="1" fill="#ffdf5c"/><rect class="s" style="--i:7" x="3" y="6" width="14" height="1" fill="#ffc83d"/><rect class="s" style="--i:6" x="3" y="7" width="14" height="1" fill="#ffc83d"/><rect class="s" style="--i:5" x="2" y="8" width="16" height="1" fill="#ffc83d"/><rect class="s" style="--i:4" x="2" y="9" width="16" height="1" fill="#ffad26"/><rect class="s" style="--i:3" x="3" y="11" width="14" height="1" fill="#ffad26"/><rect class="s" style="--i:2" x="3" y="12" width="14" height="1" fill="#ffad26"/><rect class="s" style="--i:1" x="5" y="14" width="10" height="1" fill="#ff931a"/><rect class="s" style="--i:0" x="9" y="16" width="2" height="1" fill="#ff931a"/><rect x="1" y="18" width="18" height="1" fill="#f4f4f2"/><rect x="5" y="20" width="10" height="1" fill="#5e5e5a"/></svg><div class="msg"></div></div>
+    <div id="busy"><svg class="sun" viewBox="0 0 20 22" shape-rendering="crispEdges" aria-hidden="true"><rect class="s" style="--i:12" x="9" y="1" width="2" height="1" fill="#fff3b8"/><rect class="s" style="--i:11" x="6" y="2" width="8" height="1" fill="#fff3b8"/><rect class="s" style="--i:10" x="5" y="3" width="10" height="1" fill="#ffdf5c"/><rect class="s" style="--i:9" x="4" y="4" width="12" height="1" fill="#ffdf5c"/><rect class="s" style="--i:8" x="3" y="5" width="14" height="1" fill="#ffdf5c"/><rect class="s" style="--i:7" x="3" y="6" width="14" height="1" fill="#ffc83d"/><rect class="s" style="--i:6" x="3" y="7" width="14" height="1" fill="#ffc83d"/><rect class="s" style="--i:5" x="2" y="8" width="16" height="1" fill="#ffc83d"/><rect class="s" style="--i:4" x="2" y="9" width="16" height="1" fill="#ffad26"/><rect class="s" style="--i:3" x="3" y="11" width="14" height="1" fill="#ffad26"/><rect class="s" style="--i:2" x="3" y="12" width="14" height="1" fill="#ffad26"/><rect class="s" style="--i:1" x="5" y="14" width="10" height="1" fill="#ff931a"/><rect class="s" style="--i:0" x="9" y="16" width="2" height="1" fill="#ff931a"/><rect x="1" y="18" width="18" height="1" fill="#f4f4f2"/><rect x="5" y="20" width="10" height="1" fill="#5e5e5a"/></svg><div class="msg"></div><button class="btn-dark" id="busyCancel" hidden>Cancel</button></div>
 
     <div id="sheet" class="sheet">
       <div class="sheet-card">
@@ -108,9 +117,37 @@
       </div>
     </div>
 
+    <div id="vexSheet" class="sheet">
+      <div class="sheet-card">
+        <h2>Export video</h2>
+        <div class="opt-label">Resolution</div>
+        <div class="seg" id="vxRes"></div>
+        <div class="opt-label">Frame rate</div>
+        <div class="seg" id="vxFps"></div>
+        <div class="opt-label">Quality</div>
+        <div class="seg" id="vxQ"></div>
+        <p class="hint" id="vxHint"></p>
+        <div class="sheet-actions">
+          <button class="btn-dark" id="vxCancel">Cancel</button>
+          <button class="btn-accent" id="vxGo">Save video</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="textSheet" class="sheet">
+      <div class="sheet-card">
+        <h2>Text</h2>
+        <textarea id="textInput" rows="2" maxlength="140" placeholder="Type something"></textarea>
+        <div class="sheet-actions">
+          <button class="btn-dark" id="textCancel">Cancel</button>
+          <button class="btn-accent" id="textDone">Done</button>
+        </div>
+      </div>
+    </div>
+
     <div id="moreSheet" class="sheet">
       <div class="sheet-card list">
-        <button data-a="open">Open photo</button>
+        <button data-a="open">Open media</button>
         <button data-a="camera">Take photo</button>
         <button data-a="aimodel">AI fill model <span class="state" id="fillModelState">Ask</span></button>
         <button data-a="hist">Histogram <span class="state" id="histState">Off</span></button>
@@ -172,7 +209,9 @@
       </div>
     </div>
 
-    <input type="file" id="file" accept="image/*" hidden />
+    <input type="file" id="file" accept="image/*,video/*" multiple hidden />
+    <input type="file" id="fileAdd" accept="image/*,video/*" multiple hidden />
+    <input type="file" id="fileAudio" accept="audio/*" hidden />
     <input type="file" id="fileOverlay" accept="image/*" hidden />
     <script type="module" src="/src/main.ts"></script>
   </body>

@@ -14,7 +14,7 @@ export interface ToolDef {
   id: string;
   label: string;
   icon: string;
-  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur' | 'heal' | 'double' | 'leak';
+  kind: 'params' | 'looks' | 'curves' | 'crop' | 'masks' | 'blur' | 'heal' | 'double' | 'leak' | 'video';
   subs?: Chip[];
   params: (sub: string) => string[];
   /** quick presets / one-tap actions shown in the section */

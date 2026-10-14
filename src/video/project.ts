@@ -15,7 +15,54 @@ export interface VClip {
   speed: number;
   /** 0 … 2 (1 = as recorded) */
   vol: number;
+  /** framing in the project frame (when there are no keyframes) */
+  tf?: Framing;
+  /** framing keyframes, at source times (so they stay on the same moment when trimmed) */
+  kf?: Keyframe[];
 }
+
+/** zoom (1 = as fitted), offset in fractions of the frame, rotation in degrees */
+export interface Framing {
+  z: number;
+  x: number;
+  y: number;
+  r: number;
+}
+export interface Keyframe extends Framing {
+  /** source seconds */
+  s: number;
+}
+export const NO_FRAMING: Framing = { z: 1, x: 0, y: 0, r: 0 };
+
+const easeInOut = (f: number) => (f < 0.5 ? 4 * f * f * f : 1 - Math.pow(-2 * f + 2, 3) / 2);
+
+/** The clip's framing at source time s: eased between keyframes, held before / after them. */
+export function framingAt(c: VClip, s: number): Framing {
+  const K = c.kf;
+  if (!K?.length) return c.tf ?? NO_FRAMING;
+  const pick = (k: Keyframe): Framing => ({ z: k.z, x: k.x, y: k.y, r: k.r });
+  if (s <= K[0].s) return pick(K[0]);
+  const last = K[K.length - 1];
+  if (s >= last.s) return pick(last);
+  let i = 0;
+  while (i < K.length - 2 && K[i + 1].s < s) i++;
+  const a = K[i], b = K[i + 1];
+  const f = easeInOut((s - a.s) / Math.max(1e-6, b.s - a.s));
+  // zoom eases in log space, so zooming in and out feel the same speed
+  return {
+    z: Math.exp(Math.log(a.z) + (Math.log(b.z) - Math.log(a.z)) * f),
+    x: a.x + (b.x - a.x) * f,
+    y: a.y + (b.y - a.y) * f,
+    r: a.r + (b.r - a.r) * f,
+  };
+}
+
+/** Background gradients: [top colour, bottom colour, angle in degrees]. */
+export const GRADIENTS: [string, string, number][] = [
+  ['#ffc83d', '#ff5a4a', 160], ['#1d2b64', '#f8cdda', 180], ['#0f2027', '#2c5364', 135], ['#ff9a8b', '#ff6a88', 200],
+  ['#43cea2', '#185a9d', 150], ['#141414', '#3a3a36', 180], ['#e0c3fc', '#8ec5fc', 135], ['#f7971e', '#ffd200', 90],
+];
+export const BG_COLORS = ['#000000', '#ffffff', '#141414', '#f2efe8', '#ffc83d', '#ff5a4a', '#5aa8ff', '#7fe0a0', '#c38bff', '#ff9ec7'];
 
 export interface VText {
   id: string;
@@ -50,7 +97,14 @@ export interface VideoProject {
   music: VMusic | null;
   aspect: VAspect;
   fit: 'fit' | 'fill';
-  bg: 'black' | 'blur' | 'white';
+  /** what shows around the picture ('black' / 'white' are from before colours) */
+  bg: 'blur' | 'color' | 'gradient' | 'image' | 'black' | 'white';
+  bgColor?: string;
+  bgGrad?: number;
+  /** media id of the photo used as background */
+  bgImg?: string | null;
+  /** softness of a blurred / photo background, 0 … 100 */
+  bgBlur?: number;
 }
 
 export const isVideoFile = (f: File) => f.type.startsWith('video/') || /\.(mp4|mov|m4v|webm|mkv|3gp)$/i.test(f.name);

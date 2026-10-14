@@ -10,11 +10,13 @@ import { ICONS } from '../ui/icons';
 import { tick } from '../ui/haptics';
 import { MediaLib, isAudioFile, isVideoFile, type Media } from './media';
 import { Player, type Frame } from './player';
-import { Compositor, type FrameSource } from './compose';
+import { Compositor, type FrameSource, type GpuFrame, type Placement } from './compose';
 import { Timeline, TIMELINE_H, type Sel } from './timeline';
 import { exportVideo } from './exporter';
+import { AudioEngine } from './audio';
 import {
   IMAGE_SECONDS, MIN_CLIP, clipAt, clipLen, fmtTime, frameAspect, frameSize, layout, newProject, uid,
+  framingAt, GRADIENTS, BG_COLORS, NO_FRAMING, type Framing,
   type VAspect, type VClip, type VText, type VideoProject,
 } from './project';
 import type { VideoSample } from 'mediabunny';
@@ -60,10 +62,16 @@ const DEFS: Record<string, ParamDef> = {
   'vd.tsize': { id: 'vd.tsize', label: 'Size', min: 2, max: 30, def: 8, fmt: (v) => String(Math.round(v)) },
   'vd.mvol': { id: 'vd.mvol', label: 'Volume', min: 0, max: 200, def: 70, fmt: (v) => `${Math.round(v)}%` },
   'vd.min': { id: 'vd.min', label: 'Start at', min: 0, max: 600, def: 0, swipe: 60, fmt: (v) => fmtTime(v) },
+  'vd.zoom': { id: 'vd.zoom', label: 'Zoom', min: 25, max: 400, def: 100, swipe: 150, fmt: (v) => `${Math.round(v)}%` },
+  'vd.px': { id: 'vd.px', label: 'Position X', min: -100, max: 100, def: 0, fmt: (v) => String(Math.round(v)) },
+  'vd.py': { id: 'vd.py', label: 'Position Y', min: -100, max: 100, def: 0, fmt: (v) => String(Math.round(v)) },
+  'vd.rot': { id: 'vd.rot', label: 'Rotate', min: -180, max: 180, def: 0, swipe: 90, fmt: (v) => `${Math.round(v)}°` },
+  'vd.bgblur': { id: 'vd.bgblur', label: 'Blur', min: 0, max: 100, def: 70, fmt: (v) => String(Math.round(v)) },
 };
 
 export class VideoMode {
   lib = new MediaLib();
+  audio: AudioEngine;
   player: Player;
   private comp: Compositor;
   private timeline: Timeline;
@@ -71,7 +79,10 @@ export class VideoMode {
   private exportT: Target | null = null;
   private imgTex = new Map<string, WebGLTexture>();
   /** what's in the frame now, to re-place it when the canvas settings change */
-  private last: { src: FrameSource; media: string } | null = null;
+  private last: { src: FrameSource; media: string; clip: string; s: number } | null = null;
+  private lastClip() {
+    return this.last ? this.project.clips.find((c) => c.id === this.last!.clip) ?? null : null;
+  }
   private sel: Sel = null;
   exporting = false;
   private cancelExport = false;
@@ -79,7 +90,10 @@ export class VideoMode {
 
   constructor(private h: VideoHost) {
     this.comp = new Compositor(h.g);
-    this.player = new Player(this.lib, () => this.project);
+    this.audio = new AudioEngine(this.lib);
+    this.player = new Player(this.lib, () => this.project, this.audio);
+    // playback copies each decoded frame to the GPU the moment it arrives
+    this.player.upload = (vf) => this.comp.uploadRing(vf, vf.displayWidth, vf.displayHeight);
     this.player.onFrame = (f) => this.showFrame(f);
     this.player.onTime = () => this.onTime();
     this.player.onEnd = () => this.syncPlayButton();
@@ -101,7 +115,7 @@ export class VideoMode {
       selection: () => this.sel,
     }, this.lib);
     $('tlTrack').style.height = TIMELINE_H + 'px';
-    this.lib.onThumbs = () => this.timeline.draw();
+    this.lib.onThumbs = () => this.timeline.thumbsChanged();
     const vt = (id: string, label: string, icon: string): ToolDef => ({ id, label, icon, kind: 'video', params: () => this.params(id) });
     this.tools = [vt('vclip', 'Edit', ICONS.clip), vt('vcanvas', 'Canvas', ICONS.canvas), vt('vtext', 'Text', ICONS.text), vt('vmusic', 'Music', ICONS.music)];
     this.bindUI();
@@ -172,6 +186,7 @@ export class VideoMode {
       this.h.busy(files.length > 1 ? `Opening ${k + 1} of ${files.length}` : 'Opening');
       try {
         const m = await this.lib.add(f);
+        this.audio.warm(m);
         if (m.kind === 'audio') continue;
         const c: VClip = { id: uid(), src: m.id, kind: m.kind === 'image' ? 'image' : 'video', in: 0, out: m.kind === 'image' ? IMAGE_SECONDS : m.duration, speed: 1, vol: m.audio ? 1 : 0 };
         added.push(c);
@@ -184,6 +199,7 @@ export class VideoMode {
     if (!added.length) return;
     p.clips.splice(at, 0, ...added);
     this.h.commit();
+    this.remix();
     this.ensureFrame();
     if (first) this.timeline.fitAll();
     const T = layout(p).starts[at] + 0.001;
@@ -199,8 +215,10 @@ export class VideoMode {
     try {
       const m = await this.lib.add(f);
       if (!m.audio) throw new Error('No sound in that file');
+      this.audio.warm(m);
       this.project.music = { src: m.id, name: f.name.replace(/\.[^.]+$/, ''), in: 0, vol: 0.7, fade: true };
       this.h.commit();
+      this.remix();
       this.select({ kind: 'music', id: 'music' });
       this.timeline.draw();
     } catch (e) {
@@ -224,24 +242,99 @@ export class VideoMode {
     return frameSize(frameAspect(this.project, this.firstAspect()), long);
   }
 
+  /**
+   * The preview frame's long side: the footage's own size, up to 1280. 480p / 720p clips
+   * aren't blown up first (that would be 2× the pixels to push through every frame).
+   */
+  private previewLong() {
+    let L = 0;
+    for (const c of this.project.clips) {
+      const m = this.lib.get(c.src);
+      if (m && m.kind === 'video') L = Math.max(L, m.w, m.h);
+    }
+    if (!L) L = PREVIEW_LONG; // only stills
+    return Math.max(480, Math.min(PREVIEW_LONG, Math.round(L / 2) * 2));
+  }
+
+  // ---- placing a frame: the background, and the clip's framing at that moment
+
+  private gradTex(i: number, w: number, h: number) {
+    const [a, b, ang] = GRADIENTS[i % GRADIENTS.length];
+    const W = 256, H = Math.max(16, Math.round((256 * h) / w));
+    return this.comp.canvasTexture(`grad${i}:${W}x${H}`, () => {
+      const c = document.createElement('canvas');
+      c.width = W;
+      c.height = H;
+      const x = c.getContext('2d')!;
+      const r = (ang * Math.PI) / 180, L = Math.hypot(W, H) / 2;
+      const g = x.createLinearGradient(W / 2 - Math.sin(r) * L, H / 2 + Math.cos(r) * L, W / 2 + Math.sin(r) * L, H / 2 - Math.cos(r) * L);
+      g.addColorStop(0, b);
+      g.addColorStop(1, a);
+      x.fillStyle = g;
+      x.fillRect(0, 0, W, H);
+      return c;
+    });
+  }
+
+  private imageGpu(m: Media): GpuFrame | null {
+    if (!m.bitmap) return null;
+    let t = this.imgTex.get(m.id);
+    if (!t) this.imgTex.set(m.id, (t = this.comp.imageTexture(m.bitmap)));
+    return { tex: t, w: m.bitmap.width, h: m.bitmap.height };
+  }
+
+  /** How a frame of `clip` (at source time s) sits in a w×h project frame. */
+  private placement(clip: VClip | null, s: number, w: number, h: number): Placement {
+    const p = this.project;
+    const hex = (c: string): [number, number, number] => {
+      const n = parseInt(c.replace('#', ''), 16);
+      return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
+    };
+    const tf = clip ? framingAt(clip, s) : undefined;
+    const kind = p.bg ?? 'blur';
+    let bg: Placement['bg'];
+    if (kind === 'black' || kind === 'white' || kind === 'color') {
+      bg = { kind: 'color', color: hex(kind === 'black' ? '#000000' : kind === 'white' ? '#ffffff' : p.bgColor ?? '#000000'), blur: 0, dim: 1 };
+    } else if (kind === 'gradient') {
+      bg = { kind: 'tex', color: [0, 0, 0], tex: this.gradTex(p.bgGrad ?? 0, w, h), blur: 0, dim: 1 };
+    } else if (kind === 'image') {
+      const m = p.bgImg ? this.lib.get(p.bgImg) : null;
+      const tex = m ? this.imageGpu(m) : null;
+      bg = tex ? { kind: 'tex', color: [0, 0, 0], tex, blur: (p.bgBlur ?? 0) / 100, dim: 1 } : { kind: 'color', color: [0, 0, 0], blur: 0, dim: 1 };
+    } else bg = { kind: 'blur', color: [0, 0, 0], blur: (p.bgBlur ?? 70) / 100, dim: 0.72 };
+    return { fit: p.fit, bg, tf };
+  }
+
+  /** Timeline start of a clip. */
+  private startOf(clip: VClip) {
+    const p = this.project;
+    return layout(p).starts[p.clips.indexOf(clip)] ?? 0;
+  }
+
+  /** Source time of `clip` at timeline time T. */
+  private srcTime(clip: VClip, T: number) {
+    return Math.min(clip.out, Math.max(clip.in, clip.in + (T - this.startOf(clip)) * clip.speed));
+  }
+
   /** (Re)make the project frame at the preview size. */
   ensureFrame() {
-    const { w, h } = this.dims(PREVIEW_LONG);
+    const { w, h } = this.dims(this.previewLong());
     const resized = !this.frameT || this.frameT.w !== w || this.frameT.h !== h;
     if (resized) {
       if (this.frameT) this.h.g.destroy(this.frameT);
       this.frameT = this.h.g.acquire(w, h, false);
-      this.comp.place(this.last?.src ?? null, this.frameT, this.project);
+      this.comp.place(this.last?.src ?? null, this.frameT, this.placement(this.lastClip(), this.last?.s ?? 0, w, h));
     }
     this.h.frameChanged({ tex: this.frameT!.tex, w, h, linear: false }, this.frameT!, resized);
   }
 
-  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true, bitmap?: ImageBitmap): FrameSource {
+  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true, bitmap?: ImageBitmap, pre?: GpuFrame): FrameSource {
     if (m.kind === 'image' && m.bitmap) {
-      let t = this.imgTex.get(m.id);
-      if (!t) this.imgTex.set(m.id, (t = this.comp.imageTexture(m.bitmap)));
-      return { tex: t, w: m.bitmap.width, h: m.bitmap.height, rot: 0, flip: false };
+      const g = this.imageGpu(m)!;
+      return { tex: g.tex, w: g.w, h: g.h, rot: 0, flip: false };
     }
+    const rot = ROT[(m.video?.rotation ?? 0) as 0 | 90 | 180 | 270] ?? 0;
+    if (pre) return { tex: pre.tex, w: pre.w, h: pre.h, rot, flip: false, mip: false };
     if (bitmap) this.comp.upload(bitmap, bitmap.width, bitmap.height, outLong, false);
     else if (sample) {
       const vf = sample.toVideoFrame();
@@ -249,7 +342,7 @@ export class VideoMode {
       vf.close();
     }
     const r = this.comp.rawFrame;
-    return { tex: r.tex, w: r.w, h: r.h, rot: ROT[(m.video?.rotation ?? 0) as 0 | 90 | 180 | 270] ?? 0, flip: false };
+    return { tex: r.tex, w: r.w, h: r.h, rot, flip: false };
   }
 
   private showFrame(f: Frame) {
@@ -258,10 +351,11 @@ export class VideoMode {
       return;
     }
     if (!this.frameT) this.ensureFrame();
-    const src = this.srcFor(f.media, f.sample, PREVIEW_LONG, !this.player.playing, f.bitmap);
+    const src = this.srcFor(f.media, f.sample, this.previewLong(), !this.player.playing, f.bitmap, f.pre);
+    const s = f.sample?.timestamp ?? f.ts ?? (f.t !== undefined ? this.srcTime(f.clip, f.t) : f.clip.in);
     f.sample?.close();
-    this.last = { src, media: f.media.id };
-    this.comp.place(src, this.frameT!, this.project);
+    this.last = { src, media: f.media.id, clip: f.clip.id, s };
+    this.comp.place(src, this.frameT!, this.placement(f.clip, s, this.frameT!.w, this.frameT!.h));
     this.h.pipe.invalidate();
     if (this.player.playing) this.h.renderSync();
     else this.h.requestRender();
@@ -322,7 +416,7 @@ export class VideoMode {
   /** Canvas settings changed: place the current frame again. */
   private replace() {
     this.ensureFrame();
-    if (this.frameT) this.comp.place(this.last?.src ?? null, this.frameT, this.project);
+    if (this.frameT) this.comp.place(this.last?.src ?? null, this.frameT, this.placement(this.lastClip(), this.last?.s ?? 0, this.frameT.w, this.frameT.h));
     this.h.pipe.invalidate();
     this.h.requestRender();
   }
@@ -366,6 +460,16 @@ export class VideoMode {
     this.comp.setText(JSON.stringify([vis, w, h]), w, h, this.paintTexts(vis));
   }
 
+  /** Copy any frame texture to the screen canvas (export with no adjustments). */
+  blitTex(tex: WebGLTexture, w: number, h: number) {
+    this.comp.blit(tex, w, h);
+  }
+
+  /** No adjustments at all: the frame goes to the screen as it is (one copy, no pipeline). */
+  blitFrame(w: number, h: number) {
+    if (this.frameT) this.comp.blit(this.frameT.tex, w, h);
+  }
+
   /** Called by the app around its render of the preview. */
   afterRender(w: number, h: number) {
     this.textLayer(this.player.time, w, h);
@@ -406,9 +510,14 @@ export class VideoMode {
       this.lastLabel = label;
       $('tlTime').innerHTML = label;
     }
-    this.timeline.draw();
-    if (this.player.playing) this.tuneResolution();
-    else this.updateCap();
+    if (this.player.playing) {
+      // in the playback loop: paint with this frame, not one refresh later
+      this.timeline.paintNow();
+      this.tuneResolution();
+    } else {
+      this.timeline.draw();
+      this.updateCap();
+    }
     // titles appearing or going away need a render even on a still frame
     const key = this.visibleTexts(T).map((t) => t.id).join();
     if (key !== this.lastTextKey) {
@@ -416,6 +525,7 @@ export class VideoMode {
       this.h.requestRender();
     }
   }
+
 
   seek(T: number) {
     this.player.seek(T);
@@ -444,7 +554,15 @@ export class VideoMode {
     return this.sel?.kind === 'text' ? this.project.texts.find((t) => t.id === this.sel!.id) ?? null : null;
   }
 
+  /** Rebuild the soundtrack in the background a moment after the last edit. */
+  private remixTimer = 0;
+  private remix() {
+    clearTimeout(this.remixTimer);
+    this.remixTimer = window.setTimeout(() => void this.audio.mix(this.project), 250);
+  }
+
   private changed(commit: boolean) {
+    this.remix();
     // clips are shorter / longer: text past the end comes back in
     const total = layout(this.project).total;
     for (const t of this.project.texts) {
@@ -466,10 +584,12 @@ export class VideoMode {
   /** After undo / redo / history: the timeline and frame follow the restored state. */
   onRestore() {
     const p = this.project;
+    this.remix();
     if (this.sel?.kind === 'clip' && !p.clips.some((c) => c.id === this.sel!.id)) this.sel = null;
     if (this.sel?.kind === 'text' && !p.texts.some((t) => t.id === this.sel!.id)) this.sel = null;
     if (this.sel?.kind === 'music' && !p.music) this.sel = null;
     this.ensureFrame();
+    this.replace(); // background / framing from the restored state, straight away
     this.player.seek(Math.min(this.player.time, layout(p).total));
     this.updateTitle();
     this.onTime();
@@ -565,10 +685,22 @@ export class VideoMode {
     setTimeout(() => input.focus(), 60);
   }
 
-  /** Dragging a title on the video (Text section). Returns true if it took the touch. */
-  private tdrag: { id: string; x0: number; y0: number; fx: number; fy: number; d0?: number; s0?: number } | null = null;
+  /**
+   * Touches on the video. Text section: drag a title. Edit section (on the selected clip):
+   * one finger moves the clip, two pinch to zoom and twist to rotate it; a tap still plays.
+   * Returns true when it takes the touch.
+   */
+  private tdrag: { id: string; x0: number; y0: number; fx: number; fy: number } | null = null;
+  private cdrag: { id: string; x0: number; y0: number; f0: Framing; moved: boolean; pinch?: { d0: number; a0: number; mx: number; my: number } } | null = null;
   stageDown(e: PointerEvent, frameRect: DOMRect) {
-    if (this.h.toolId() !== 'vtext') return false;
+    const tool = this.h.toolId();
+    if (tool === 'vclip') {
+      const c = this.selClip();
+      if (!c || !this.onClip(c)) return false;
+      this.cdrag = { id: c.id, x0: e.clientX, y0: e.clientY, f0: { ...framingAt(c, this.sNow(c)) }, moved: false };
+      return true;
+    }
+    if (tool !== 'vtext') return false;
     const T = this.player.time;
     const u = (e.clientX - frameRect.left) / frameRect.width, v = (e.clientY - frameRect.top) / frameRect.height;
     // the nearest visible title under the finger (generous hit area)
@@ -588,7 +720,44 @@ export class VideoMode {
     tick();
     return true;
   }
+
+  /** A second finger: pinch / twist the selected clip (Edit section). */
+  stagePinchStart(a: { x: number; y: number }, b: { x: number; y: number }) {
+    if (this.h.toolId() !== 'vclip') return false;
+    const c = this.selClip();
+    if (!c || !this.onClip(c)) return false;
+    this.cdrag = {
+      id: c.id, x0: 0, y0: 0, f0: { ...framingAt(c, this.sNow(c)) }, moved: true,
+      pinch: { d0: Math.hypot(a.x - b.x, a.y - b.y) || 1, a0: Math.atan2(b.y - a.y, b.x - a.x), mx: (a.x + b.x) / 2, my: (a.y + b.y) / 2 },
+    };
+    return true;
+  }
+  stagePinch(a: { x: number; y: number }, b: { x: number; y: number }, frameRect: DOMRect) {
+    const d = this.cdrag, P = d?.pinch;
+    const c = d && this.project.clips.find((x) => x.id === d.id);
+    if (!d || !P || !c) return;
+    let r = d.f0.r + ((Math.atan2(b.y - a.y, b.x - a.x) - P.a0) * 180) / Math.PI;
+    r = ((r + 540) % 360) - 180;
+    for (const snap of [0, 90, -90, 180, -180]) if (Math.abs(r - snap) < 3) r = snap;
+    const z = Math.max(0.25, Math.min(4, (d.f0.z * Math.hypot(a.x - b.x, a.y - b.y)) / P.d0));
+    const x = d.f0.x + ((a.x + b.x) / 2 - P.mx) / frameRect.width;
+    const y = d.f0.y + ((a.y + b.y) / 2 - P.my) / frameRect.height;
+    this.setFraming(c, { z: Math.abs(z - 1) < 0.02 ? 1 : z, x, y, r });
+  }
+
   stageMove(e: PointerEvent, frameRect: DOMRect) {
+    const cd = this.cdrag;
+    if (cd && !cd.pinch) {
+      const c = this.project.clips.find((x) => x.id === cd.id);
+      if (!c) return;
+      if (!cd.moved && Math.hypot(e.clientX - cd.x0, e.clientY - cd.y0) < 8) return;
+      cd.moved = true;
+      let x = cd.f0.x + (e.clientX - cd.x0) / frameRect.width, y = cd.f0.y + (e.clientY - cd.y0) / frameRect.height;
+      if (Math.abs(x) < 0.012) x = 0;
+      if (Math.abs(y) < 0.012) y = 0;
+      this.setFraming(c, { x, y });
+      return;
+    }
     const d = this.tdrag;
     const t = d && this.project.texts.find((x) => x.id === d.id);
     if (!d || !t) return;
@@ -599,17 +768,114 @@ export class VideoMode {
     if (Math.abs(t.y - 0.5) < 0.015) t.y = 0.5;
     this.h.requestRender();
   }
+
+  /** A touch handed over to pinch-zooming the view: drop any drag without side effects. */
+  stageCancel() {
+    this.cdrag = null;
+    this.tdrag = null;
+  }
+
   stageUp() {
+    const cd = this.cdrag;
+    if (cd) {
+      this.cdrag = null;
+      if (cd.moved) {
+        this.changed(true);
+        this.h.refreshSection();
+      } else this.togglePlay();
+      return;
+    }
     if (!this.tdrag) return;
     this.tdrag = null;
     this.h.commit();
+  }
+
+
+  // ---- framing and keyframes
+
+  /** Source time of the playhead within clip c (its nearest end if the playhead is elsewhere). */
+  private sNow(c: VClip) {
+    return this.srcTime(c, this.player.time);
+  }
+
+  /** Is the playhead on clip c? */
+  private onClip(c: VClip) {
+    const st = this.startOf(c), T = this.player.time;
+    return T >= st - 1e-3 && T <= st + clipLen(c) + 1e-3;
+  }
+
+  /** Change the framing at the playhead: into a keyframe there if the clip has keyframes. */
+  private setFraming(c: VClip, patch: Partial<Framing>) {
+    if (c.kf?.length) {
+      const s = this.sNow(c);
+      let k = c.kf.find((x) => Math.abs(x.s - s) < 1 / 60);
+      if (!k) {
+        k = { ...framingAt(c, s), s };
+        c.kf.push(k);
+        c.kf.sort((a, b) => a.s - b.s);
+      }
+      Object.assign(k, patch);
+    } else c.tf = { ...(c.tf ?? NO_FRAMING), ...patch };
+    this.replace();
+  }
+
+  /** A keyframe at the playhead? */
+  private keyHere(c: VClip) {
+    const s = this.sNow(c);
+    return c.kf?.findIndex((x) => Math.abs(x.s - s) < 1 / 60) ?? -1;
+  }
+
+  private toggleKey(c: VClip) {
+    if (!this.onClip(c)) return this.h.toast('Move the playhead onto the clip first');
+    const s = this.sNow(c);
+    const i = this.keyHere(c);
+    if (i >= 0) {
+      const f = framingAt(c, s);
+      c.kf!.splice(i, 1);
+      if (!c.kf!.length) {
+        delete c.kf;
+        c.tf = { z: f.z, x: f.x, y: f.y, r: f.r };
+      }
+    } else {
+      c.kf ??= [];
+      c.kf.push({ ...framingAt(c, s), s });
+      c.kf.sort((a, b) => a.s - b.s);
+      if (c.kf.length === 1) this.h.toast('Keyframe added · move the playhead and change the framing for the next one', 2800);
+    }
+    tick(true);
+    this.changed(true);
+    this.replace();
+  }
+
+  /** A slow push in across the clip (photos especially). */
+  private kenBurns(c: VClip) {
+    const r = () => (Math.random() - 0.5) * 0.06;
+    c.kf = [{ s: c.in, z: 1, x: 0, y: 0, r: 0 }, { s: c.out, z: 1.22, x: r(), y: r(), r: 0 }];
+    delete c.tf;
+    tick(true);
+    this.changed(true);
+    this.replace();
+  }
+
+  private resetFraming(c: VClip) {
+    delete c.kf;
+    delete c.tf;
+    tick(true);
+    this.changed(true);
+    this.replace();
   }
 
   // -----------------------------------------------------------------------------------
   // sections
 
   private params(id: string): string[] {
-    if (id === 'vclip') return this.selClip() ? ['vd.speed', 'vd.vol'] : [];
+    if (id === 'vclip') {
+      const c = this.selClip();
+      if (!c) return [];
+      const fr = ['vd.zoom', 'vd.px', 'vd.py', 'vd.rot'];
+      return c.kind === 'image' ? fr : [...(this.lib.get(c.src)?.audio ? ['vd.speed', 'vd.vol'] : ['vd.speed']), ...fr];
+    }
+    if (id === 'vcanvas') return this.project.bg === 'blur' || this.project.bg === 'image' ? ['vd.bgblur'] : [];
     if (id === 'vtext') return this.selText() ? ['vd.tsize'] : [];
     if (id === 'vmusic') return this.project.music ? ['vd.mvol', 'vd.min'] : [];
     return [];
@@ -631,6 +897,11 @@ export class VideoMode {
       case 'vd.tsize': return t?.size ?? 8;
       case 'vd.mvol': return (mu?.vol ?? 0.7) * 100;
       case 'vd.min': return mu?.in ?? 0;
+      case 'vd.bgblur': return this.project.bgBlur ?? (this.project.bg === 'image' ? 0 : 70);
+    }
+    if (c && /^vd\.(zoom|px|py|rot)$/.test(id)) {
+      const f = framingAt(c, this.sNow(c));
+      return id === 'vd.zoom' ? f.z * 100 : id === 'vd.px' ? f.x * 100 : id === 'vd.py' ? f.y * 100 : f.r;
     }
     return 0;
   }
@@ -654,7 +925,14 @@ export class VideoMode {
       this.h.requestRender();
     } else if (id === 'vd.mvol' && mu) mu.vol = v / 100;
     else if (id === 'vd.min' && mu) mu.in = v;
+    else if (id === 'vd.bgblur') {
+      this.project.bgBlur = v;
+      this.replace();
+    } else if (c && /^vd\.(zoom|px|py|rot)$/.test(id)) {
+      this.setFraming(c, id === 'vd.zoom' ? { z: v / 100 } : id === 'vd.px' ? { x: v / 100 } : id === 'vd.py' ? { y: v / 100 } : { r: v });
+    }
     this.timeline.draw();
+    this.remix();
   }
 
   buildSubs(t: ToolDef, row: HTMLElement) {
@@ -706,19 +984,46 @@ export class VideoMode {
       const m = this.lib.get(c.src);
       if (m?.audio) this.h.tile(row, c.vol > 0 ? ICONS.sound : ICONS.mute, c.vol > 0 ? 'Mute' : 'Unmute', c.vol > 0 ? '' : 'hot', () => this.clipAction('mute'));
       this.h.tile(row, ICONS.trash, 'Delete', 'danger', () => this.clipAction('delete'));
+      sep();
+      this.h.tile(row, ICONS.key, 'Keyframe', this.keyHere(c) >= 0 ? 'hot' : '', () => this.toggleKey(c));
+      this.h.tile(row, ICONS.kenburns, 'Ken Burns', '', () => this.kenBurns(c));
+      if (c.kf?.length || c.tf) this.h.tile(row, ICONS.reset, 'Reset', '', () => this.resetFraming(c));
     } else if (t.id === 'vcanvas') {
       this.h.tile(row, ICONS.canvas, 'Fit', p.fit === 'fit' ? 'on' : '', () => this.setFit('fit'));
       this.h.tile(row, ICONS.crop, 'Fill', p.fit === 'fill' ? 'on' : '', () => this.setFit('fill'));
-      if (p.fit === 'fit') {
+      sep();
+      const kind = p.bg === 'black' || p.bg === 'white' ? 'color' : p.bg;
+      const setBg = (patch: Partial<VideoProject>) => {
+        Object.assign(p, patch);
+        this.replace();
+        this.h.commit();
+        this.h.refreshSection();
+      };
+      for (const [b, label] of [['blur', 'Blur'], ['color', 'Color'], ['gradient', 'Gradient'], ['image', 'Photo']] as const) {
+        this.h.chip(row, { id: b, label }, kind === b, () => {
+          if (b === 'image' && !p.bgImg) return this.pickBgImage();
+          setBg({ bg: b, bgColor: p.bgColor ?? (p.bg === 'white' ? '#ffffff' : '#000000') });
+        });
+      }
+      const dot = (bg: string, on: boolean, onClick: () => void) => {
+        const b = document.createElement('button');
+        b.className = 'dotchip' + (on ? ' on' : '');
+        b.innerHTML = `<i style="background:${bg}"></i>`;
+        b.onclick = () => {
+          tick();
+          onClick();
+        };
+        row.appendChild(b);
+      };
+      if (kind === 'color') {
         sep();
-        for (const [b, label] of [['blur', 'Blur'], ['black', 'Black'], ['white', 'White']] as const) {
-          this.h.chip(row, { id: b, label }, p.bg === b, () => {
-            p.bg = b;
-            this.replace();
-            this.h.commit();
-            this.h.refreshSection();
-          });
-        }
+        for (const c of BG_COLORS) dot(c, (p.bgColor ?? '#000000') === c, () => setBg({ bg: 'color', bgColor: c }));
+      } else if (kind === 'gradient') {
+        sep();
+        GRADIENTS.forEach(([a, b2, ang], i) => dot(`linear-gradient(${ang}deg, ${b2}, ${a})`, (p.bgGrad ?? 0) === i, () => setBg({ bg: 'gradient', bgGrad: i })));
+      } else if (kind === 'image') {
+        sep();
+        this.h.tile(row, ICONS.image, 'Change', '', () => this.pickBgImage());
       }
     } else if (t.id === 'vtext') {
       const tx = this.selText();
@@ -776,6 +1081,29 @@ export class VideoMode {
     }
   }
 
+  private pickBgImage() {
+    const i = $<HTMLInputElement>('fileBg');
+    i.value = '';
+    i.onchange = async () => {
+      const f = i.files?.[0];
+      if (!f) return;
+      try {
+        const m = await this.lib.add(f);
+        if (m.kind !== 'image') throw new Error('Pick a photo for the background');
+        const p = this.project;
+        p.bg = 'image';
+        p.bgImg = m.id;
+        p.bgBlur ??= 0;
+        this.replace();
+        this.h.commit();
+        this.h.refreshSection();
+      } catch (e) {
+        this.h.toast((e as Error).message, 3000);
+      }
+    };
+    i.click();
+  }
+
   private setFit(f: 'fit' | 'fill') {
     this.project.fit = f;
     this.replace();
@@ -785,10 +1113,10 @@ export class VideoMode {
 
   isModified(id: string) {
     const p = this.project;
-    if (id === 'vcanvas') return p.aspect !== 'auto' || p.fit !== 'fit' || p.bg !== 'blur';
+    if (id === 'vcanvas') return p.aspect !== 'auto' || p.fit !== 'fit' || p.bg !== 'blur' || (p.bgBlur ?? 70) !== 70;
     if (id === 'vtext') return p.texts.length > 0;
     if (id === 'vmusic') return !!p.music;
-    if (id === 'vclip') return p.clips.some((c) => c.speed !== 1 || (!!this.lib.get(c.src)?.audio && c.vol !== 1));
+    if (id === 'vclip') return p.clips.some((c) => c.speed !== 1 || !!c.kf?.length || !!c.tf || (!!this.lib.get(c.src)?.audio && c.vol !== 1));
     return false;
   }
 
@@ -892,15 +1220,14 @@ export class VideoMode {
       this.exportT = this.h.g.acquire(w, h, false);
       const out = this.exportT;
       const blob = await exportVideo({
-        lib: this.lib, project: st.video!, canvas, w, h, fps: this.ex.fps, quality: this.ex.q,
+        lib: this.lib, audio: this.audio, project: st.video!, canvas, w, h, fps: this.ex.fps, quality: this.ex.q,
         drawFrame: (clip, m, sample, T) => {
           const src = this.srcFor(m, sample, Math.max(w, h));
-          this.comp.place(src, out, this.project);
+          this.comp.place(src, out, this.placement(clip, sample?.timestamp ?? this.srcTime(clip, T), w, h));
           this.h.renderFull({ tex: out.tex, w, h, linear: false }, w, h);
           const vis = this.visibleTexts(T);
           this.comp.setText(vis.length ? JSON.stringify([vis, w, h]) : '', w, h, vis.length ? this.paintTexts(vis) : null);
           this.comp.drawText(w, h);
-          void clip;
         },
         progress: (f, stage) => this.h.busy(stage === 'Exporting' ? `Exporting ${Math.round(f * 100)}%` : stage),
         cancelled: () => this.cancelExport,

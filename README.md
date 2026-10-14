@@ -22,15 +22,29 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Timeline:** drag to scrub (flick to coast), pinch to zoom, tap a clip to select it, drag its yellow
   handles to trim, hold a clip to pick it up and move it. **+** adds more clips (after the selected one).
 - **Edit:** Split at the playhead, Copy, Mute, Delete, **Speed** (0.25–4×) and **Volume** on the slider.
-- **Canvas:** Original, 9:16, 4:5, 1:1 or 16:9; Fit (with a blurred, black or white background) or Fill.
+- **Framing & keyframes:** with a clip selected (Edit), drag the video to move the clip and pinch to zoom /
+  twist to rotate it (or use Zoom, Position and Rotate on the slider). **Keyframe** (◆) marks the framing at
+  the playhead; once a clip has keyframes, changing the framing anywhere keys it there, and the motion eases
+  between them. Keyframes sit on the clip's content, so trimming or speed changes don't move them.
+  **Ken Burns** adds a slow push-in (photos move while playing too).
+- **Canvas:** Original, 9:16, 4:5, 1:1 or 16:9; Fit or Fill; background **Blur** (strength on the slider),
+  **Color**, **Gradient** or your own **Photo** (sharp or blurred).
 - **Text:** titles with Pixel / Sans / Serif type, colours and a box; drag them on the video, and drag or
   trim their bar in the timeline to set when they show.
 - **Music:** add a song (fades in/out), set its volume and where in the song to start.
-- **Play:** the play button or a tap on the video. Picture and sound share one clock, and the picture
-  allows for Bluetooth headphone delay.
+- **Play:** the play button or a tap on the video.
+- **How it stays smooth:** frames are decoded ahead and copied to GPU textures the moment they arrive; one
+  display loop shows each on the refresh it's due, against the audio output's own clock (interpolated, and
+  allowing for Bluetooth delay). The soundtrack is mixed once in the background after each edit into one
+  continuous track, so playback has nothing to schedule and can't drop out. Scrubbing keeps a decoder open
+  (forward is just decoding on), jumps to key frames while the finger moves fast, caches the second behind
+  the playhead for reverse scrubbing, and lands on the exact frame when you stop. 480p / 720p footage is
+  previewed at its own size, an edit with no adjustments skips the photo pipeline entirely, and the preview
+  resolution only steps down if a phone can't keep up.
 - **Export:** 720p / 1080p / 1440p / 4K (up to the source), 24 / 30 / 60 fps, MP4 with the phone's hardware
-  encoder (H.264 where available, else HEVC / VP9 / AV1) and AAC or Opus sound; saved to Movies/Lumen in the
-  Android app. Each frame goes through the same GPU pipeline as the preview, at full size.
+  encoder (H.264 where available, else HEVC / VP9 / AV1) and AAC or Opus sound (the same mix the preview
+  plays); saved to Movies/Lumen in the Android app. Each frame goes through the same GPU pipeline as the
+  preview, at full size.
 - Undo, redo and the history list cover timeline edits too.
 - Built on **Mediabunny** (demuxing, frame-exact decoding and MP4 muxing through WebCodecs), loaded only
   when a video is opened. Video projects aren't autosaved yet.

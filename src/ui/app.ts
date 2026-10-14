@@ -437,6 +437,20 @@ export class App {
     return s;
   }
 
+  /** True when an edit changes nothing at all (every setting at its default). */
+  private static DEF_V = defaultValues();
+  private static DEF_CURVES = JSON.stringify(defaultState().curves);
+  private isNeutral(st: EditState) {
+    const D = App.DEF_V, v = st.v;
+    for (const k in v) {
+      if (v[k] !== D[k] && !/^((dx|lk)(Brush|Hard)|healSize|vigX|vigY|blurX|blurY)$/.test(k)) return false;
+    }
+    const g = st.geo;
+    if (g.quarter || g.flipH || g.flipV || g.crop.w < 0.9999 || g.crop.h < 0.9999) return false;
+    if (st.masks.length || st.spots.length || st.fills?.length || st.overlay || st.leak) return false;
+    return JSON.stringify(st.curves) === App.DEF_CURVES;
+  }
+
   private renderNow() {
     if (!this.img || this.video?.exporting) return;
     const st = this.viewState();
@@ -454,7 +468,9 @@ export class App {
     this.syncOverlay(st);
     this.pipe.showMask = this.kind() === 'masks' && (this.maskOverlayOn || this.maskInteracting || aiMode) ? this.maskSel : -1;
     try {
-      this.pipe.render(this.img.preview, st, w, h, null);
+      // a video with nothing applied skips the whole pipeline: one copy to the screen
+      if (this.video && this.isNeutral(st)) this.video.blitFrame(w, h);
+      else this.pipe.render(this.img.preview, st, w, h, null);
       this.video?.afterRender(w, h);
     } catch (e) {
       console.error(e);
@@ -1116,6 +1132,7 @@ export class App {
       chip: (row, c, on, onClick) => this.chip(row, c, on, onClick),
       tile: (row, icon, label, cls, onClick) => this.tile(row, icon, label, cls, onClick),
       renderFull: (src, w, h) => {
+        if (this.isNeutral(this.state)) return this.video!.blitTex(src.tex, w, h);
         this.syncOverlay(this.state);
         this.pipe.brushTex = this.atlas.tex;
         this.pipe.invalidate();
@@ -1828,7 +1845,7 @@ export class App {
   private bindGestures() {
     const st = this.stage;
     const pts = new Map<number, { x: number; y: number }>();
-    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx' | 'vig' | 'shape' | 'lshape' | 'vtext';
+    type Mode = 'none' | 'pending' | 'value' | 'menu' | 'pinch' | 'crop' | 'compare' | 'mask' | 'paint' | 'pick' | 'blur' | 'pan' | 'heal' | 'ai' | 'dx' | 'vig' | 'shape' | 'lshape' | 'vtext' | 'vpinch';
     let mode: Mode = 'none';
     let sx = 0, sy = 0, startIdx = 0, lastStep = 0;
     let lastX = 0, lastT = 0;
@@ -1871,6 +1888,12 @@ export class App {
         if (mode === 'vig') this.vigOv.end();
         if (mode === 'blur') this.blurOv.end();
         const [a, b] = [...pts.values()];
+        // video, Edit section: two fingers zoom / twist the selected clip itself
+        if (this.video?.stagePinchStart(a, b)) {
+          mode = 'vpinch';
+          return;
+        }
+        if (mode === 'vtext') this.video?.stageCancel();
         const m = stageXY((a.x + b.x) / 2, (a.y + b.y) / 2);
         pinch0 = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, mx: m.x, my: m.y, ...this.zoom };
         // in Blur and Vignette two fingers shape the effect (pinch = size, twist = angle)
@@ -1979,6 +2002,13 @@ export class App {
     st.addEventListener('pointermove', (e) => {
       if (!pts.has(e.pointerId)) return;
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      if (mode === 'vpinch') {
+        if (pts.size >= 2) {
+          const [a, b] = [...pts.values()];
+          this.video?.stagePinch(a, b, this.frame.getBoundingClientRect());
+        }
+        return;
+      }
       if (mode === 'pinch' && pts.size >= 2) {
         const [a, b] = [...pts.values()];
         const d = Math.hypot(a.x - b.x, a.y - b.y);
@@ -2112,6 +2142,13 @@ export class App {
       armed = false;
       if (mode === 'pinch') {
         if (pts.size === 0) mode = 'none';
+        return;
+      }
+      if (mode === 'vpinch') {
+        if (pts.size === 0) {
+          mode = 'none';
+          this.video?.stageUp();
+        }
         return;
       }
       if (mode === 'lshape') {
@@ -4484,7 +4521,10 @@ function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditStat
     if (x.speed !== y.speed) return 'Speed';
     if (x.vol !== y.vol) return y.vol === 0 ? 'Mute' : 'Volume';
     if (x.in !== y.in || x.out !== y.out) return 'Trim';
+    if (j(x.kf) !== j(y.kf)) return (y.kf?.length ?? 0) !== (x.kf?.length ?? 0) ? 'Keyframe' : 'Framing';
+    if (j(x.tf) !== j(y.tf)) return 'Framing';
   }
+  if (a.bg !== b.bg || a.bgColor !== b.bgColor || a.bgGrad !== b.bgGrad || a.bgImg !== b.bgImg || a.bgBlur !== b.bgBlur) return 'Background';
   if (j(a.texts) !== j(b.texts)) return b.texts.length > a.texts.length ? 'Text added' : b.texts.length < a.texts.length ? 'Text deleted' : 'Text';
   if (j(a.music) !== j(b.music)) return !a.music ? 'Music added' : !b.music ? 'Music removed' : 'Music';
   return 'Canvas';

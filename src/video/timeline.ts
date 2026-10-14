@@ -107,19 +107,25 @@ export class Timeline {
     if (reorder) {
       this.paintReorder(reorder);
     } else {
-      p.clips.forEach((cl, i) => {
-        const x0 = this.x(starts[i]), x1 = this.x(starts[i] + clipLen(cl));
-        if (x1 < -4 || x0 > W + 4) return;
-        this.paintClip(cl.src, cl.in, cl.out, x0 + 1, x1 - 1, CLIP_Y, CLIP_H, cl.speed);
-        if (cl.speed !== 1) this.badge(`${cl.speed}×`, x0 + 5, CLIP_Y + 4);
-        if (cl.vol === 0 && this.lib.get(cl.src)?.audio) this.badge('MUTE', x0 + 5, CLIP_Y + CLIP_H - 15);
-      });
+      // the clips come from a cached strip covering three screen widths: while playing or
+      // scrolling, that's one image copy per refresh rather than every thumbnail again
+      const st = this.stripFor(T, W, dpr, p, starts);
+      const dx = Math.round((W / 2 + (st.t0 - T) * this.pps) * dpr) / dpr;
+      ctx.drawImage(st.c, 0, 0, st.c.width, st.c.height, dx, CLIP_Y, st.w, CLIP_H);
       // the selected clip: a yellow frame with trim handles
       if (sel?.kind === 'clip') {
         const i = p.clips.findIndex((c) => c.id === sel.id);
         if (i >= 0) {
           const x0 = this.x(starts[i]), x1 = this.x(starts[i] + clipLen(p.clips[i]));
           this.frame(x0, x1, CLIP_Y, CLIP_H);
+          // its keyframes: diamonds along the bottom (the one under the playhead filled)
+          const cl = p.clips[i];
+          for (const k of cl.kf ?? []) {
+            const kx = this.x(starts[i] + (k.s - cl.in) / cl.speed);
+            if (kx < x0 - 1 || kx > x1 + 1) continue;
+            const here = Math.abs(kx - W / 2) < 2;
+            this.diamond(Math.round(kx), CLIP_Y + CLIP_H - 7, here);
+          }
         }
       }
     }
@@ -176,8 +182,46 @@ export class Timeline {
     }
   }
 
-  private badge(s: string, x: number, y: number) {
-    const ctx = this.ctx;
+  private strip: { c: HTMLCanvasElement; t0: number; w: number; key: string } | null = null;
+  private thumbsVer = 0;
+
+  /** New thumbnails arrived: the strip is redrawn. */
+  thumbsChanged() {
+    this.thumbsVer++;
+    this.draw();
+  }
+
+  private stripFor(T: number, W: number, dpr: number, p: VideoProject, starts: number[]) {
+    const key = JSON.stringify([this.pps, W, dpr, this.thumbsVer, p.clips.map((c) => [c.src, c.in, c.out, c.speed, c.vol])]);
+    const half = W / 2 / this.pps;
+    const s = this.strip;
+    if (s && s.key === key && T - half >= s.t0 && T + half <= s.t0 + s.w / this.pps) return s;
+    const w = W * 3, t0 = T - (W * 1.5) / this.pps;
+    const c = s?.c ?? document.createElement('canvas');
+    c.width = Math.round(w * dpr);
+    c.height = Math.round(CLIP_H * dpr);
+    const g = c.getContext('2d')!;
+    g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    g.clearRect(0, 0, w, CLIP_H);
+    g.imageSmoothingEnabled = true;
+    p.clips.forEach((cl, i) => {
+      const x0 = (starts[i] - t0) * this.pps, x1 = (starts[i] + clipLen(cl) - t0) * this.pps;
+      if (x1 < -4 || x0 > w + 4) return;
+      this.paintClip(g, w, cl.src, cl.in, cl.out, x0 + 1, x1 - 1, 0, CLIP_H, cl.speed);
+      if (cl.speed !== 1) this.badge(g, `${cl.speed}×`, x0 + 5, 4);
+      if (cl.vol === 0 && this.lib.get(cl.src)?.audio) this.badge(g, 'MUTE', x0 + 5, CLIP_H - 15);
+    });
+    this.strip = { c, t0, w, key };
+    return this.strip;
+  }
+
+  /** Paint now (inside the playback loop, so the timeline moves with the frame). */
+  paintNow() {
+    cancelAnimationFrame(this.raf);
+    this.paint();
+  }
+
+  private badge(ctx: CanvasRenderingContext2D, s: string, x: number, y: number) {
     ctx.font = '700 8px Silkscreen, monospace';
     const w = ctx.measureText(s).width + 6;
     ctx.fillStyle = 'rgba(14,14,14,0.75)';
@@ -187,8 +231,7 @@ export class Timeline {
   }
 
   /** A clip's strip of thumbnails between x0 and x1. */
-  private paintClip(src: string, sIn: number, sOut: number, x0: number, x1: number, y: number, h: number, speed: number) {
-    const ctx = this.ctx;
+  private paintClip(ctx: CanvasRenderingContext2D, cullW: number, src: string, sIn: number, sOut: number, x0: number, x1: number, y: number, h: number, speed: number) {
     const m = this.lib.get(src);
     ctx.save();
     ctx.beginPath();
@@ -199,9 +242,8 @@ export class Timeline {
     if (m) {
       const aspect = m.w && m.h ? m.w / m.h : 16 / 9;
       const tw = Math.max(18, Math.min(h * 1.8, h * aspect));
-      const W = this.c.clientWidth;
       for (let x = x0; x < x1; x += tw) {
-        if (x + tw < 0 || x > W) continue;
+        if (x + tw < 0 || x > cullW) continue;
         const t = m.kind === 'image' ? 0 : sIn + ((x + tw / 2 - x0) / this.pps) * speed;
         const th = this.lib.thumbAt(m, Math.min(sOut, t));
         if (!th) continue;
@@ -213,6 +255,26 @@ export class Timeline {
       }
     }
     ctx.restore();
+  }
+
+  private diamond(x: number, y: number, on: boolean) {
+    const ctx = this.ctx;
+    ctx.fillStyle = '#141414';
+    ctx.beginPath();
+    ctx.moveTo(x, y - 6);
+    ctx.lineTo(x + 6, y);
+    ctx.lineTo(x, y + 6);
+    ctx.lineTo(x - 6, y);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = on ? '#f2efe8' : ACCENT;
+    ctx.beginPath();
+    ctx.moveTo(x, y - 4);
+    ctx.lineTo(x + 4, y);
+    ctx.lineTo(x, y + 4);
+    ctx.lineTo(x - 4, y);
+    ctx.closePath();
+    ctx.fill();
   }
 
   private frame(x0: number, x1: number, y: number, h: number) {
@@ -239,13 +301,13 @@ export class Timeline {
       if (ci === d.from) return;
       const x = d.baseX + k * this.slot;
       const cl = p.clips[ci];
-      this.paintClip(cl.src, cl.in, cl.out, x + 2, x + this.slot - 2, CLIP_Y + 6, CLIP_H - 12, cl.speed);
+      this.paintClip(this.ctx, this.c.clientWidth, cl.src, cl.in, cl.out, x + 2, x + this.slot - 2, CLIP_Y + 6, CLIP_H - 12, cl.speed);
     });
     const cl = p.clips[d.from];
     const x = d.x - this.slot / 2;
     this.ctx.fillStyle = 'rgba(0,0,0,0.4)';
     this.ctx.fillRect(x + 4, CLIP_Y + 2, this.slot, CLIP_H);
-    this.paintClip(cl.src, cl.in, cl.out, x - 2, x + this.slot + 2, CLIP_Y - 2, CLIP_H, cl.speed);
+    this.paintClip(this.ctx, this.c.clientWidth, cl.src, cl.in, cl.out, x - 2, x + this.slot + 2, CLIP_Y - 2, CLIP_H, cl.speed);
     this.frame(x - 2, x + this.slot + 2, CLIP_Y - 2, CLIP_H);
   }
 

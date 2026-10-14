@@ -18,6 +18,7 @@ uniform int uBgMode;    // 0 colour, 1 texture
 uniform vec3 uBgColor;
 uniform float uBgDim;
 uniform int uTaps;      // 1: shrinking a lot without mipmaps: average 4 spread taps
+uniform float uAng;     // the clip's own rotation (keyframes), radians clockwise
 vec4 bgAt(vec2 uv) {
   if (uBgMode == 0) return vec4(uBgColor, 1.0);
   // the background copy is tiny; a few taps smooth its texels into a soft blur
@@ -28,8 +29,10 @@ vec4 bgAt(vec2 uv) {
 }
 void main() {
   // texel rows run top to bottom here, like an uploaded image
-  vec2 p = vUv * uOut;
-  vec2 d = (p - 0.5 * uOut - uOff) / uDisp + 0.5;
+  vec2 p = vUv * uOut - (0.5 * uOut + uOff);
+  float cs = cos(uAng), sn = sin(uAng);
+  p = vec2(cs * p.x + sn * p.y, -sn * p.x + cs * p.y);
+  vec2 d = p / uDisp + 0.5;
   vec2 e = min(d, 1.0 - d) * uDisp;
   float a = clamp(min(e.x, e.y) + 0.5, 0.0, 1.0);
   vec2 q = clamp(d, 0.0, 1.0);
@@ -68,11 +71,41 @@ export interface FrameSource {
   /** clockwise quarter turns to show it upright */
   rot: 0 | 1 | 2 | 3;
   flip: boolean;
+  /** has mipmaps (else big downscales are supersampled) */
+  mip?: boolean;
+}
+
+/** A decoded frame already on the GPU. */
+export interface GpuFrame {
+  tex: WebGLTexture;
+  w: number;
+  h: number;
+}
+
+/** Textures decoded frames are copied into as soon as they arrive (the decoder never waits on us). */
+const RING = 7;
+
+/** A clip's framing in the project frame: zoom (1 = as fitted), offset (fractions of the frame), rotation (degrees). */
+export interface Framing {
+  z: number;
+  x: number;
+  y: number;
+  r: number;
 }
 
 export interface Placement {
   fit: 'fit' | 'fill';
-  bg: 'black' | 'blur' | 'white';
+  bg: {
+    kind: 'blur' | 'color' | 'tex';
+    color: [number, number, number];
+    /** gradient or photo for 'tex' */
+    tex?: GpuFrame | null;
+    /** 0 sharp … 1 very soft (blur, and a photo background) */
+    blur: number;
+    /** darken a little behind the picture */
+    dim: number;
+  };
+  tf?: Framing;
 }
 
 export class Compositor {
@@ -87,6 +120,8 @@ export class Compositor {
   private textKey = '';
   private textOn = false;
   private textCanvas = document.createElement('canvas');
+  private ring: GpuFrame[] = [];
+  private ringNext = 0;
 
   constructor(private g: GL) {
     this.compose = new Program(g.gl, COMPOSE, 'compose');
@@ -122,6 +157,20 @@ export class Compositor {
     this.rawMip = mip;
   }
 
+  /** Copy a decoded frame into the next ring texture (playback). */
+  uploadRing(img: TexImageSource, w: number, h: number): GpuFrame {
+    const gl = this.g.gl;
+    if (this.ring.length < RING) this.ring.push({ tex: this.mutableTex(), w: 1, h: 1 });
+    const slot = this.ring[this.ringNext];
+    this.ringNext = (this.ringNext + 1) % RING;
+    gl.bindTexture(gl.TEXTURE_2D, slot.tex);
+    gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+    slot.w = w;
+    slot.h = h;
+    return { ...slot };
+  }
+
   /** A still's own texture (made once per image). */
   imageTexture(bmp: ImageBitmap) {
     const gl = this.g.gl;
@@ -140,58 +189,101 @@ export class Compositor {
     const dispH = src ? (src.rot % 2 ? src.w : src.h) : 1;
     const fitK = Math.min(dst.w / dispW, dst.h / dispH);
     const fillK = Math.max(dst.w / dispW, dst.h / dispH);
-    const k = pl.fit === 'fill' ? fillK : fitK;
-    const needBg = !src || pl.fit === 'fit' && (Math.abs(dispW * k - dst.w) > 1 || Math.abs(dispH * k - dst.h) > 1);
-    // the blurred background: the frame filled into a tiny target, smoothed when sampled
-    let bgMode = 0;
-    if (src && needBg && pl.bg === 'blur') {
-      const bw = 40, bh = Math.max(4, Math.round((40 * dst.h) / dst.w));
+    const tf = pl.tf ?? { z: 1, x: 0, y: 0, r: 0 };
+    const k = (pl.fit === 'fill' ? fillK : fitK) * Math.max(0.05, tf.z);
+    // the background: soft copies come from a tiny target (smaller = softer), smoothed when sampled
+    const B = pl.bg;
+    let mode = 0;
+    let bgTex: WebGLTexture | null = null;
+    const soft = (from: FrameSource) => {
+      const bw = Math.round(400 - (400 - 20) * Math.pow(Math.min(1, Math.max(0, B.blur)), 0.5));
+      const bh = Math.max(4, Math.round((bw * dst.h) / dst.w));
       if (!this.bgT || this.bgT.w !== bw || this.bgT.h !== bh) {
         if (this.bgT) g.destroy(this.bgT);
         this.bgT = g.acquire(bw, bh, false);
       }
-      this.draw(src, this.bgT, fillK * (bw / dst.w), { mode: 0, color: [0, 0, 0] });
-      bgMode = 1;
+      const fdW = from.rot % 2 ? from.h : from.w, fdH = from.rot % 2 ? from.w : from.h;
+      this.draw(from, this.bgT, Math.max(bw / fdW, bh / fdH), { mode: 0, color: [0, 0, 0], tex: null, dim: 1 }, null);
+      return this.bgT.tex;
+    };
+    if (B.kind === 'blur' && src) {
+      bgTex = soft(src);
+      mode = 1;
+    } else if (B.kind === 'tex' && B.tex) {
+      const ts: FrameSource = { tex: B.tex.tex, w: B.tex.w, h: B.tex.h, rot: 0, flip: false, mip: true };
+      bgTex = B.blur > 0.02 ? soft(ts) : null;
+      if (!bgTex) {
+        // sharp: fill the frame with it directly
+        if (!this.bgT || this.bgT.w !== dst.w || this.bgT.h !== dst.h) {
+          if (this.bgT) g.destroy(this.bgT);
+          this.bgT = g.acquire(dst.w, dst.h, false);
+        }
+        this.draw(ts, this.bgT, Math.max(dst.w / ts.w, dst.h / ts.h), { mode: 0, color: [0, 0, 0], tex: null, dim: 1 }, null);
+        bgTex = this.bgT.tex;
+      }
+      mode = 1;
     }
-    const color: [number, number, number] = pl.bg === 'white' ? [1, 1, 1] : [0, 0, 0];
+    const bg = { mode, color: B.color, tex: bgTex, dim: B.dim };
     if (!src) {
       g.draw(this.compose, dst, dst.w, dst.h, (p) => {
         const gl = g.gl;
         g.bindTex(p, 'uSrc', this.raw);
-        g.bindTex(p, 'uBg', this.raw);
+        g.bindTex(p, 'uBg', bgTex ?? this.raw);
         gl.uniform2f(p.loc('uOut'), dst.w, dst.h);
         gl.uniform2f(p.loc('uDisp'), 1e-3, 1e-3);
         gl.uniform2f(p.loc('uOff'), 1e6, 1e6);
         gl.uniform1i(p.loc('uRot'), 0);
         gl.uniform1i(p.loc('uFlip'), 0);
-        gl.uniform1i(p.loc('uBgMode'), 0);
-        gl.uniform3fv(p.loc('uBgColor'), color);
-        gl.uniform1f(p.loc('uBgDim'), 1);
+        gl.uniform1i(p.loc('uBgMode'), mode);
+        gl.uniform3fv(p.loc('uBgColor'), B.color);
+        gl.uniform1f(p.loc('uBgDim'), B.dim);
+        gl.uniform1f(p.loc('uAng'), 0);
+        gl.uniform1i(p.loc('uTaps'), 0);
       });
       return;
     }
-    this.draw(src, dst, k, { mode: bgMode, color });
+    this.draw(src, dst, k, bg, tf);
   }
 
-  private draw(src: FrameSource, dst: Target, k: number, bg: { mode: number; color: [number, number, number] }) {
+  private draw(src: FrameSource, dst: Target, k: number, bg: { mode: number; color: [number, number, number]; tex: WebGLTexture | null; dim: number }, tf: Framing | null) {
     const g = this.g;
     const dispW = src.rot % 2 ? src.h : src.w;
     const dispH = src.rot % 2 ? src.w : src.h;
     g.draw(this.compose, dst, dst.w, dst.h, (p) => {
       const gl = g.gl;
       g.bindTex(p, 'uSrc', src.tex);
-      g.bindTex(p, 'uBg', bg.mode === 1 && this.bgT ? this.bgT.tex : src.tex);
+      g.bindTex(p, 'uBg', bg.mode === 1 && bg.tex ? bg.tex : src.tex);
       gl.uniform2f(p.loc('uOut'), dst.w, dst.h);
       gl.uniform2f(p.loc('uDisp'), dispW * k, dispH * k);
-      gl.uniform2f(p.loc('uOff'), 0, 0);
+      gl.uniform2f(p.loc('uOff'), (tf?.x ?? 0) * dst.w, (tf?.y ?? 0) * dst.h);
+      gl.uniform1f(p.loc('uAng'), ((tf?.r ?? 0) * Math.PI) / 180);
       gl.uniform1i(p.loc('uRot'), src.rot);
       gl.uniform1i(p.loc('uFlip'), src.flip ? 1 : 0);
       gl.uniform1i(p.loc('uBgMode'), bg.mode);
       gl.uniform3fv(p.loc('uBgColor'), bg.color);
-      gl.uniform1f(p.loc('uBgDim'), 0.72);
+      gl.uniform1f(p.loc('uBgDim'), bg.dim);
       // shrinking the raw frame a lot with no mipmaps (playback): supersample instead
-      gl.uniform1i(p.loc('uTaps'), src.tex === this.raw && !this.rawMip && 1 / k > 1.5 ? 1 : 0);
+      const mipped = src.mip ?? (src.tex === this.raw ? this.rawMip : true);
+      gl.uniform1i(p.loc('uTaps'), !mipped && 1 / k > 1.5 ? 1 : 0);
     });
+  }
+
+  /** A small texture from a 2D canvas (gradient backgrounds), cached by key. */
+  private canvasTex = new Map<string, GpuFrame>();
+  canvasTexture(key: string, paint: () => HTMLCanvasElement): GpuFrame {
+    let t = this.canvasTex.get(key);
+    if (!t) {
+      const c = paint();
+      const tex = this.mutableTex();
+      const gl = this.g.gl;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, c);
+      gl.generateMipmap(gl.TEXTURE_2D);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+      t = { tex, w: c.width, h: c.height };
+      this.canvasTex.set(key, t);
+    }
+    return t;
   }
 
   get rawFrame() {
@@ -219,6 +311,16 @@ export class Compositor {
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   }
 
+  /** Draw a frame texture straight onto the screen canvas (no adjustments to apply). */
+  blit(tex: WebGLTexture, w: number, h: number) {
+    const g = this.g, gl = g.gl;
+    gl.disable(gl.BLEND);
+    g.draw(this.over, null, w, h, (p) => {
+      g.bindTex(p, 'uTex', tex);
+      gl.uniform1i(p.loc('uFlipY'), 1);
+    });
+  }
+
   /** Lay the text over whatever was just drawn to the screen canvas (w×h). */
   drawText(w: number, h: number) {
     if (!this.textOn) return;
@@ -236,6 +338,10 @@ export class Compositor {
     const gl = this.g.gl;
     gl.deleteTexture(this.raw);
     gl.deleteTexture(this.textTex);
+    for (const r of this.ring) gl.deleteTexture(r.tex);
+    for (const t of this.canvasTex.values()) gl.deleteTexture(t.tex);
+    this.canvasTex.clear();
+    this.ring = [];
     if (this.bgT) this.g.destroy(this.bgT);
   }
 }

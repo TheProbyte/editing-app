@@ -94,6 +94,7 @@ export class VideoMode {
     this.player = new Player(this.lib, () => this.project, this.audio);
     // playback copies each decoded frame to the GPU the moment it arrives
     this.player.upload = (vf) => this.comp.uploadRing(vf, vf.displayWidth, vf.displayHeight);
+    this.player.stillMoves = () => this.stillMoves();
     this.player.onFrame = (f) => this.showFrame(f);
     this.player.onTime = () => this.onTime();
     this.player.onEnd = () => this.syncPlayButton();
@@ -188,6 +189,7 @@ export class VideoMode {
         const m = await this.lib.add(f);
         this.audio.warm(m);
         if (m.kind === 'audio') continue;
+        if (m.kind === 'video') setTimeout(() => void this.player.buildKeys(m), 1200);
         const c: VClip = { id: uid(), src: m.id, kind: m.kind === 'image' ? 'image' : 'video', in: 0, out: m.kind === 'image' ? IMAGE_SECONDS : m.duration, speed: 1, vol: m.audio ? 1 : 0 };
         added.push(c);
       } catch (e) {
@@ -290,7 +292,11 @@ export class VideoMode {
       const n = parseInt(c.replace('#', ''), 16);
       return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
     };
-    const tf = clip ? framingAt(clip, s) : undefined;
+    let tf = clip ? framingAt(clip, s) : undefined;
+    if (clip && (this.h.state().v.filmWeave ?? 0) > 0) {
+      const wv = this.weave(this.startOf(clip) + (s - clip.in) / clip.speed);
+      tf = { ...(tf ?? NO_FRAMING), x: (tf?.x ?? 0) + wv.x, y: (tf?.y ?? 0) + wv.y };
+    }
     const kind = p.bg ?? 'blur';
     let bg: Placement['bg'];
     if (kind === 'black' || kind === 'white' || kind === 'color') {
@@ -328,12 +334,12 @@ export class VideoMode {
     this.h.frameChanged({ tex: this.frameT!.tex, w, h, linear: false }, this.frameT!, resized);
   }
 
-  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true, bitmap?: ImageBitmap, pre?: GpuFrame): FrameSource {
+  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true, bitmap?: ImageBitmap, pre?: GpuFrame, upright = false): FrameSource {
     if (m.kind === 'image' && m.bitmap) {
       const g = this.imageGpu(m)!;
       return { tex: g.tex, w: g.w, h: g.h, rot: 0, flip: false };
     }
-    const rot = ROT[(m.video?.rotation ?? 0) as 0 | 90 | 180 | 270] ?? 0;
+    const rot = upright ? 0 : ROT[(m.video?.rotation ?? 0) as 0 | 90 | 180 | 270] ?? 0;
     if (pre) return { tex: pre.tex, w: pre.w, h: pre.h, rot, flip: false, mip: false };
     if (bitmap) this.comp.upload(bitmap, bitmap.width, bitmap.height, outLong, false);
     else if (sample) {
@@ -351,7 +357,7 @@ export class VideoMode {
       return;
     }
     if (!this.frameT) this.ensureFrame();
-    const src = this.srcFor(f.media, f.sample, this.previewLong(), !this.player.playing, f.bitmap, f.pre);
+    const src = this.srcFor(f.media, f.sample, this.previewLong(), !this.player.playing, f.bitmap, f.pre, f.upright);
     const s = f.sample?.timestamp ?? f.ts ?? (f.t !== undefined ? this.srcTime(f.clip, f.t) : f.clip.in);
     f.sample?.close();
     this.last = { src, media: f.media.id, clip: f.clip.id, s };
@@ -413,6 +419,11 @@ export class VideoMode {
     this.updateCap();
   }
 
+  /** Settings that move the picture itself changed (e.g. gate weave): place the frame again. */
+  refreshFrame() {
+    this.replace();
+  }
+
   /** Canvas settings changed: place the current frame again. */
   private replace() {
     this.ensureFrame();
@@ -458,6 +469,58 @@ export class VideoMode {
     const vis = this.visibleTexts(T);
     if (!vis.length) return this.comp.setText('', w, h, null);
     this.comp.setText(JSON.stringify([vis, w, h]), w, h, this.paintTexts(vis));
+  }
+
+  // ---- film: grain that moves, flicker and gate weave, all keyed to the film frame at T, so
+  // the preview and the export match frame for frame
+
+  private hash(i: number, k: number) {
+    let x = (i * 374761393 + k * 668265263) | 0;
+    x = (x ^ (x >>> 13)) * 1274126177;
+    return ((x ^ (x >>> 16)) >>> 0) / 4294967296;
+  }
+
+  /** The film frame number at timeline time T (grain changes on each one). */
+  private filmRate() {
+    return [0, 12, 24, this.sourceFps()][Math.round(this.h.state().v.grainMotion ?? 2)] ?? 24;
+  }
+
+  /**
+   * Grain seed, dust seed and flicker for the frame at T (handed to the pipeline before it
+   * renders). Grain moves at the Motion rate (or not at all on Still); dust and flicker always
+   * move, at that rate or 24 fps.
+   */
+  film(T: number) {
+    const v = this.h.state().v;
+    const rate = this.filmRate();
+    const i = rate ? Math.floor(T * rate + 1e-6) : 0;
+    const j = Math.floor(T * (rate || 24) + 1e-6);
+    const fl = (v.filmFlicker ?? 0) / 100;
+    return { seed: (1337 + i * 7919) % 1000003, dust: (7331 + j * 104729) % 1000003, flicker: fl ? fl * 0.09 * (this.hash(j, 1) * 2 - 1) : 0 };
+  }
+
+  /** Gate weave: a small drift of the picture that moves on film frames. */
+  private weave(T: number) {
+    const a = (this.h.state().v.filmWeave ?? 0) / 100;
+    if (!a) return { x: 0, y: 0 };
+    const i = Math.floor(T * 24);
+    // smooth-ish random walk: two slow waves plus a little per-frame jitter
+    const x = Math.sin(i * 0.21) * 0.6 + Math.sin(i * 0.067 + 1.3) * 0.4 + (this.hash(i, 7) - 0.5) * 0.5;
+    const y = Math.sin(i * 0.17 + 2.1) * 0.6 + Math.sin(i * 0.051) * 0.4 + (this.hash(i, 9) - 0.5) * 0.8;
+    return { x: x * a * 0.004, y: y * a * 0.007 };
+  }
+
+  /** Moving grain and dust are noise the encoder has to keep: give it the bits for that. */
+  private grainBoost() {
+    const v = this.h.state().v;
+    const moving = (v.grainMotion ?? 2) > 0 ? v.grain / 100 : 0;
+    return 1 + Math.min(1.5, moving * 1.5 + ((v.filmDust ?? 0) / 100) * 0.2);
+  }
+
+  /** Does a still need re-rendering while it plays (moving grain etc.)? */
+  stillMoves() {
+    const v = this.h.state().v;
+    return (v.grain > 0 && (v.grainMotion ?? 2) > 0) || (v.filmFlicker ?? 0) > 0 || (v.filmWeave ?? 0) > 0 || (v.filmDust ?? 0) > 0;
   }
 
   /** Copy any frame texture to the screen canvas (export with no adjustments). */
@@ -1220,8 +1283,9 @@ export class VideoMode {
       this.exportT = this.h.g.acquire(w, h, false);
       const out = this.exportT;
       const blob = await exportVideo({
-        lib: this.lib, audio: this.audio, project: st.video!, canvas, w, h, fps: this.ex.fps, quality: this.ex.q,
+        lib: this.lib, audio: this.audio, project: st.video!, canvas, w, h, fps: this.ex.fps, quality: this.ex.q, boost: this.grainBoost(),
         drawFrame: (clip, m, sample, T) => {
+          this.h.pipe.filmFrame = this.film(T);
           const src = this.srcFor(m, sample, Math.max(w, h));
           this.comp.place(src, out, this.placement(clip, sample?.timestamp ?? this.srcTime(clip, T), w, h));
           this.h.renderFull({ tex: out.tex, w, h, linear: false }, w, h);

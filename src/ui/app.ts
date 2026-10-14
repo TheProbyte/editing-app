@@ -34,6 +34,18 @@ import { isVideoFile, newProject } from '../video/project';
 
 /** photo tools that don't apply to video */
 const VIDEO_HIDDEN = new Set(['heal', 'masks', 'double']);
+/** Grain for video: the same grain, moving, plus flicker, gate weave, dust and film presets. */
+const VIDEO_GRAIN = (t: ToolDef): ToolDef => ({
+  ...t,
+  params: (sub) => [...t.params(sub), 'grainMotion', 'filmFlicker', 'filmWeave', 'filmDust'],
+  actions: [
+    { id: 'grain:v8', label: '8mm' },
+    { id: 'grain:v16', label: '16mm' },
+    { id: 'grain:v35', label: '35mm' },
+    { id: 'grain:vclean', label: 'Clean' },
+    ...(t.actions ?? []),
+  ],
+});
 
 interface Img {
   full: Source;
@@ -469,6 +481,7 @@ export class App {
     this.pipe.showMask = this.kind() === 'masks' && (this.maskOverlayOn || this.maskInteracting || aiMode) ? this.maskSel : -1;
     try {
       // a video with nothing applied skips the whole pipeline: one copy to the screen
+      if (this.video) this.pipe.filmFrame = this.video.film(this.video.player.time);
       if (this.video && this.isNeutral(st)) this.video.blitFrame(w, h);
       else this.pipe.render(this.img.preview, st, w, h, null);
       this.video?.afterRender(w, h);
@@ -874,6 +887,7 @@ export class App {
       this.requestRender();
       return;
     }
+    if (id === 'filmWeave' && this.video) queueMicrotask(() => this.video?.refreshFrame());
     if (id === 'lookAmt') {
       this.look.amt = v;
       if (this.look.base && this.look.idx >= 0) this.applyLookValues();
@@ -1083,6 +1097,7 @@ export class App {
     this.img = null;
     this.pipe.invalidate();
     this.appEl.classList.remove('video');
+    this.pipe.filmFrame = { seed: 1337, dust: 7331, flicker: 0 };
     this.buildTools();
   }
 
@@ -1161,7 +1176,8 @@ export class App {
   }
 
   private toolList(): ToolDef[] {
-    return this.video ? [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id))] : TOOLS;
+    if (!this.video) return TOOLS;
+    return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t))];
   }
 
   pickPhoto() {
@@ -3790,7 +3806,13 @@ export class App {
           '3200': { grain: 62, grainSize: 55, grainRough: 82, grainColor: 0, grainShadows: 90, grainHighlights: 50 },
           s8: { grain: 72, grainSize: 78, grainRough: 70, grainColor: 35, grainShadows: 80, grainHighlights: 60 },
           color: { grain: 38, grainSize: 36, grainRough: 50, grainColor: 75, grainShadows: 75, grainHighlights: 40 },
+          // video film looks: grain moving at film rate, flicker, weave, dust
+          v8: { grain: 70, grainSize: 80, grainRough: 72, grainColor: 30, grainShadows: 85, grainHighlights: 60, grainMotion: 1, filmFlicker: 40, filmWeave: 45, filmDust: 45 },
+          v16: { grain: 45, grainSize: 48, grainRough: 55, grainColor: 15, grainShadows: 75, grainHighlights: 45, grainMotion: 2, filmFlicker: 15, filmWeave: 18, filmDust: 18 },
+          v35: { grain: 24, grainSize: 24, grainRough: 40, grainColor: 5, grainShadows: 65, grainHighlights: 35, grainMotion: 2, filmFlicker: 5, filmWeave: 5, filmDust: 5 },
+          vclean: { grain: 0, grainMotion: 2, filmFlicker: 0, filmWeave: 0, filmDust: 0 },
         }[arg]!);
+        if (this.video) queueMicrotask(() => this.video?.refreshFrame()); // gate weave moves the frame
         break;
       case 'hal':
         setMany({

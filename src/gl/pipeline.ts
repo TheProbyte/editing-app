@@ -47,8 +47,8 @@ export function outputSize(state: EditState, w: number, h: number) {
 
 /** Settings only the finish pass reads (halation/glow/blur *amounts* are checked separately). */
 /** brush settings: they only change what the next stroke looks like */
-const BRUSH_ONLY = /^((dx|lk)(Brush|Hard)|healSize)$/;
-const FINISH_ONLY = /^(halation|halThreshold|halRadius|halHue|halSat|glow|glowThreshold|glowRadius|glowWarmth|vig\w*|grain\w*|ca|blur(Type|Amt|Size|Feather|Angle|X|Y))$/;
+const BRUSH_ONLY = /^((dx|lk)(Brush|Hard)|healSize|filmWeave)$/;
+const FINISH_ONLY = /^(film(Flicker|Dust)|halation|halThreshold|halRadius|halHue|halSat|glow|glowThreshold|glowRadius|glowWarmth|vig\w*|grain\w*|ca|blur(Type|Amt|Size|Feather|Angle|X|Y))$/;
 
 export class Pipeline {
   g: GL;
@@ -105,6 +105,9 @@ export class Pipeline {
   }
 
   /** Forget cached blurs (call when the source image changes). */
+  /** Per-frame film state for video: grain seed (changes per film frame) and flicker. */
+  filmFrame = { seed: 1337, dust: 7331, flicker: 0 };
+
   invalidate() {
     if (this.globals) {
       for (const t of [this.globals.A, this.globals.texB, this.globals.clarB, this.globals.largeB]) this.g.release(t);
@@ -539,7 +542,10 @@ export class Pipeline {
       u1('uGrainColor', v.grainColor / 100);
       u1('uGrainSh', v.grainShadows / 100);
       u1('uGrainHi', v.grainHighlights / 100);
-      u1('uSeed', 1337);
+      u1('uSeed', this.filmFrame.seed);
+      u1('uFlick', this.filmFrame.flicker);
+      u1('uDust', (v.filmDust ?? 0) / 100);
+      u1('uDustSeed', this.filmFrame.dust);
       u1('uClip', flipY && this.clip ? 1 : 0);
     });
   }

@@ -68,6 +68,11 @@ export const PARAMS: ParamDef[] = [
   p('grainColor', 'Color', 0, 100, 0),
   p('grainShadows', 'In shadows', 0, 100, 70),
   p('grainHighlights', 'In highlights', 0, 100, 35),
+  // video film: grain that moves, projector flicker, gate weave, dust and scratches
+  p('grainMotion', 'Motion', 0, 3, 2, { fmt: (v) => ['Still', '12 fps', '24 fps', 'Every frame'][Math.round(v)] }),
+  p('filmFlicker', 'Flicker', 0, 100, 0),
+  p('filmWeave', 'Gate weave', 0, 100, 0),
+  p('filmDust', 'Dust & scratches', 0, 100, 0),
   // Halation
   p('halation', 'Amount', 0, 100),
   p('halThreshold', 'Threshold', 0, 100, 65),

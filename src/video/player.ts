@@ -4,7 +4,7 @@
 // against a smooth clock read from the audio output. The sound is one premixed track (see
 // audio.ts), so there's nothing to schedule while playing. Paused, seeking fetches the exact
 // frame (latest request wins).
-import { EncodedPacketSink, type VideoSample, type VideoSampleSink } from 'mediabunny';
+import { CanvasSink, EncodedPacketSink, type VideoSample, type VideoSampleSink } from 'mediabunny';
 import type { Media, MediaLib } from './media';
 import type { AudioEngine } from './audio';
 import type { GpuFrame } from './compose';
@@ -23,6 +23,8 @@ export interface Frame {
   pre?: GpuFrame;
   /** timeline time it's shown for */
   t?: number;
+  /** the bitmap is already rotated upright (key frame cache) */
+  upright?: boolean;
 }
 
 /** a decoded frame waiting for its moment */
@@ -37,6 +39,9 @@ const QMAX = 4;
 
 /** Frames kept for scrubbing backwards (each a preview-size bitmap). */
 const REV_MAX = 90;
+/** cached key frames in all (each a small picture, KEY_LONG px on the long side) */
+const KEYS_MAX = 240;
+const KEY_LONG = 480;
 const REV_LONG = 960;
 
 
@@ -57,6 +62,8 @@ export class Player {
   private imgT = 0;
   private space: (() => void) | null = null;
   private lastTime = 0;
+  /** true when stills need redrawing while playing (moving grain, flicker…) */
+  stillMoves: () => boolean = () => false;
   /** copies a decoded frame to the GPU (set by the video editor) */
   upload: (vf: VideoFrame) => GpuFrame = () => {
     throw new Error('no uploader');
@@ -113,6 +120,18 @@ export class Player {
 
   /** Show the frame at T without moving the playhead (e.g. the edge being trimmed). */
   peek(T: number, fast = false) {
+    // how fast the finger is going, in timeline seconds per second
+    const now = performance.now(), dt = now - this.lastReq.at;
+    if (fast && dt > 0) {
+      const v = Math.abs(T - this.lastReq.T) / (dt / 1000);
+      this.speed = dt > 250 ? v : this.speed * 0.6 + v * 0.4;
+    } else if (!fast) this.speed = 0;
+    // the drag's direction, over the last eighth of a second (steadier than one step)
+    this.hist.push([now, T]);
+    while (this.hist.length > 2 && now - this.hist[1][0] > 120) this.hist.shift();
+    const d = T - this.hist[0][1];
+    this.dragDir = fast && Math.abs(d) > 0.06 ? Math.sign(d) : 0;
+    this.lastReq = { T, at: now };
     this.seekWant = { T: Math.max(0, T), fast };
     clearTimeout(this.settle);
     // the exact frame once requests stop coming
@@ -120,6 +139,90 @@ export class Player {
     if (!this.seekBusy) void this.seekLoop();
   }
   private settle = 0;
+  private speed = 0;
+  private hist: [number, number][] = [];
+  /** which way the finger is going: 1, -1, or 0 (still / unclear) */
+  private dragDir = 0;
+
+  /** While dragging, a frame that would step back against the drag (from a wobble): skip it. */
+  private against(m: Media, ts: number) {
+    if (!this.dragDir || this.shownTs.media !== m.id) return false;
+    return (ts - this.shownTs.ts) * this.dragDir < -0.05;
+  }
+  /** how many frames a second scrub decoding keeps up with (learnt while dragging) */
+  private decCap = 180;
+  private probeAt = 0;
+  private lastReq = { T: 0, at: 0 };
+
+  // ---- key frame cache: every whole frame the file stores (about one a second), decoded once
+  // in the background into small pictures. A fast drag shows these instantly, with no decoding
+  // at all; the decoder takes over as the finger slows, and the exact frame lands when it stops.
+
+  private keys = new Map<string, { ts: number; bmp: ImageBitmap }[]>();
+  private keyBusy = new Set<string>();
+  private keyTotal = 0;
+
+  async buildKeys(m: Media) {
+    if (!m.video || this.keys.has(m.id) || this.keyBusy.has(m.id) || this.keyTotal > KEYS_MAX) return;
+    this.keyBusy.add(m.id);
+    try {
+      let ks = this.keySinks.get(m.id);
+      if (!ks) this.keySinks.set(m.id, (ks = new EncodedPacketSink(m.video)));
+      const ts: number[] = [];
+      let pk = await ks.getKeyPacket(0, { metadataOnly: true });
+      while (pk && ts.length < 900) {
+        ts.push(pk.timestamp);
+        pk = await ks.getNextKeyPacket(pk, { metadataOnly: true });
+      }
+      // a very long clip with many key frames: keep an even spread
+      const room = Math.max(8, KEYS_MAX - this.keyTotal);
+      const step = Math.max(1, Math.ceil(ts.length / room));
+      const pick = ts.filter((_, i) => i % step === 0);
+      const sink = new CanvasSink(m.video, { width: m.w >= m.h ? KEY_LONG : undefined, height: m.w < m.h ? KEY_LONG : undefined, fit: 'contain' });
+      const out: { ts: number; bmp: ImageBitmap }[] = [];
+      this.keys.set(m.id, out);
+      let i = 0;
+      for await (const w of sink.canvasesAtTimestamps(pick)) {
+        const t = pick[i++];
+        if (!w) continue;
+        // (the sink's picture is already turned upright, unlike raw frames: see Frame.upright)
+        out.push({ ts: w.timestamp ?? t, bmp: await createImageBitmap(w.canvas) });
+        this.keyTotal++;
+        if (this.playing) await new Promise((r) => setTimeout(r, 50)); // stay out of playback's way
+      }
+    } catch (e) {
+      console.warn('key frame cache failed', e);
+    } finally {
+      this.keyBusy.delete(m.id);
+    }
+  }
+
+  /**
+   * The cached key frame to show for a fast drag to t: between the screen and the finger (never
+   * past the finger, so nothing has to come back), and nearest the finger. Going forward it must
+   * also be ahead of the scrub decoder, otherwise decoding on is as quick and shows more frames.
+   * `wide` (a very fast drag, faster than any decoder): the nearest one either side of the
+   * finger, up to half a second past it.
+   */
+  private keyNear(m: Media, t: number, dir: number, shown: number | null, wide: boolean) {
+    const K = this.keys.get(m.id);
+    if (!K?.length) return null;
+    const sc = this.scrub?.media === m.id ? this.scrub : null;
+    let best: (typeof K)[number] | null = null;
+    for (const k of K) {
+      if (wide) {
+        if (Math.abs(k.ts - t) > 0.5 || (shown !== null && (dir > 0 ? k.ts <= shown + 1e-4 : k.ts >= shown - 1e-4))) continue;
+        if (!best || Math.abs(k.ts - t) < Math.abs(best.ts - t)) best = k;
+      } else if (dir > 0) {
+        if (k.ts > t + 1e-4 || (shown !== null && k.ts <= shown + 1e-4) || (sc && k.ts <= sc.ts + 1e-4)) continue;
+        if (!best || k.ts > best.ts) best = k;
+      } else {
+        if (k.ts < t - 0.04 || (shown !== null && k.ts >= shown - 1e-4)) continue;
+        if (!best || k.ts < best.ts) best = k;
+      }
+    }
+    return best;
+  }
 
   /**
    * One open decoder for scrubbing: moving forward a little just decodes on from where it is
@@ -197,7 +300,7 @@ export class Player {
     // decode on to the frame covering t (or as far as the budget goes)
     let cur: VideoSample | null = sc!.peek;
     sc!.peek = null;
-    let n = 0;
+    let n = 0, dec = 0;
     for (;;) {
       if (cur && cur.timestamp + (cur.duration || 1 / 60) > t + 1e-4) break;
       if (n++ >= budget) break;
@@ -210,6 +313,13 @@ export class Player {
       }
       cur?.close();
       cur = r.value;
+      dec++;
+    }
+    // does the decoder keep up with the finger? (decides how the fastest drags are shown)
+    if (fast && dec && cur && this.speed > 2) {
+      const gap = t - cur.timestamp, need = this.speed * m.fps;
+      if (gap > 0.3) this.decCap = Math.min(this.decCap, need * 0.9);
+      else if (gap < 0.1 && need > this.decCap * 0.85) this.decCap = Math.min(2000, Math.max(this.decCap, need * 1.15));
     }
     if (!cur) return null;
     sc!.ts = cur.timestamp;
@@ -319,11 +429,39 @@ export class Player {
         const sink = this.vSink(m);
         if (!sink) continue;
         const t = Math.min(at.src, m.duration - 1e-3);
+        // a fast drag: the cached key frame nearest the finger, no decoding at all
+        if (fast && this.speed > 2.5) {
+          const dir = this.dragDir || (this.lastT.media === m.id ? Math.sign(t - this.lastT.t) : 1);
+          const shown = this.shownTs.media === m.id ? this.shownTs.ts : null;
+          // faster than the decoder can go through frames
+          const wide = this.speed * m.fps > this.decCap;
+          const k = dir ? this.keyNear(m, t, dir, shown, wide) : null;
+          if (k) {
+            // the decoder is behind it: start it again from this key frame (t's own, going forward)
+            if (dir > 0) this.closeScrub();
+            this.onFrame({ clip, media: m, sample: null, bitmap: k.bmp, ts: k.ts, t: T, upright: true });
+            this.shownTs = { media: m.id, ts: k.ts };
+            this.lastT = { media: m.id, t };
+            continue;
+          }
+          if (dir === 0) continue;
+          // too fast to decode: wait for the next key frame (the exact frame comes when it stops),
+          // trying the decoder now and then in case it can keep up after all
+          if (wide && this.keys.get(m.id)?.length) {
+            const now = performance.now();
+            if (now - this.probeAt < 150) continue;
+            this.probeAt = now;
+          }
+        }
         // scrubbing backwards: from the cache when it has the frame; otherwise the quick
         // frame now, and the second before t goes into the cache in the background
         if (fast && this.backward(m, t)) {
           // the exact frame from the cache, else the nearest cached one just ahead of the finger
           const b = this.cached(m, t) ?? this.near(m, t, this.shownTs.media === m.id ? this.shownTs.ts : Infinity);
+          if (b && this.against(m, b.ts)) {
+            this.lastT = { media: m.id, t };
+            continue;
+          }
           if (b) {
             this.onFrame({ clip, media: m, sample: null, bitmap: b.bmp, ts: b.ts, t: T });
             this.shownTs = { media: m.id, ts: b.ts };
@@ -332,7 +470,11 @@ export class Player {
           }
           if (!this.filling) this.filling = this.fillBack(m, sink, t).catch(() => {}).finally(() => (this.filling = null));
         }
-        const s = await this.frameAt(m, sink, t, fast);
+        let s = await this.frameAt(m, sink, t, fast);
+        if (s && fast && this.against(m, s.timestamp)) {
+          s.close();
+          s = null;
+        }
         if (s) {
           this.shownTs = { media: m.id, ts: s.timestamp };
           this.onFrame({ clip, media: m, sample: s, t: T });
@@ -496,8 +638,8 @@ export class Player {
         this.cur = due;
         this.onFrame({ clip: due.clip, media: due.media, sample: null, pre: due.pre ?? undefined, t: due.tl });
         this.space?.();
-      } else if (this.cur && this.cur.media.kind === 'image' && (this.cur.clip.kf?.length ?? 0) > 1 && t - this.imgT >= 1 / 60) {
-        // a photo with keyframes moves on its own (it has no frames): 60 updates a second
+      } else if (this.cur && this.cur.media.kind === 'image' && ((this.cur.clip.kf?.length ?? 0) > 1 || this.stillMoves()) && t - this.imgT >= 1 / 60) {
+        // a photo with keyframes (or moving grain) moves on its own (it has no frames): 60 updates a second
         this.imgT = t;
         this.onFrame({ clip: this.cur.clip, media: this.cur.media, sample: null, t });
       }
@@ -512,6 +654,8 @@ export class Player {
     this.pause();
     this.closeScrub();
     this.clearRev();
+    for (const K of this.keys.values()) for (const k of K) k.bmp.close();
+    this.keys.clear();
     this.keySinks.clear();
     this.vSinks.clear();
     void this.ctx?.close();

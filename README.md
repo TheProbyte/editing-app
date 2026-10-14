@@ -32,13 +32,19 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Text:** titles with Pixel / Sans / Serif type, colours and a box; drag them on the video, and drag or
   trim their bar in the timeline to set when they show.
 - **Music:** add a song (fades in/out), set its volume and where in the song to start.
+- **Film grain that moves:** in Grain, video adds **Motion** (Still / 12 fps / 24 fps / every frame),
+  **Flicker**, **Gate weave** (the picture drifting in the projector gate) and **Dust & scratches**, plus
+  **8mm / 16mm / 35mm / Clean** presets. Everything is keyed to the film frame, so the export matches the
+  preview frame for frame, and exports with moving grain get extra bitrate so the grain survives encoding.
 - **Play:** the play button or a tap on the video.
 - **How it stays smooth:** frames are decoded ahead and copied to GPU textures the moment they arrive; one
   display loop shows each on the refresh it's due, against the audio output's own clock (interpolated, and
   allowing for Bluetooth delay). The soundtrack is mixed once in the background after each edit into one
   continuous track, so playback has nothing to schedule and can't drop out. Scrubbing keeps a decoder open
-  (forward is just decoding on), jumps to key frames while the finger moves fast, caches the second behind
-  the playhead for reverse scrubbing, and lands on the exact frame when you stop. 480p / 720p footage is
+  (forward is just decoding on), caches the second behind the playhead for reverse scrubbing, and lands on
+  the exact frame when you stop. Every key frame of a clip is also decoded once in the background into a
+  small picture: a drag faster than the decoder can follow (it learns how fast that is) shows those
+  instantly, and no frame is ever shown against the direction you're dragging. 480p / 720p footage is
   previewed at its own size, an edit with no adjustments skips the photo pipeline entirely, and the preview
   resolution only steps down if a phone can't keep up.
 - **Export:** 720p / 1080p / 1440p / 4K (up to the source), 24 / 30 / 60 fps, MP4 with the phone's hardware

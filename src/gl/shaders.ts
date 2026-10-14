@@ -575,6 +575,9 @@ uniform vec2 uVigC;
 uniform float uGrain, uGrainCell, uGrainRough, uGrainColor, uGrainSh, uGrainHi;
 uniform float uSeed;
 uniform float uClip;
+uniform float uFlick;   // this film frame's flicker (exposure multiplier - 1)
+uniform float uDust;    // dust & scratches amount (video)
+uniform float uDustSeed; // changes every film frame, even with still grain
 
 vec2 gradDir(ivec2 c, uint seed) {
   float a = rnd(c, seed) * 6.2831853;
@@ -676,6 +679,32 @@ void main() {
     float amp = uGrain * 0.2 * resp * env;
     p += n * amp;
     p = max(p, 0.0);
+  }
+
+  if (uFlick != 0.0) p *= 1.0 + uFlick;
+
+  if (uDust > 0.0) {
+    // dust: a sparse scatter of specks that changes every film frame (mostly dark dirt, some
+    // white where the dust sat on the negative); sized on the frame, not on pixels
+    uint seed = uint(uDustSeed);
+    vec2 g = gUv * uFull / shortEdge * 26.0;
+    ivec2 ci = ivec2(floor(g));
+    if (rnd(ci, seed + 501u) > 1.0 - 0.035 * uDust) {
+      vec2 c0 = vec2(rnd(ci, seed + 502u), rnd(ci, seed + 503u)) * 0.8 + 0.1;
+      vec2 sq = vec2(1.0, 0.45 + rnd(ci, seed + 506u));
+      float rad = 0.035 + 0.11 * pow(rnd(ci, seed + 504u), 2.0);
+      float d = length((fract(g) - c0) * sq);
+      float m = 1.0 - smoothstep(rad * 0.55, rad, d);
+      float white = step(0.72, rnd(ci, seed + 505u));
+      p = mix(p, vec3(mix(0.03, 0.92, white)), m * 0.85);
+    }
+    // a thin scratch running down some frames
+    if (rnd(ivec2(3, 7), seed + 600u) < 0.3 * uDust) {
+      float xs = 0.08 + 0.84 * rnd(ivec2(5, 1), seed + 601u);
+      float dx = abs(gUv.x - xs - 0.0012 * sin(gUv.y * 6.0 + float(seed % 97u)));
+      float m = 1.0 - smoothstep(0.0, 0.0011 * (1500.0 / shortEdge) + 0.0007, dx);
+      p = mix(p, vec3(0.9), m * 0.55 * smoothstep(0.0, 0.2, uDust));
+    }
   }
 
   vec3 outc = linToSrgb(toLin(p));

@@ -35,7 +35,7 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
 
   const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
   // bits per pixel per frame, capped at what phones record at
-  const bitrate = Math.min(80e6, o.w * o.h * o.fps * (o.quality === 'max' ? 0.3 : 0.16));
+  const bitrate = Math.round(Math.min(80e6, o.w * o.h * o.fps * (o.quality === 'max' ? 0.3 : 0.16)));
   const video = new CanvasSource(o.canvas, { codec: vcodec, bitrate: bitrate || (o.quality === 'max' ? QUALITY_VERY_HIGH : QUALITY_HIGH), keyFrameInterval: 2 });
   output.addVideoTrack(video, { frameRate: o.fps });
   let audio: AudioBufferSource | null = null;

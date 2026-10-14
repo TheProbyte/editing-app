@@ -17,6 +17,7 @@ uniform int uFlip;
 uniform int uBgMode;    // 0 colour, 1 texture
 uniform vec3 uBgColor;
 uniform float uBgDim;
+uniform int uTaps;      // 1: shrinking a lot without mipmaps: average 4 spread taps
 vec4 bgAt(vec2 uv) {
   if (uBgMode == 0) return vec4(uBgColor, 1.0);
   // the background copy is tiny; a few taps smooth its texels into a soft blur
@@ -29,17 +30,24 @@ void main() {
   // texel rows run top to bottom here, like an uploaded image
   vec2 p = vUv * uOut;
   vec2 d = (p - 0.5 * uOut - uOff) / uDisp + 0.5;
-  vec4 bg = bgAt(vUv);
   vec2 e = min(d, 1.0 - d) * uDisp;
   float a = clamp(min(e.x, e.y) + 0.5, 0.0, 1.0);
+  vec2 q = clamp(d, 0.0, 1.0);
+  if (uFlip == 1) q.x = 1.0 - q.x;
+  vec2 r = q;
+  if (uRot == 1) r = vec2(q.y, 1.0 - q.x);
+  else if (uRot == 2) r = vec2(1.0 - q.x, 1.0 - q.y);
+  else if (uRot == 3) r = vec2(1.0 - q.y, q.x);
+  // footprint of one output pixel in the source (taken before any branching)
+  vec2 dx = dFdx(r) * 0.3, dy = dFdy(r) * 0.3;
+  vec4 bg = bgAt(vUv);
   if (a <= 0.0) { o = bg; return; }
-  d = clamp(d, 0.0, 1.0);
-  if (uFlip == 1) d.x = 1.0 - d.x;
-  vec2 r = d;
-  if (uRot == 1) r = vec2(d.y, 1.0 - d.x);
-  else if (uRot == 2) r = vec2(1.0 - d.x, 1.0 - d.y);
-  else if (uRot == 3) r = vec2(1.0 - d.y, d.x);
-  o = mix(bg, vec4(texture(uSrc, r).rgb, 1.0), a);
+  vec3 c;
+  if (uTaps == 1) {
+    c = (texture(uSrc, r + dx + dy).rgb + texture(uSrc, r + dx - dy).rgb +
+         texture(uSrc, r - dx + dy).rgb + texture(uSrc, r - dx - dy).rgb) * 0.25;
+  } else c = texture(uSrc, r).rgb;
+  o = mix(bg, vec4(c, 1.0), a);
 }`;
 
 const OVER = `#version 300 es
@@ -73,6 +81,7 @@ export class Compositor {
   /** the raw decoded frame (re-specified each frame, so not an immutable texture) */
   raw: WebGLTexture;
   private rawSize = { w: 0, h: 0 };
+  private rawMip = false;
   private bgT: Target | null = null;
   private textTex: WebGLTexture;
   private textKey = '';
@@ -110,6 +119,7 @@ export class Compositor {
     const mip = quality && Math.max(w, h) > outLong * 1.6;
     if (mip) gl.generateMipmap(gl.TEXTURE_2D);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
+    this.rawMip = mip;
   }
 
   /** A still's own texture (made once per image). */
@@ -179,6 +189,8 @@ export class Compositor {
       gl.uniform1i(p.loc('uBgMode'), bg.mode);
       gl.uniform3fv(p.loc('uBgColor'), bg.color);
       gl.uniform1f(p.loc('uBgDim'), 0.72);
+      // shrinking the raw frame a lot with no mipmaps (playback): supersample instead
+      gl.uniform1i(p.loc('uTaps'), src.tex === this.raw && !this.rawMip && 1 / k > 1.5 ? 1 : 0);
     });
   }
 

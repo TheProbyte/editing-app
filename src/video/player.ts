@@ -1,7 +1,7 @@
 // Playback: frames are decoded ahead with Mediabunny and shown when the audio clock reaches
 // them; audio for every clip (and the music) is scheduled on a Web Audio graph, so picture
 // and sound share one clock. Paused, seeking fetches the exact frame (latest request wins).
-import type { VideoSample, VideoSampleSink, AudioBufferSink } from 'mediabunny';
+import { EncodedPacketSink, type VideoSample, type VideoSampleSink, type AudioBufferSink } from 'mediabunny';
 import type { Media, MediaLib } from './media';
 import { clipAt, clipLen, layout, type VClip, type VideoProject } from './project';
 
@@ -10,7 +10,17 @@ export interface Frame {
   media: Media;
   /** null for stills */
   sample: VideoSample | null;
+  /** a cached preview-size copy instead of a sample (reverse scrubbing); not to be closed */
+  bitmap?: ImageBitmap;
+  /** its source time */
+  ts?: number;
 }
+
+/** Frames kept for scrubbing backwards (each a preview-size bitmap). */
+const REV_MAX = 150;
+const REV_LONG = 640;
+
+type Opened = { it: AsyncGenerator<VideoSample, void, unknown>; first: Promise<IteratorResult<VideoSample, void>> };
 
 const raf = () => new Promise<void>((r) => requestAnimationFrame(() => r()));
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -18,6 +28,9 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 export class Player {
   playing = false;
   private T = 0;
+  /** frames dropped / shown since playback started (for dynamic resolution) */
+  drops = 0;
+  shown = 0;
   private token = 0;
   ctx: AudioContext | null = null;
   private ctxStart = 0;
@@ -26,7 +39,7 @@ export class Player {
   private vSinks = new Map<string, VideoSampleSink>();
   private aSinks = new Map<string, AudioBufferSink>();
   private seekBusy = false;
-  private seekWant: number | null = null;
+  private seekWant: { T: number; fast: boolean } | null = null;
   private master: GainNode | null = null;
 
   /** a frame to show (the receiver closes the sample) */
@@ -57,23 +70,164 @@ export class Player {
 
   // ---- paused: show the frame at T
 
-  seek(T: number) {
+  /**
+   * Show the frame at T and move the playhead there. `fast` (while a finger is moving) may
+   * show the nearest whole frame the file stores instead, which decodes in one step; the
+   * exact frame follows as soon as the finger settles.
+   */
+  seek(T: number, fast = false) {
     if (this.playing) this.pause();
     this.T = Math.max(0, T);
-    this.peek(this.T);
+    this.peek(this.T, fast);
   }
 
   /** Show the frame at T without moving the playhead (e.g. the edge being trimmed). */
-  peek(T: number) {
-    this.seekWant = Math.max(0, T);
+  peek(T: number, fast = false) {
+    this.seekWant = { T: Math.max(0, T), fast };
+    clearTimeout(this.settle);
+    // the exact frame once requests stop coming
+    if (fast) this.settle = window.setTimeout(() => this.peek(T, false), 110);
     if (!this.seekBusy) void this.seekLoop();
+  }
+  private settle = 0;
+
+  /**
+   * One open decoder for scrubbing: moving forward a little just decodes on from where it is
+   * (cheap); anything else restarts it at the stored whole frame ("key frame") before T.
+   */
+  private scrub: { media: string; it: AsyncGenerator<VideoSample, void, unknown>; ts: number; peek: VideoSample | null } | null = null;
+  private keySinks = new Map<string, EncodedPacketSink>();
+  private shownKey = { media: '', ts: -1 };
+
+  private closeScrub() {
+    const sc = this.scrub;
+    if (!sc) return;
+    this.scrub = null;
+    sc.peek?.close();
+    void sc.it.return().catch(() => {});
+  }
+
+  private async keyTime(m: Media, t: number) {
+    let ks = this.keySinks.get(m.id);
+    if (!ks) this.keySinks.set(m.id, (ks = new EncodedPacketSink(m.video!)));
+    const pk = await ks.getKeyPacket(t, { metadataOnly: true });
+    return pk ? pk.timestamp : 0;
+  }
+
+  /** The sample at source time t (exact), or the key frame before it (fast). Null: nothing new. */
+  private async frameAt(m: Media, sink: VideoSampleSink, t: number, fast: boolean): Promise<VideoSample | null> {
+    let sc = this.scrub?.media === m.id ? this.scrub : null;
+    const ahead = sc ? t - sc.ts : -1;
+    if (!sc || ahead < -1e-4 || ahead > (fast ? 0.6 : 1.5)) {
+      // restart at the key frame before t
+      const kt = await this.keyTime(m, t);
+      // close to the key frame, decoding the few frames up to t is cheap: be exact
+      const far = t - kt > 0.35;
+      if (fast && far && this.shownKey.media === m.id && Math.abs(this.shownKey.ts - kt) < 1e-4) return null;
+      this.closeScrub();
+      const it = sink.samples(kt);
+      const r = await it.next();
+      if (r.done) {
+        void it.return();
+        return null;
+      }
+      sc = this.scrub = { media: m.id, it, ts: r.value.timestamp, peek: r.value };
+      if (fast && far) {
+        this.shownKey = { media: m.id, ts: kt };
+        sc.peek = null;
+        return r.value;
+      }
+    }
+    // decode on to the frame covering t
+    let cur: VideoSample | null = sc.peek;
+    sc.peek = null;
+    for (;;) {
+      if (cur && cur.timestamp + (cur.duration || 1 / 60) > t + 1e-4) break;
+      const r = await sc.it.next();
+      if (r.done) break;
+      if (r.value.timestamp > t + 1e-4) {
+        // already past t: keep it for later, show what we have
+        sc.peek = r.value;
+        break;
+      }
+      cur?.close();
+      cur = r.value;
+    }
+    if (!cur) return null;
+    // `cur` goes to the screen (and is closed there); remember where we are
+    sc.ts = cur.timestamp;
+    this.shownKey = { media: '', ts: -1 };
+    return cur;
+  }
+
+  // ---- reverse scrubbing: video only decodes forwards, so going back a second at a time is
+  // done by decoding that whole second once into small bitmaps and showing those
+
+  private filling: Promise<unknown> | null = null;
+  private rev = new Map<string, { ts: number; end: number; bmp: ImageBitmap }[]>();
+  private revCount = 0;
+  private lastT = { media: '', t: -1 };
+
+  private backward(m: Media, t: number) {
+    return this.lastT.media === m.id && t < this.lastT.t - 1e-4;
+  }
+
+  private cached(m: Media, t: number) {
+    const L = this.rev.get(m.id);
+    if (!L) return null;
+    for (const f of L) if (t >= f.ts - 1e-4 && t < f.end) return f;
+    return null;
+  }
+
+  private async fillBack(m: Media, sink: VideoSampleSink, t: number) {
+    const kt = await this.keyTime(m, t);
+    const L = this.rev.get(m.id) ?? [];
+    this.rev.set(m.id, L);
+    // the key frame up to t (scrubbing backwards, what's after t has been passed already),
+    // stopping early at frames that are cached
+    const next = L.filter((f) => f.ts > kt).reduce((a, f) => Math.min(a, f.ts), t + 0.05);
+    if (next <= kt) return null;
+    const k = Math.min(1, REV_LONG / Math.max(m.video?.codedWidth ?? 1920, m.video?.codedHeight ?? 1080));
+    for await (const s of sink.samples(kt, next)) {
+      const vf = s.toVideoFrame();
+      try {
+        const bmp = await createImageBitmap(vf, { resizeWidth: Math.max(2, Math.round(vf.displayWidth * k)), resizeHeight: Math.max(2, Math.round(vf.displayHeight * k)), resizeQuality: 'medium' });
+        L.push({ ts: s.timestamp, end: s.timestamp + (s.duration || 1 / 30), bmp });
+        this.revCount++;
+      } finally {
+        vf.close();
+        s.close();
+      }
+      if (this.playing) break;
+    }
+    L.sort((a, b) => a.ts - b.ts);
+    // bounded: drop the frames furthest from where we are
+    while (this.revCount > REV_MAX) {
+      let worst: { list: typeof L; i: number; d: number } | null = null;
+      for (const list of this.rev.values()) list.forEach((f, i) => {
+        const d = Math.abs(f.ts - t) + (list === L ? 0 : 1e6);
+        if (!worst || d > worst.d) worst = { list, i, d };
+      });
+      if (!worst) break;
+      const w = worst as { list: typeof L; i: number };
+      w.list[w.i].bmp.close();
+      w.list.splice(w.i, 1);
+      this.revCount--;
+    }
+    return this.cached(m, t);
+  }
+
+  private clearRev() {
+    for (const L of this.rev.values()) for (const f of L) f.bmp.close();
+    this.rev.clear();
+    this.revCount = 0;
   }
 
   private async seekLoop() {
     this.seekBusy = true;
     try {
       while (this.seekWant !== null) {
-        const T = this.seekWant;
+        const { T, fast } = this.seekWant;
         this.seekWant = null;
         const p = this.project();
         const at = clipAt(p, T);
@@ -87,13 +241,25 @@ export class Player {
         }
         const sink = this.vSink(m);
         if (!sink) continue;
-        const s = (await sink.getSample(at.src)) ?? (await sink.getSample(m.duration * 0.999));
-        if (!s) continue;
-        // a newer request came in while decoding: still show this one (it's close), then go on
-        this.onFrame({ clip, media: m, sample: s });
+        const t = Math.min(at.src, m.duration - 1e-3);
+        // scrubbing backwards: from the cache when it has the frame; otherwise the quick
+        // frame now, and the second before t goes into the cache in the background
+        if (fast && this.backward(m, t)) {
+          const b = this.cached(m, t);
+          if (b) {
+            this.onFrame({ clip, media: m, sample: null, bitmap: b.bmp, ts: b.ts });
+            this.lastT = { media: m.id, t };
+            continue;
+          }
+          if (!this.filling) this.filling = this.fillBack(m, sink, t).catch(() => {}).finally(() => (this.filling = null));
+        }
+        const s = await this.frameAt(m, sink, t, fast);
+        if (s) this.onFrame({ clip, media: m, sample: s });
+        this.lastT = { media: m.id, t };
       }
     } catch (e) {
       console.warn('seek failed', e);
+      this.closeScrub();
     } finally {
       this.seekBusy = false;
     }
@@ -110,12 +276,34 @@ export class Player {
     if (this.ctx.state !== 'running') await this.ctx.resume();
     this.master ??= this.ctx.createGain();
     this.master.connect(this.ctx.destination);
+    // the scrub decoder isn't needed while playing (phones have only a few decoders)
+    this.closeScrub();
+    clearTimeout(this.settle);
+    this.seekWant = null;
     this.playing = true;
+    this.drops = 0;
+    this.shown = 0;
     const token = ++this.token;
     this.startT = this.T;
+    this.ctxStart = this.ctx.currentTime + 3600; // the clock holds at startT until it really starts
+    // decode the first frame before the clock starts, so playback begins without a stutter
+    const plan = this.plan(this.startT);
+    let first: Opened | null = null;
+    const m0 = plan[0] && this.lib.get(plan[0].clip.src);
+    const sink0 = m0 && m0.kind === 'video' ? this.vSink(m0) : null;
+    if (sink0) {
+      const it = sink0.samples(plan[0].from, plan[0].clip.out);
+      const r = await Promise.race([it.next(), sleep(1500).then(() => null)]);
+      first = { it, first: r ? Promise.resolve(r) : it.next() };
+      if (!this.alive(token)) {
+        void first.first.then((x) => x.value && x.value.close()).catch(() => {});
+        void it.return();
+        return;
+      }
+    }
     // a small lead so the first frame and sound are ready together
-    this.ctxStart = this.ctx.currentTime + 0.12;
-    void this.videoLoop(token);
+    this.ctxStart = this.ctx.currentTime + 0.06;
+    void this.videoLoop(token, plan, first);
     void this.audioLoop(token);
     void this.musicLoop(token);
     void this.clockLoop(token);
@@ -165,10 +353,9 @@ export class Player {
     return p.clips.slice(at.i).map((c, k) => ({ clip: c, start: starts[at.i + k], from: k === 0 ? at.src : c.in }));
   }
 
-  private async videoLoop(token: number) {
-    const plan = this.plan(this.startT);
+  private async videoLoop(token: number, plan: ReturnType<Player['plan']>, primed: Opened | null) {
     // decoding of the next clip starts a little before the current one ends
-    let pending: { it: AsyncGenerator<VideoSample, void, unknown>; first: Promise<IteratorResult<VideoSample, void>> } | null = null;
+    let pending: Opened | null = primed;
     const open = (k: number) => {
       const c = plan[k];
       const m = c && this.lib.get(c.clip.src);
@@ -209,8 +396,13 @@ export class Player {
             break;
           }
           // running late: skip frames whose time has fully passed (but never all of them)
-          if (this.time > tlEnd && tlEnd < end - 0.001) s.close();
-          else this.onFrame({ clip, media: m, sample: s });
+          if (this.time > tlEnd && tlEnd < end - 0.001) {
+            s.close();
+            this.drops++;
+          } else {
+            this.shown++;
+            this.onFrame({ clip, media: m, sample: s });
+          }
           if (!pending && end - this.time < 1.2) pending = open(k + 1);
           r = await cur.it.next();
         }
@@ -318,6 +510,9 @@ export class Player {
   /** Forget decoders for media no longer used. */
   dispose() {
     this.pause();
+    this.closeScrub();
+    this.clearRev();
+    this.keySinks.clear();
     this.vSinks.clear();
     this.aSinks.clear();
     void this.ctx?.close();

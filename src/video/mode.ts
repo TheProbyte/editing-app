@@ -26,6 +26,10 @@ export interface VideoHost {
   state(): EditState;
   commit(): void;
   requestRender(): void;
+  /** render right now (playback: a frame is shown the moment it's due) */
+  renderSync(): void;
+  /** the render resolution cap changed (see renderCap) */
+  syncScale(): void;
   /** the project frame was (re)made: use it as the photo; `resized` = new size */
   frameChanged(src: Source, target: Target, resized: boolean): void;
   toast(msg: string, ms?: number): void;
@@ -83,11 +87,15 @@ export class VideoMode {
       project: () => this.project,
       time: () => this.player.time,
       scrub: (T) => {
-        this.player.seek(T);
+        this.interactive();
+        this.player.seek(T, true);
         this.syncPlayButton();
         this.onTime();
       },
-      peek: (T) => this.player.peek(T),
+      peek: (T) => {
+        this.interactive();
+        this.player.peek(T, true);
+      },
       changed: (commit) => this.changed(commit),
       select: (s) => this.select(s),
       selection: () => this.sel,
@@ -228,13 +236,14 @@ export class VideoMode {
     this.h.frameChanged({ tex: this.frameT!.tex, w, h, linear: false }, this.frameT!, resized);
   }
 
-  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true): FrameSource {
+  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true, bitmap?: ImageBitmap): FrameSource {
     if (m.kind === 'image' && m.bitmap) {
       let t = this.imgTex.get(m.id);
       if (!t) this.imgTex.set(m.id, (t = this.comp.imageTexture(m.bitmap)));
       return { tex: t, w: m.bitmap.width, h: m.bitmap.height, rot: 0, flip: false };
     }
-    if (sample) {
+    if (bitmap) this.comp.upload(bitmap, bitmap.width, bitmap.height, outLong, false);
+    else if (sample) {
       const vf = sample.toVideoFrame();
       this.comp.upload(vf, vf.displayWidth, vf.displayHeight, outLong, quality);
       vf.close();
@@ -249,12 +258,65 @@ export class VideoMode {
       return;
     }
     if (!this.frameT) this.ensureFrame();
-    const src = this.srcFor(f.media, f.sample, PREVIEW_LONG, !this.player.playing);
+    const src = this.srcFor(f.media, f.sample, PREVIEW_LONG, !this.player.playing, f.bitmap);
     f.sample?.close();
     this.last = { src, media: f.media.id };
     this.comp.place(src, this.frameT!, this.project);
     this.h.pipe.invalidate();
-    this.h.requestRender();
+    if (this.player.playing) this.h.renderSync();
+    else this.h.requestRender();
+  }
+
+  // ---- dynamic resolution: while playing or scrubbing, the preview renders as sharp as the
+  // phone keeps up with; if frames start arriving late it steps down a little, and climbs
+  // back when there's room. Paused, it's always full quality.
+
+  private dyn = 1;
+  private busyUntil = 0;
+  private capTimer = 0;
+  private lastCap = 1;
+  private dynCheck = { t: 0, drops: 0, shown: 0, calm: 0 };
+  private static LEVELS = [1, 0.85, 0.7, 0.55]; // the app's render-scale steps
+
+  /** The longest side the preview may render at, as a fraction of the project frame. */
+  renderCap() {
+    return this.player.playing || performance.now() < this.busyUntil ? this.dyn : 1;
+  }
+
+  /** A scrub / trim is going on: render at the moving-picture quality for a moment. */
+  private interactive() {
+    this.busyUntil = performance.now() + 350;
+    clearTimeout(this.capTimer);
+    this.capTimer = window.setTimeout(() => this.updateCap(), 380);
+    this.updateCap();
+  }
+
+  private updateCap() {
+    const c = this.renderCap();
+    if (c !== this.lastCap) {
+      this.lastCap = c;
+      this.h.syncScale();
+    }
+  }
+
+  private tuneResolution() {
+    const now = performance.now(), d = this.dynCheck, P = this.player;
+    if (now - d.t < 1000) return;
+    const drops = P.drops - d.drops, shown = P.shown - d.shown;
+    d.t = now;
+    d.drops = P.drops;
+    d.shown = P.shown;
+    if (drops + shown < 8) return;
+    const L = VideoMode.LEVELS;
+    const i = L.indexOf(this.dyn);
+    if (drops / (drops + shown) > 0.06 && i < L.length - 1) {
+      this.dyn = L[i + 1];
+      d.calm = 0;
+    } else if (drops === 0 && ++d.calm >= 3 && i > 0) {
+      this.dyn = L[i - 1];
+      d.calm = 0;
+    }
+    this.updateCap();
   }
 
   /** Canvas settings changed: place the current frame again. */
@@ -319,7 +381,11 @@ export class VideoMode {
       this.player.seek(this.player.time);
     } else {
       if (!this.project.clips.length) return this.pickMedia();
-      void this.player.play().then(() => this.syncPlayButton());
+      this.dynCheck = { t: performance.now(), drops: 0, shown: 0, calm: 0 };
+      void this.player.play().then(() => {
+        this.syncPlayButton();
+        this.updateCap();
+      });
     }
     this.syncPlayButton();
   }
@@ -330,11 +396,19 @@ export class VideoMode {
   }
 
   private lastTextKey = '';
+  private lastLabel = '';
   private onTime() {
     const T = this.player.time;
     const total = layout(this.project).total;
-    $('tlTime').innerHTML = `<b>${fmtTime(T)}</b> / ${fmtTime(total)}`;
+    // the label changes ten times a second at most: only touch the DOM then
+    const label = `<b>${fmtTime(T)}</b> / ${fmtTime(total)}`;
+    if (label !== this.lastLabel) {
+      this.lastLabel = label;
+      $('tlTime').innerHTML = label;
+    }
     this.timeline.draw();
+    if (this.player.playing) this.tuneResolution();
+    else this.updateCap();
     // titles appearing or going away need a render even on a still frame
     const key = this.visibleTexts(T).map((t) => t.id).join();
     if (key !== this.lastTextKey) {
@@ -745,8 +819,8 @@ export class VideoMode {
     this.player.pause();
     this.syncPlayButton();
     const L = this.sourceLong();
-    this.ex.res = L >= 2000 ? 1920 : L >= 1200 ? 1280 : 720;
-    if (this.ex.res === 1920 && L >= 3000) this.ex.res = 1920; // 4K is a choice, not the default
+    // the footage's own size, up to 1080p (1440p / 4K are there to pick)
+    this.ex.res = L >= 1800 ? 1920 : L >= 1200 ? 1280 : 720;
     this.ex.fps = this.sourceFps();
     this.buildExport();
     $('vexSheet').classList.add('on');

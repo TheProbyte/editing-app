@@ -414,9 +414,11 @@ export class App {
     if (!fw) return 1;
     const shown = fw * this.view.base * this.zoom.s * (window.devicePixelRatio || 1); // device px across the photo
     const fullW = outputSize(this.viewState(), this.img.preview.w, this.img.preview.h).w;
-    const need = (shown / fullW) * 1.04;
+    // a playing / scrubbing video may render a little softer if the phone can't keep up
+    const need = Math.min((shown / fullW) * 1.04, this.video?.renderCap() ?? 1);
     let lv = [0.4, 0.55, 0.7, 0.85, 1].find((l) => l >= need) ?? 1;
-    if (lv < this.rs && need > this.rs * 0.8) lv = this.rs; // don't flip-flop at the edge of a level
+    // don't flip-flop at the edge of a level (unless a video is asking for less on purpose)
+    if (lv < this.rs && need > this.rs * 0.8 && (this.video?.renderCap() ?? 1) >= this.rs) lv = this.rs;
     return lv;
   }
   private syncRenderScale() {
@@ -1076,6 +1078,13 @@ export class App {
       state: () => this.state,
       commit: () => this.commit(),
       requestRender: () => this.requestRender(),
+      renderSync: () => {
+        cancelAnimationFrame(this.raf);
+        this.raf = 0;
+        this.renderVer++;
+        this.renderNow();
+      },
+      syncScale: () => this.syncRenderScale(),
       frameChanged: (src, target, resized) => {
         if (!this.img || resized) {
           if (this.img) this.g.destroy(this.img.thumbT);

@@ -1,5 +1,5 @@
 export interface BlurShape {
-  type: number; // 1 tilt, 2 radial
+  type: number; // 1 tilt, 2 radial, 3 lens (just a focus point)
   x: number;
   y: number;
   /** focus half-size and transition, in image heights */
@@ -48,7 +48,10 @@ export class BlurOverlay {
     const s = this.get();
     if (!s.type) return false;
     const { c, h } = this.points();
-    if (Math.hypot(h.x - e.clientX, h.y - e.clientY) < 30) this.drag = { what: 'size', dx: 0, dy: 0 };
+    if (s.type === 3) {
+      if (Math.hypot(c.x - e.clientX, c.y - e.clientY) >= 34) return false;
+      this.drag = { what: 'move', dx: e.clientX - c.x, dy: e.clientY - c.y };
+    } else if (Math.hypot(h.x - e.clientX, h.y - e.clientY) < 30) this.drag = { what: 'size', dx: 0, dy: 0 };
     else if (Math.hypot(c.x - e.clientX, c.y - e.clientY) < 34) this.drag = { what: 'move', dx: e.clientX - c.x, dy: e.clientY - c.y };
     else return false;
     this.guides = true;
@@ -69,6 +72,13 @@ export class BlurOverlay {
       this.set(p, false);
     }
     this.draw();
+  }
+
+  /** Where a screen point falls on the picture (0..1), or null when it's off it. */
+  uvAt(e: { clientX: number; clientY: number }) {
+    const r = this.host.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+    return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? { x, y } : null;
   }
 
   end() {
@@ -93,6 +103,19 @@ export class BlurOverlay {
     let g = '';
     const op = this.guides ? 1 : 0.6;
     let hx = cx + a, hy = cy;
+    if (s.type === 3) {
+      // lens: the focus point only (a focus-square reticle; tap anywhere to move it)
+      const q = 16 * k, t = 6 * k;
+      g += `<g opacity="${op}">`;
+      for (const [sx, sy] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) {
+        const x0 = cx + sx * q, y0 = cy + sy * q;
+        g += `<path class="ring" d="M${x0} ${y0 - sy * t}V${y0}H${x0 - sx * t}"/>`;
+      }
+      g += `</g><rect class="pin main" x="${cx - 4 * k}" y="${cy - 4 * k}" width="${8 * k}" height="${8 * k}"/>`;
+      this.svg.setAttribute('viewBox', `0 0 ${W} ${H}`);
+      this.svg.innerHTML = g;
+      return;
+    }
     if (s.type === 1) {
       const deg = (s.angle * 180) / Math.PI;
       const L = (W + H) * 2;
@@ -193,6 +216,13 @@ export class VignetteOverlay {
       }
     }
     this.draw();
+  }
+
+  /** Where a screen point falls on the picture (0..1), or null when it's off it. */
+  uvAt(e: { clientX: number; clientY: number }) {
+    const r = this.host.getBoundingClientRect();
+    const x = (e.clientX - r.left) / r.width, y = (e.clientY - r.top) / r.height;
+    return x >= 0 && x <= 1 && y >= 0 && y <= 1 ? { x, y } : null;
   }
 
   end() {

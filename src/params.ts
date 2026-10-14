@@ -99,11 +99,13 @@ export const PARAMS: ParamDef[] = [
   p('distortion', 'Distortion'),
   p('diffuse', 'Diffusion', 0, 100),
   // Blur (tilt-shift / radial focus)
-  p('blurType', 'Blur type', 0, 2, 0),
+  p('blurType', 'Blur type', 0, 3, 0),
   p('blurAmt', 'Blur strength', 0, 100, 60),
   p('blurSize', 'Focus size', 0, 100, 22),
   p('blurFeather', 'Transition', 0, 100, 45),
   p('blurAngle', 'Angle', -90, 90, 0, { fmt: (v) => Math.round(v) + '°' }),
+  p('lensRange', 'Depth of field', 0, 100, 20),
+  p('lensBokeh', 'Bokeh', 0, 100, 35),
   p('blurX', 'Focus X', 0, 1, 0.5),
   p('blurY', 'Focus Y', 0, 1, 0.55),
   // Double exposure

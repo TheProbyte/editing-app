@@ -1,5 +1,5 @@
 import { GL, Program, Target } from './glutil';
-import { BLUR, BRIGHT, DEVELOP, DOWNSAMPLE, FINISH, GEOMETRY } from './shaders';
+import { BLUR, BRIGHT, DEVELOP, DOWNSAMPLE, FINISH, GEOMETRY, LENS } from './shaders';
 import { buildCurveLut, isIdentity, LUT_SIZE } from '../curves';
 import { EditState, GRADE_ZONES, HSL_BANDS, Geometry, MAX_MASKS, MAX_SPOTS, MAX_SPOT_CIRCLES, spotCircles } from '../params';
 
@@ -48,7 +48,7 @@ export function outputSize(state: EditState, w: number, h: number) {
 /** Settings only the finish pass reads (halation/glow/blur *amounts* are checked separately). */
 /** brush settings: they only change what the next stroke looks like */
 const BRUSH_ONLY = /^((dx|lk)(Brush|Hard)|healSize|filmWeave)$/;
-const FINISH_ONLY = /^(film(Flicker|Dust)|halation|halThreshold|halRadius|halHue|halSat|glow|glowThreshold|glowRadius|glowWarmth|vig\w*|grain\w*|ca|blur(Type|Amt|Size|Feather|Angle|X|Y))$/;
+const FINISH_ONLY = /^(lens\w*|film(Flicker|Dust)|halation|halThreshold|halRadius|halHue|halSat|glow|glowThreshold|glowRadius|glowWarmth|vig\w*|grain\w*|ca|blur(Type|Amt|Size|Feather|Angle|X|Y))$/;
 
 export class Pipeline {
   g: GL;
@@ -58,6 +58,7 @@ export class Pipeline {
   private bright: Program;
   private dev: Program;
   private fin: Program;
+  private lensP: Program;
   private lut: WebGLTexture;
   private lutKey = '';
   private globals: Globals | null = null;
@@ -78,6 +79,71 @@ export class Pipeline {
   leak: { tex: WebGLTexture; id: string } | null = null;
   /** Hide-brush atlas for both layers (red = double exposure, green = leak) */
   overlayMask: WebGLTexture | null = null;
+  /** Depth of the photo for the lens blur (0 far … 1 near, source orientation), w×h = the source's size */
+  depth: { tex: WebGLTexture; w: number; h: number; id: string } | null = null;
+
+  /** Upload a depth map for the current photo (null removes it). */
+  setDepth(map: { data: Float32Array; w: number; h: number } | null, id: string, srcW: number, srcH: number) {
+    const gl = this.g.gl;
+    if (this.depth) gl.deleteTexture(this.depth.tex);
+    this.depth = null;
+    this.clearFx();
+    if (!map) return;
+    const tex = this.g.texture(map.w, map.h, 'f16');
+    const px = new Float32Array(map.w * map.h * 4);
+    for (let i = 0; i < map.w * map.h; i++) {
+      const d = map.data[i];
+      px[i * 4] = d;
+      px[i * 4 + 1] = d;
+      px[i * 4 + 2] = d;
+      px[i * 4 + 3] = 1;
+    }
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, map.w, map.h, gl.RGBA, gl.FLOAT, px);
+    this.depth = { tex, w: srcW, h: srcH, id };
+  }
+
+  /** The lens blur's largest radius, in pixels of an image whose short side is `S`. */
+  static lensMaxR(v: EditState['v'], S: number) {
+    return S * 0.035 * (v.blurAmt / 100);
+  }
+
+  /**
+   * Lens blur of the developed frame B, using the depth map (put through the same crop / turn
+   * as the photo). Done at a reduced size where the largest blur is at most `cap` texels.
+   * Returns [blurred picture (+ foreground cover in alpha), depth in frame space].
+   */
+  private lensBlur(B: Target, state: EditState, cap: number) {
+    const g = this.g, gl = g.gl, v = state.v, D = this.depth!;
+    const S = Math.min(B.w, B.h);
+    const maxRB = Pipeline.lensMaxR(v, S);
+    const k = Math.min(1, Math.max(0.2, cap / Math.max(1, maxRB)));
+    const ww = Math.max(8, Math.round(B.w * k)), wh = Math.max(8, Math.round(B.h * k));
+    const small = this.resize(B, ww, wh);
+    // the depth at the frame's own size (it decides per pixel what's sharp, in the finish pass)
+    const dF = g.acquire(B.w, B.h);
+    const bare: EditState = { ...state, spots: [], overlay: null, leak: null, fills: [] };
+    this.geometryPass({ tex: D.tex, w: D.w, h: D.h, linear: true }, bare, { w: B.w, h: B.h }, { x: 0, y: 0, w: B.w, h: B.h }, dF);
+    const out = g.acquire(ww, wh);
+    const n = cap > 16 ? 192 : 128;
+    g.draw(this.lensP, out, ww, wh, (p) => {
+      g.bindTex(p, 'uSrc', small.tex);
+      g.bindTex(p, 'uDepth', dF.tex);
+      gl.uniform2f(p.loc('uTexel'), 1 / ww, 1 / wh);
+      gl.uniform2f(p.loc('uFocusUv'), v.blurX, v.blurY);
+      gl.uniform1f(p.loc('uRange'), Pipeline.lensRange(v));
+      gl.uniform1f(p.loc('uMaxR'), maxRB * k);
+      gl.uniform1f(p.loc('uBokeh'), (v.lensBokeh ?? 35) / 100);
+      gl.uniform1i(p.loc('uN'), n);
+    });
+    g.release(small);
+    return [out, dF] as const;
+  }
+
+  static lensRange(v: EditState['v']) {
+    return ((v.lensRange ?? 20) / 100) * 0.25;
+  }
+
   /** Content-aware fill result in frame space (rgb + amount), and the key of what it was made from */
   fill: { tex: WebGLTexture; key: string } | null = null;
 
@@ -90,8 +156,9 @@ export class Pipeline {
     this.bright = new Program(gl, BRIGHT, 'bright');
     this.dev = new Program(gl, DEVELOP, 'develop');
     this.fin = new Program(gl, FINISH, 'finish');
-    // all six were started above; now wait for them together
-    for (const p of [this.geo, this.down, this.blurP, this.bright, this.dev, this.fin]) p.check();
+    this.lensP = new Program(gl, LENS, 'lens');
+    // all were started above; now wait for them together
+    for (const p of [this.geo, this.down, this.blurP, this.bright, this.dev, this.fin, this.lensP]) p.check();
     this.lut = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.lut);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, LUT_SIZE, 1);
@@ -490,6 +557,13 @@ export class Pipeline {
     const [hal, hal2] = slot('hal', v.halation > 0 ? `${hT}|${hS}` : null, () => make(v.halation, hT, hS, 3.5));
     const [glow, glow2] = slot('glow', v.glow > 0 ? `${gT}|${gS}` : null, () => make(v.glow, gT, gS, 3));
     // lens blur in linear light, so bright points bloom like real bokeh
+    if (Math.round(v.blurType) === 3) {
+      // lens blur: needs the depth map (until it's ready, the photo shows unblurred)
+      const on = v.blurAmt > 0 && this.depth;
+      const key = on ? `lens|${this.depth!.id}|${v.blurAmt}|${v.lensRange}|${v.lensBokeh}|${v.blurX}|${v.blurY}` : null;
+      const [blur1, blur2] = slot('blur', key, () => this.lensBlur(B, state, devKey ? 14 : 22));
+      return { hal, hal2, glow, glow2, blur1, blur2 };
+    }
     const [blur1, blur2] = slot('blur', v.blurType > 0 && v.blurAmt > 0 ? `${v.blurAmt}` : null, () => {
       const a = v.blurAmt / 100;
       return [this.blur(B, Math.max(1, S * 0.008 * a)), this.blur(B, Math.max(2, S * 0.03 * a))] as const;
@@ -518,7 +592,8 @@ export class Pipeline {
       this.g.bindTex(p, 'uBlur1', fx.blur1 ? fx.blur1.tex : this.black);
       this.g.bindTex(p, 'uBlur2', fx.blur2 ? fx.blur2.tex : this.black);
       gl.uniform1i(p.loc('uBlurType'), fx.blur1 ? Math.round(v.blurType) : 0);
-      gl.uniform4f(p.loc('uBlurP'), v.blurX, v.blurY, (v.blurSize / 100) * 0.6, 0.02 + (v.blurFeather / 100) * 0.5);
+      if (Math.round(v.blurType) === 3) gl.uniform4f(p.loc('uBlurP'), v.blurX, v.blurY, Pipeline.lensRange(v), Pipeline.lensMaxR(v, Math.min(full.w, full.h)));
+      else gl.uniform4f(p.loc('uBlurP'), v.blurX, v.blurY, (v.blurSize / 100) * 0.6, 0.02 + (v.blurFeather / 100) * 0.5);
       gl.uniform1f(p.loc('uBlurAngle'), (v.blurAngle * Math.PI) / 180);
       gl.uniform4f(p.loc('uBRect'), ...bRect);
       gl.uniform2f(p.loc('uBSize'), B.w, B.h);

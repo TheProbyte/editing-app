@@ -15,11 +15,13 @@ import { Timeline, TIMELINE_H, type Sel } from './timeline';
 import { exportVideo } from './exporter';
 import { AudioEngine } from './audio';
 import {
-  IMAGE_SECONDS, MIN_CLIP, clipAt, clipLen, fmtTime, frameAspect, frameSize, layout, newProject, uid,
-  framingAt, GRADIENTS, BG_COLORS, NO_FRAMING, type Framing,
+  IMAGE_SECONDS, MIN_CLIP, clipAt, clipLen, fmtTime, frameAspect, frameSize, layout, localAt, newProject, srcAt, subRamp, uid,
+  framingAt, GRADIENTS, BG_COLORS, NO_FRAMING, RAMPS, RAMP_CUSTOM, type Framing,
   type VAspect, type VClip, type VText, type VideoProject,
 } from './project';
 import type { VideoSample } from 'mediabunny';
+import { RampEditor } from './rampEditor';
+import { effectiveLook, lookKeyAt, lookValues, newLook, sameValues, unscopeState, upsertKey } from './looks';
 
 export interface VideoHost {
   g: GL;
@@ -42,7 +44,9 @@ export interface VideoHost {
   chip(row: HTMLElement, c: Chip, on: boolean, onClick: () => void): HTMLElement;
   tile(row: HTMLElement, icon: string, label: string, cls: string, onClick: () => void): HTMLElement;
   /** draw the finished edit of `src` onto the screen canvas at w×h */
-  renderFull(src: Source, w: number, h: number): void;
+  renderFull(src: Source, w: number, h: number, st: EditState): void;
+  /** the settings in the edit changed underneath the sliders (another clip's look came in) */
+  lookChanged(): void;
   save(blob: Blob, name: string): Promise<void>;
 }
 
@@ -84,6 +88,10 @@ export class VideoMode {
     return this.last ? this.project.clips.find((c) => c.id === this.last!.clip) ?? null : null;
   }
   private sel: Sel = null;
+  /** the clip's speed-ramp choices are showing (in Edit) */
+  private rampOpen = false;
+  private rampEd: RampEditor;
+  private toolId: string | null = null;
   exporting = false;
   private cancelExport = false;
   readonly tools: ToolDef[];
@@ -97,7 +105,14 @@ export class VideoMode {
     this.player.stillMoves = () => this.stillMoves();
     this.player.onFrame = (f) => this.showFrame(f);
     this.player.onTime = () => this.onTime();
-    this.player.onEnd = () => this.syncPlayButton();
+    this.rampEd = new RampEditor($('curveWrap').parentElement!, () => this.rampView(), (pts, commit) => {
+      const c = this.selClip();
+      if (c) this.setRamp(c, { id: 'custom', pts }, commit);
+    });
+    this.player.onEnd = () => {
+      this.syncPlayButton();
+      this.rescope();
+    };
     this.timeline = new Timeline($('tlTrack'), {
       project: () => this.project,
       time: () => this.player.time,
@@ -293,8 +308,9 @@ export class VideoMode {
       return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
     };
     let tf = clip ? framingAt(clip, s) : undefined;
-    if (clip && (this.h.state().v.filmWeave ?? 0) > 0) {
-      const wv = this.weave(this.startOf(clip) + (s - clip.in) / clip.speed);
+    const lv = clip ? effectiveLook(this.h.state(), clip, s, !this.player.playing && !this.exporting).v : this.h.state().v;
+    if (clip && (lv.filmWeave ?? 0) > 0) {
+      const wv = this.weave(this.startOf(clip) + localAt(clip, s), lv);
       tf = { ...(tf ?? NO_FRAMING), x: (tf?.x ?? 0) + wv.x, y: (tf?.y ?? 0) + wv.y };
     }
     const kind = p.bg ?? 'blur';
@@ -319,7 +335,7 @@ export class VideoMode {
 
   /** Source time of `clip` at timeline time T. */
   private srcTime(clip: VClip, T: number) {
-    return Math.min(clip.out, Math.max(clip.in, clip.in + (T - this.startOf(clip)) * clip.speed));
+    return Math.min(clip.out, Math.max(clip.in, srcAt(clip, T - this.startOf(clip))));
   }
 
   /** (Re)make the project frame at the preview size. */
@@ -364,7 +380,10 @@ export class VideoMode {
     this.comp.place(src, this.frameT!, this.placement(f.clip, s, this.frameT!.w, this.frameT!.h));
     this.h.pipe.invalidate();
     if (this.player.playing) this.h.renderSync();
-    else this.h.requestRender();
+    else {
+      this.rescope();
+      this.h.requestRender();
+    }
   }
 
   // ---- dynamic resolution: while playing or scrubbing, the preview renders as sharp as the
@@ -481,8 +500,8 @@ export class VideoMode {
   }
 
   /** The film frame number at timeline time T (grain changes on each one). */
-  private filmRate() {
-    return [0, 12, 24, this.sourceFps()][Math.round(this.h.state().v.grainMotion ?? 2)] ?? 24;
+  private filmRate(v = this.h.state().v) {
+    return [0, 12, 24, this.sourceFps()][Math.round(v.grainMotion ?? 2)] ?? 24;
   }
 
   /**
@@ -490,9 +509,8 @@ export class VideoMode {
    * renders). Grain moves at the Motion rate (or not at all on Still); dust and flicker always
    * move, at that rate or 24 fps.
    */
-  film(T: number) {
-    const v = this.h.state().v;
-    const rate = this.filmRate();
+  film(T: number, v = this.h.state().v) {
+    const rate = this.filmRate(v);
     const i = rate ? Math.floor(T * rate + 1e-6) : 0;
     const j = Math.floor(T * (rate || 24) + 1e-6);
     const fl = (v.filmFlicker ?? 0) / 100;
@@ -500,8 +518,8 @@ export class VideoMode {
   }
 
   /** Gate weave: a small drift of the picture that moves on film frames. */
-  private weave(T: number) {
-    const a = (this.h.state().v.filmWeave ?? 0) / 100;
+  private weave(T: number, v = this.h.state().v) {
+    const a = (v.filmWeave ?? 0) / 100;
     if (!a) return { x: 0, y: 0 };
     const i = Math.floor(T * 24);
     // smooth-ish random walk: two slow waves plus a little per-frame jitter
@@ -573,6 +591,7 @@ export class VideoMode {
       this.lastLabel = label;
       $('tlTime').innerHTML = label;
     }
+    if (this.rampEd.shown) this.rampEd.draw();
     if (this.player.playing) {
       // in the playback loop: paint with this frame, not one refresh later
       this.timeline.paintNow();
@@ -626,6 +645,7 @@ export class VideoMode {
 
   private changed(commit: boolean) {
     this.remix();
+    this.rescope();
     // clips are shorter / longer: text past the end comes back in
     const total = layout(this.project).total;
     for (const t of this.project.texts) {
@@ -647,6 +667,8 @@ export class VideoMode {
   /** After undo / redo / history: the timeline and frame follow the restored state. */
   onRestore() {
     const p = this.project;
+    this.kfAnchor = null;
+    this.rescope();
     this.remix();
     if (this.sel?.kind === 'clip' && !p.clips.some((c) => c.id === this.sel!.id)) this.sel = null;
     if (this.sel?.kind === 'text' && !p.texts.some((t) => t.id === this.sel!.id)) this.sel = null;
@@ -667,6 +689,7 @@ export class VideoMode {
   info = '';
 
   private split() {
+    this.unscope();
     const p = this.project;
     const T = this.player.time;
     const at = clipAt(p, T);
@@ -674,8 +697,14 @@ export class VideoMode {
     const c = p.clips[at.i];
     const local = T - at.start;
     if (local < MIN_CLIP || clipLen(c) - local < MIN_CLIP) return this.h.toast('Move the playhead into the clip to split it');
-    const cut = c.in + local * c.speed;
-    const b: VClip = { ...c, id: uid(), in: cut };
+    const cut = srcAt(c, local);
+    const b: VClip = { ...c, id: uid(), in: cut, look: c.look && JSON.parse(JSON.stringify(c.look)) };
+    if (c.ramp) {
+      // each half keeps its part of the ramp
+      const u = (cut - c.in) / (c.out - c.in);
+      b.ramp = subRamp(c.ramp, u, 1);
+      c.ramp = subRamp(c.ramp, 0, u);
+    }
     c.out = cut;
     p.clips.splice(at.i + 1, 0, b);
     this.sel = { kind: 'clip', id: b.id };
@@ -684,6 +713,7 @@ export class VideoMode {
   }
 
   private clipAction(what: 'delete' | 'copy' | 'mute') {
+    this.unscope();
     const p = this.project;
     const c = this.selClip();
     if (!c) return;
@@ -695,7 +725,7 @@ export class VideoMode {
       this.ensureFrame();
       this.player.seek(Math.min(this.player.time, layout(p).total));
     } else if (what === 'copy') {
-      const d = { ...c, id: uid() };
+      const d = { ...c, id: uid(), look: c.look && JSON.parse(JSON.stringify(c.look)) };
       p.clips.splice(i + 1, 0, d);
       this.sel = { kind: 'clip', id: d.id };
     } else {
@@ -920,6 +950,178 @@ export class VideoMode {
     this.replace();
   }
 
+  // ---- looks per clip (see looks.ts)
+
+  /** when the clip in the edit is animated: where (clip, source time) its settings were loaded from */
+  private kfAnchor: { clip: string; s: number; v: string } | null = null;
+
+  /** The clip under the playhead. */
+  playClip(): VClip | null {
+    const at = clipAt(this.project, this.player.time);
+    return at ? this.project.clips[at.i] : null;
+  }
+
+  /** Settings edited on an animated clip go into a keyframe at the moment they were edited at. */
+  private flushKey() {
+    const p = this.project, a = this.kfAnchor;
+    const c = p.scope ? p.clips.find((x) => x.id === p.scope) : null;
+    if (!a || !c?.look?.kf?.length || a.clip !== c.id) return;
+    const st = this.h.state();
+    const json = JSON.stringify(st.v);
+    if (json === a.v) return;
+    if (!sameValues(st.v, lookValues(c.look, a.s))) upsertKey(c.look, a.s, st.v);
+    a.v = json;
+  }
+
+  /** Before each history step. */
+  beforeCommit() {
+    this.flushKey();
+  }
+
+  /** The look being edited goes back where it belongs (before clips are copied, deleted…). */
+  private unscope() {
+    this.flushKey();
+    unscopeState(this.h.state());
+    this.kfAnchor = null;
+  }
+
+  /**
+   * The sliders edit the look in force at the playhead: the clip's own, if it has one (swapped
+   * into the edit's settings), else the whole video's. Animated, they show the values there.
+   */
+  rescope() {
+    if (this.player.playing || this.exporting) return;
+    const st = this.h.state(), p = this.project;
+    const c = this.playClip();
+    const want = c?.look ? c.id : undefined;
+    const before = p.scope;
+    if (p.scope && p.scope !== want) this.unscope();
+    if (c?.look && p.scope !== want) {
+      p.base = { v: st.v, curves: st.curves };
+      st.v = JSON.parse(JSON.stringify(c.look.kf?.length ? lookValues(c.look, this.sNow(c)) : c.look.v));
+      st.curves = JSON.parse(JSON.stringify(c.look.curves));
+      p.scope = want;
+      this.kfAnchor = null;
+    }
+    let reloaded = false;
+    if (c?.look?.kf?.length) {
+      const s = this.sNow(c);
+      const a = this.kfAnchor;
+      if (!a || a.clip !== c.id || Math.abs(a.s - s) > 1e-4) {
+        this.flushKey();
+        if (a?.clip === c.id) st.v = JSON.parse(JSON.stringify(lookValues(c.look, s)));
+        this.kfAnchor = { clip: c.id, s, v: JSON.stringify(st.v) };
+        reloaded = !!a;
+      }
+    } else this.kfAnchor = null;
+    if (before !== p.scope || reloaded) this.h.lookChanged();
+  }
+
+  /** The edit as a frame of `clip` at source time s is drawn (its clip's look, animated). */
+  lookState(st: EditState, clip: VClip | null = this.lastClip(), s = this.last?.s ?? 0, live = !this.player.playing): EditState {
+    if (!st.video) return st;
+    const L = effectiveLook(st, clip, s, live);
+    return L.v === st.v && L.curves === st.curves ? st : { ...st, v: L.v, curves: L.curves };
+  }
+
+  /** The look switch at the front of an adjustment section: whole video / this clip, keyframe. */
+  scopeChips(row: HTMLElement) {
+    const c = this.playClip();
+    if (!c) return;
+    const own = !!c.look;
+    this.h.chip(row, { id: 'all', label: 'All clips' }, !own, () => {
+      if (!c.look) return;
+      this.unscope();
+      delete c.look;
+      this.h.toast('This clip follows the whole video’s look again', 2200);
+      this.lookEdited();
+    });
+    this.h.chip(row, { id: 'clip', label: 'This clip' }, own, () => {
+      if (c.look) return;
+      this.giveLook(c);
+      this.h.toast('Changes now apply to this clip only', 2200);
+      this.lookEdited();
+    });
+    const k = lookKeyAt(c.look, this.sNow(c)) >= 0;
+    const b = this.h.chip(row, { id: 'key', label: '◆ Key' }, k, () => this.toggleLookKey(c));
+    b.classList.add('keychip');
+    row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
+  }
+
+  /** Clip c gets its own look, starting from the one it shows now. */
+  private giveLook(c: VClip) {
+    const st = this.h.state();
+    this.unscope();
+    c.look = newLook(st.v, st.curves);
+    this.rescope();
+  }
+
+  private toggleLookKey(c: VClip) {
+    if (!this.onClip(c)) return this.h.toast('Move the playhead onto the clip first');
+    if (!c.look) this.giveLook(c);
+    const look = c.look!;
+    const s = this.sNow(c);
+    const i = lookKeyAt(look, s);
+    const st = this.h.state();
+    if (i >= 0) {
+      look.kf!.splice(i, 1);
+      if (!look.kf!.length) {
+        delete look.kf;
+        look.v = JSON.parse(JSON.stringify(st.v));
+      }
+    } else {
+      upsertKey(look, s, st.v);
+      if (look.kf!.length === 1) this.h.toast('Look keyframe added · move the playhead and change the look for the next one', 3000);
+    }
+    this.kfAnchor = look.kf?.length ? { clip: c.id, s, v: JSON.stringify(st.v) } : null;
+    tick(true);
+    this.lookEdited();
+  }
+
+  private lookEdited() {
+    this.timeline.draw();
+    this.h.requestRender();
+    this.h.commit();
+    this.h.refreshSection();
+  }
+
+  /** Give the clip a speed ramp (null: none), keeping the playhead on the same moment of it. */
+  private setRamp(c: VClip, r: VClip['ramp'] | null, commit: boolean) {
+    const p = this.project;
+    const start = layout(p).starts[p.clips.indexOf(c)];
+    const T = this.player.time;
+    const inside = this.onClip(c);
+    const srcT = srcAt(c, T - start);
+    if (r) c.ramp = r;
+    else delete c.ramp;
+    if (inside) this.player.seek(start + localAt(c, srcT));
+    if (commit) tick();
+    this.timeline.draw();
+    this.changed(commit);
+    this.syncRampEd();
+  }
+
+  private rampView() {
+    const c = this.selClip();
+    if (!c?.ramp) return null;
+    const s = this.sNow(c);
+    return { pts: c.ramp.pts, at: this.onClip(c) ? (s - c.in) / Math.max(1e-6, c.out - c.in) : null, base: c.speed };
+  }
+
+  /** The ramp curve shows while its choices do, for a clip that has one. */
+  private syncRampEd() {
+    const c = this.selClip();
+    const on = this.toolId === 'vclip' && this.rampOpen && c?.kind === 'video' && !!c.ramp;
+    this.rampEd.show(on);
+  }
+
+  /** The app's open section changed (null: none). */
+  toolShown(id: string | null) {
+    if (id !== 'vclip') this.rampOpen = false;
+    this.toolId = id;
+    this.syncRampEd();
+  }
+
   private resetFraming(c: VClip) {
     delete c.kf;
     delete c.tf;
@@ -978,9 +1180,9 @@ export class VideoMode {
       const start = layout(p).starts[i];
       const T = this.player.time;
       const inside = T >= start && T <= start + clipLen(c);
-      const srcT = c.in + (T - start) * c.speed;
+      const srcT = srcAt(c, T - start);
       c.speed = Math.round(v * 20) / 20;
-      if (inside) this.player.seek(start + (srcT - c.in) / c.speed);
+      if (inside) this.player.seek(start + localAt(c, srcT));
       this.changed(false);
     } else if (id === 'vd.vol' && c) c.vol = v / 100;
     else if (id === 'vd.tsize' && t) {
@@ -1036,7 +1238,27 @@ export class VideoMode {
 
   buildActs(t: ToolDef, row: HTMLElement) {
     const p = this.project;
+    this.syncRampEd();
     const sep = () => row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
+    if (t.id === 'vclip' && this.rampOpen && this.selClip()?.kind === 'video') {
+      // speed ramp: the presets, and the curve above the timeline to shape it
+      const c = this.selClip()!;
+      this.h.tile(row, ICONS.check, 'Done', '', () => {
+        this.rampOpen = false;
+        this.h.refreshSection();
+      });
+      sep();
+      this.h.chip(row, { id: 'none', label: 'None' }, !c.ramp, () => this.setRamp(c, null, true));
+      for (const [id, label, pts] of RAMPS) {
+        this.h.chip(row, { id, label }, c.ramp?.id === id, () => this.setRamp(c, { id, pts: pts.map((q) => [q[0], q[1]] as [number, number]) }, true));
+      }
+      this.h.chip(row, { id: 'custom', label: 'Custom' }, c.ramp?.id === 'custom', () => {
+        if (c.ramp?.id !== 'custom') this.setRamp(c, { id: 'custom', pts: (c.ramp?.pts ?? RAMP_CUSTOM).map((q) => [q[0], q[1]] as [number, number]) }, true);
+        this.h.toast('Drag the points up to speed up, down to slow down', 2600);
+      });
+      this.syncRampEd();
+      return;
+    }
     if (t.id === 'vclip') {
       const c = this.selClip();
       this.h.tile(row, ICONS.plus, 'Add', '', () => this.pickMedia());
@@ -1048,6 +1270,10 @@ export class VideoMode {
       if (m?.audio) this.h.tile(row, c.vol > 0 ? ICONS.sound : ICONS.mute, c.vol > 0 ? 'Mute' : 'Unmute', c.vol > 0 ? '' : 'hot', () => this.clipAction('mute'));
       this.h.tile(row, ICONS.trash, 'Delete', 'danger', () => this.clipAction('delete'));
       sep();
+      if (c.kind === 'video') this.h.tile(row, ICONS.ramp, 'Ramp', c.ramp ? 'hot' : '', () => {
+        this.rampOpen = true;
+        this.h.refreshSection();
+      });
       this.h.tile(row, ICONS.key, 'Keyframe', this.keyHere(c) >= 0 ? 'hot' : '', () => this.toggleKey(c));
       this.h.tile(row, ICONS.kenburns, 'Ken Burns', '', () => this.kenBurns(c));
       if (c.kf?.length || c.tf) this.h.tile(row, ICONS.reset, 'Reset', '', () => this.resetFraming(c));
@@ -1179,7 +1405,7 @@ export class VideoMode {
     if (id === 'vcanvas') return p.aspect !== 'auto' || p.fit !== 'fit' || p.bg !== 'blur' || (p.bgBlur ?? 70) !== 70;
     if (id === 'vtext') return p.texts.length > 0;
     if (id === 'vmusic') return !!p.music;
-    if (id === 'vclip') return p.clips.some((c) => c.speed !== 1 || !!c.kf?.length || !!c.tf || (!!this.lib.get(c.src)?.audio && c.vol !== 1));
+    if (id === 'vclip') return p.clips.some((c) => c.speed !== 1 || !!c.ramp || !!c.kf?.length || !!c.tf || (!!this.lib.get(c.src)?.audio && c.vol !== 1));
     return false;
   }
 
@@ -1285,10 +1511,11 @@ export class VideoMode {
       const blob = await exportVideo({
         lib: this.lib, audio: this.audio, project: st.video!, canvas, w, h, fps: this.ex.fps, quality: this.ex.q, boost: this.grainBoost(),
         drawFrame: (clip, m, sample, T) => {
-          this.h.pipe.filmFrame = this.film(T);
+          const look = this.lookState(this.h.state(), clip, sample?.timestamp ?? this.srcTime(clip, T), false);
+          this.h.pipe.filmFrame = this.film(T, look.v);
           const src = this.srcFor(m, sample, Math.max(w, h));
           this.comp.place(src, out, this.placement(clip, sample?.timestamp ?? this.srcTime(clip, T), w, h));
-          this.h.renderFull({ tex: out.tex, w, h, linear: false }, w, h);
+          this.h.renderFull({ tex: out.tex, w, h, linear: false }, w, h, look);
           const vis = this.visibleTexts(T);
           this.comp.setText(vis.length ? JSON.stringify([vis, w, h]) : '', w, h, vis.length ? this.paintTexts(vis) : null);
           this.comp.drawText(w, h);
@@ -1328,6 +1555,7 @@ export class VideoMode {
   /** Release everything (leaving video mode). */
   dispose() {
     this.life.abort();
+    this.rampEd.el.remove();
     this.player.dispose();
     this.comp.dispose();
     const gl = this.h.g.gl;

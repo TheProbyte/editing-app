@@ -4,7 +4,7 @@
 // thin lanes underneath.
 import { tick } from '../ui/haptics';
 import type { MediaLib } from './media';
-import { clipLen, layout, MIN_CLIP, fmtTime, type VideoProject } from './project';
+import { clipLen, layout, localAt, MIN_CLIP, fmtTime, speedAt, srcAt, type VClip, type VideoProject } from './project';
 
 export type Sel = { kind: 'clip' | 'text' | 'music'; id: string } | null;
 
@@ -112,6 +112,17 @@ export class Timeline {
       const st = this.stripFor(T, W, dpr, p, starts);
       const dx = Math.round((W / 2 + (st.t0 - T) * this.pps) * dpr) / dpr;
       ctx.drawImage(st.c, 0, 0, st.c.width, st.c.height, dx, CLIP_Y, st.w, CLIP_H);
+      // look keyframes (any clip): light diamonds along the top
+      p.clips.forEach((cl, i) => {
+        if (!cl.look?.kf?.length) return;
+        const x0 = this.x(starts[i]), x1 = this.x(starts[i] + clipLen(cl));
+        if (x1 < 0 || x0 > W) return;
+        for (const k of cl.look.kf) {
+          const kx = this.x(starts[i] + localAt(cl, k.s));
+          if (kx < x0 - 1 || kx > x1 + 1) continue;
+          this.diamond(Math.round(kx), CLIP_Y + 7, true);
+        }
+      });
       // the selected clip: a yellow frame with trim handles
       if (sel?.kind === 'clip') {
         const i = p.clips.findIndex((c) => c.id === sel.id);
@@ -121,7 +132,7 @@ export class Timeline {
           // its keyframes: diamonds along the bottom (the one under the playhead filled)
           const cl = p.clips[i];
           for (const k of cl.kf ?? []) {
-            const kx = this.x(starts[i] + (k.s - cl.in) / cl.speed);
+            const kx = this.x(starts[i] + localAt(cl, k.s));
             if (kx < x0 - 1 || kx > x1 + 1) continue;
             const here = Math.abs(kx - W / 2) < 2;
             this.diamond(Math.round(kx), CLIP_Y + CLIP_H - 7, here);
@@ -192,7 +203,7 @@ export class Timeline {
   }
 
   private stripFor(T: number, W: number, dpr: number, p: VideoProject, starts: number[]) {
-    const key = JSON.stringify([this.pps, W, dpr, this.thumbsVer, p.clips.map((c) => [c.src, c.in, c.out, c.speed, c.vol])]);
+    const key = JSON.stringify([this.pps, W, dpr, this.thumbsVer, p.clips.map((c) => [c.src, c.in, c.out, c.speed, c.vol, c.ramp])]);
     const half = W / 2 / this.pps;
     const s = this.strip;
     if (s && s.key === key && T - half >= s.t0 && T + half <= s.t0 + s.w / this.pps) return s;
@@ -207,8 +218,9 @@ export class Timeline {
     p.clips.forEach((cl, i) => {
       const x0 = (starts[i] - t0) * this.pps, x1 = (starts[i] + clipLen(cl) - t0) * this.pps;
       if (x1 < -4 || x0 > w + 4) return;
-      this.paintClip(g, w, cl.src, cl.in, cl.out, x0 + 1, x1 - 1, 0, CLIP_H, cl.speed);
-      if (cl.speed !== 1) this.badge(g, `${cl.speed}×`, x0 + 5, 4);
+      this.paintClip(g, w, cl, x0 + 1, x1 - 1, 0, CLIP_H);
+      if (cl.ramp) this.badge(g, cl.speed !== 1 ? `Ramp ${cl.speed}×` : 'Ramp', x0 + 5, 4);
+      else if (cl.speed !== 1) this.badge(g, `${cl.speed}×`, x0 + 5, 4);
       if (cl.vol === 0 && this.lib.get(cl.src)?.audio) this.badge(g, 'MUTE', x0 + 5, CLIP_H - 15);
     });
     this.strip = { c, t0, w, key };
@@ -231,8 +243,8 @@ export class Timeline {
   }
 
   /** A clip's strip of thumbnails between x0 and x1. */
-  private paintClip(ctx: CanvasRenderingContext2D, cullW: number, src: string, sIn: number, sOut: number, x0: number, x1: number, y: number, h: number, speed: number) {
-    const m = this.lib.get(src);
+  private paintClip(ctx: CanvasRenderingContext2D, cullW: number, cl: VClip, x0: number, x1: number, y: number, h: number) {
+    const m = this.lib.get(cl.src);
     ctx.save();
     ctx.beginPath();
     ctx.rect(x0, y, Math.max(0, x1 - x0), h);
@@ -244,8 +256,8 @@ export class Timeline {
       const tw = Math.max(18, Math.min(h * 1.8, h * aspect));
       for (let x = x0; x < x1; x += tw) {
         if (x + tw < 0 || x > cullW) continue;
-        const t = m.kind === 'image' ? 0 : sIn + ((x + tw / 2 - x0) / this.pps) * speed;
-        const th = this.lib.thumbAt(m, Math.min(sOut, t));
+        const t = m.kind === 'image' ? 0 : srcAt(cl, (x + tw / 2 - x0) / this.pps);
+        const th = this.lib.thumbAt(m, Math.min(cl.out, t));
         if (!th) continue;
         const iw = (th as HTMLCanvasElement).width, ih = (th as HTMLCanvasElement).height;
         // cover the tile
@@ -301,13 +313,13 @@ export class Timeline {
       if (ci === d.from) return;
       const x = d.baseX + k * this.slot;
       const cl = p.clips[ci];
-      this.paintClip(this.ctx, this.c.clientWidth, cl.src, cl.in, cl.out, x + 2, x + this.slot - 2, CLIP_Y + 6, CLIP_H - 12, cl.speed);
+      this.paintClip(this.ctx, this.c.clientWidth, cl, x + 2, x + this.slot - 2, CLIP_Y + 6, CLIP_H - 12);
     });
     const cl = p.clips[d.from];
     const x = d.x - this.slot / 2;
     this.ctx.fillStyle = 'rgba(0,0,0,0.4)';
     this.ctx.fillRect(x + 4, CLIP_Y + 2, this.slot, CLIP_H);
-    this.paintClip(this.ctx, this.c.clientWidth, cl.src, cl.in, cl.out, x - 2, x + this.slot + 2, CLIP_Y - 2, CLIP_H, cl.speed);
+    this.paintClip(this.ctx, this.c.clientWidth, cl, x - 2, x + this.slot + 2, CLIP_Y - 2, CLIP_H);
     this.frame(x - 2, x + this.slot + 2, CLIP_Y - 2, CLIP_H);
   }
 
@@ -381,13 +393,25 @@ export class Timeline {
       // hold a clip to pick it up
       if (hit?.what === 'clip' && p.clips.length > 1) {
         clearTimeout(this.hold);
-        this.hold = window.setTimeout(() => {
+        const armed = performance.now();
+        const pickUp = () => {
           if (this.drag?.kind !== 'scroll' || this.drag.moved) return;
+          // late (the page was busy): finger moves may be waiting to be handled; let them first
+          if (performance.now() - armed > 460) {
+            this.hold = window.setTimeout(() => {
+              if (this.drag?.kind === 'scroll' && !this.drag.moved && performance.now() - armed < 4000) pickUpNow();
+            }, 60);
+            return;
+          }
+          pickUpNow();
+        };
+        const pickUpNow = () => {
           tick(true);
           const baseX = q.x - this.slot / 2 - hit.i * this.slot;
           this.drag = { kind: 'reorder', from: hit.i, to: hit.i, x: q.x, baseX };
           this.draw();
-        }, 380);
+        };
+        this.hold = window.setTimeout(pickUp, 380);
       }
     });
     c.addEventListener('pointermove', (e) => {
@@ -429,21 +453,23 @@ export class Timeline {
         const cl = p.clips.find((x) => x.id === d.id);
         const m = cl && this.lib.get(cl.src);
         if (!cl || !m) return;
-        const ds = ((q.x - d.x0) / this.pps) * cl.speed; // source seconds
+        // source seconds (with a ramp, at the speed of the edge being dragged)
+        const rate = speedAt(cl, d.kind === 'trimL' ? d.in0 : d.out0);
+        const ds = ((q.x - d.x0) / this.pps) * rate;
         const maxOut = m.kind === 'image' ? 600 : m.duration;
         if (d.kind === 'trimL') {
-          cl.in = Math.max(m.kind === 'image' ? 0 : 0, Math.min(d.out0 - MIN_CLIP * cl.speed, d.in0 + ds));
+          cl.in = Math.max(0, Math.min(d.out0 - MIN_CLIP * rate, d.in0 + ds));
           if (m.kind === 'image') {
             // a still has no "in": trimming its start shortens it
             cl.in = 0;
             cl.out = Math.max(MIN_CLIP, Math.min(maxOut, d.out0 - ds));
           }
           // keep the right edge where it was: the view follows the left handle
-          const shrink = (d.out0 - d.in0 - (cl.out - cl.in)) / cl.speed;
+          const shrink = clipLen({ ...cl, in: d.in0, out: d.out0 }) - clipLen(cl);
           this.h.scrub(Math.max(0, d.T0 - shrink));
           this.h.peek(d.start);
         } else {
-          cl.out = Math.max(cl.in + MIN_CLIP * cl.speed, Math.min(maxOut, d.out0 + ds));
+          cl.out = Math.max(cl.in + MIN_CLIP * rate, Math.min(maxOut, d.out0 + ds));
           this.h.peek(d.start + clipLen(cl) - 0.001);
         }
         const len = clipLen(cl);

@@ -8,7 +8,7 @@ import { CanvasSink, EncodedPacketSink, type VideoSample, type VideoSampleSink }
 import type { Media, MediaLib } from './media';
 import type { AudioEngine } from './audio';
 import type { GpuFrame } from './compose';
-import { clipAt, layout, type VClip, type VideoProject } from './project';
+import { clipAt, clipLen, layout, localAt, type VClip, type VideoProject } from './project';
 
 export interface Frame {
   clip: VClip;
@@ -647,6 +647,7 @@ export class Player {
       const sink = this.vSink(m);
       if (!sink) continue;
       const it = sink.samples(from, clip.out);
+      let lastTl = -Infinity;
       try {
         for (;;) {
           const r = await it.next();
@@ -656,7 +657,13 @@ export class Player {
             s.close();
             return;
           }
-          const tl = Math.max(start, start + (s.timestamp - clip.in) / clip.speed);
+          const tl = Math.max(start, start + localAt(clip, s.timestamp));
+          // sped up: frames that would land on the same screen refresh are never seen, don't upload them
+          if (tl - lastTl < 1 / 125 && tl < start + clipLen(clip) - 0.05) {
+            s.close();
+            continue;
+          }
+          lastTl = tl;
           const vf = s.toVideoFrame();
           let pre: GpuFrame;
           try {

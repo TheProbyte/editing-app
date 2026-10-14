@@ -84,8 +84,9 @@ export const TOOLS: ToolDef[] = [
       { id: '0', label: 'Off', icon: ICONS.off },
       { id: '1', label: 'Tilt-shift', icon: ICONS.tilt },
       { id: '2', label: 'Radial', icon: ICONS.radialBlur },
+      { id: '3', label: 'Lens', icon: ICONS.lens },
     ],
-    params: (t) => (t === '1' ? ['blurAmt', 'blurSize', 'blurFeather', 'blurAngle'] : t === '2' ? ['blurAmt', 'blurSize', 'blurFeather'] : []),
+    params: (t) => (t === '1' ? ['blurAmt', 'blurSize', 'blurFeather', 'blurAngle'] : t === '2' ? ['blurAmt', 'blurSize', 'blurFeather'] : t === '3' ? ['blurAmt', 'lensRange', 'lensBokeh'] : []),
   },
   {
     id: 'grain', label: 'Grain', icon: ICONS.grain, kind: 'params',

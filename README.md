@@ -22,6 +22,15 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Timeline:** drag to scrub (flick to coast), pinch to zoom, tap a clip to select it, drag its yellow
   handles to trim, hold a clip to pick it up and move it. **+** adds more clips (after the selected one).
 - **Edit:** Split at the playhead, Copy, Mute, Delete, **Speed** (0.25–4×) and **Volume** on the slider.
+- **Speed ramps:** **Ramp** in Edit: Montage, Hero, Bullet, Flash in, Flash out, Jump cut, or Custom. The
+  curve shows above the timeline; drag its points up (faster) or down (slower), 0.1×–10×. The speed changes
+  smoothly along the curve (exactly: the timeline ↔ source mapping is solved per straight piece), and
+  playback, scrubbing, trimming, splitting, the sound (its rate follows the curve) and the export all follow it.
+- **A look per clip, and animated looks:** every adjustment section starts with **All clips / This clip**.
+  *This clip* gives the clip under the playhead its own look (starting from the current one); the sliders
+  then change only that clip. **◆ Key** keys the look at the playhead: once a clip has look keyframes,
+  changing any setting elsewhere in it adds a keyframe there, and the look eases between them (white
+  diamonds on the timeline). *All clips* puts the clip back on the whole-video look.
 - **Framing & keyframes:** with a clip selected (Edit), drag the video to move the clip and pinch to zoom /
   twist to rotate it (or use Zoom, Position and Rotate on the slider). **Keyframe** (◆) marks the framing at
   the playhead; once a clip has keyframes, changing the framing anywhere keys it there, and the motion eases
@@ -63,6 +72,13 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Remove:** tap blemishes, dust or small objects to heal them (auto-picks a matching patch).
 - **Camera:** take a photo in-app — a plain full-resolution capture from the camera without the phone's HDR/computational processing (swipe for exposure).
 - **Blur:** tilt-shift and radial focus blur with a draggable focus point (true linear-light lens blur).
+  **Lens** is a portrait-mode style blur from the photo's depth: tap where it should be sharp; Blur strength,
+  Depth of field and Bokeh on the slider. The depth comes from Depth Anything V2 (small, run on the phone;
+  27 MB, downloaded once), its edges snapped to the photo's with a guided filter. The blur is a gathered
+  disc per pixel where each sample only reaches as far as its own blur (so a sharp subject isn't smeared
+  by the background, and a blurred foreground spreads over what's behind), with bright points weighted
+  up so lights turn into round bokeh. Sharp vs blurred is decided per pixel at full size, so subject edges
+  stay crisp in the full-resolution export.
 - **Masks & selective edits:** up to 8 per photo — **Subject** (AI: tap or scribble over it, Exclude to
   take parts away), **People** (AI: person, face, skin, hair, clothes or background), Radial, Gradient,
   Brush (paint/erase with size, hardness, flow), Selective point (Snapseed-style, follows similar colors),
@@ -163,6 +179,8 @@ Code map:
 - **MI-GAN** (Picsart AI Research, MIT) — the `migan_pipeline_v2.onnx` weights used for the built-in AI fill, taken from the
   `migan-onnx` npm package. **LaMa** (Samsung AI Center, Apache-2.0) is fetched on request. The weights were trained on Places2 / FFHQ research datasets, so treat this as a
   personal-use app.
+- **Depth Anything V2 Small** (Apache-2.0; `onnx-community/depth-anything-v2-small`, quantized) for the lens blur,
+  fetched from Hugging Face the first time Lens is used.
 - **LibRaw** (via `libraw-wasm`), **MediaPipe Tasks Vision** (Apache-2.0) for subject / people selection,
   **ONNX Runtime Web** (MIT), **fflate** (MIT) for PNG compression, **Mediabunny** (MPL-2.0) for video,
   Pixelify Sans and Silkscreen (OFL).

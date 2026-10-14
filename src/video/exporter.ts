@@ -7,7 +7,7 @@ import {
 } from 'mediabunny';
 import type { Media, MediaLib } from './media';
 import { MIX_RATE, type AudioEngine } from './audio';
-import { clipLen, layout, type VClip, type VideoProject } from './project';
+import { clipLen, layout, srcAt, type VClip, type VideoProject } from './project';
 
 export interface VideoExportOptions {
   lib: MediaLib;
@@ -81,7 +81,7 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
         continue;
       }
       const sink = o.lib.videoSink(m)!;
-      const srcTimes = times.map((T) => Math.min(clip.out - 1e-4, clip.in + (T - start) * clip.speed));
+      const srcTimes = times.map((T) => Math.min(clip.out - 1e-4, srcAt(clip, T - start)));
       let j = 0;
       let last: VideoSample | null = null;
       for await (const s of sink.samplesAtTimestamps(srcTimes)) {

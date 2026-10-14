@@ -28,9 +28,11 @@ import { Camera } from './camera';
 import { isNative, Native, fileFromPath } from '../native';
 import { Segmenter, PEOPLE_PARTS, refineMask } from '../ai/segment';
 import { NeuralFill, LAMA_MB, type NeuralKind } from '../ai/neural';
+import { DepthEstimator } from '../ai/depth';
 // the video editor (and Mediabunny) load only when a video is opened
 import type { VideoMode, VideoHost } from '../video/mode';
 import { isVideoFile, newProject } from '../video/project';
+import { canonical } from '../video/looks';
 
 /** photo tools that don't apply to video */
 const VIDEO_HIDDEN = new Set(['heal', 'masks', 'double']);
@@ -130,6 +132,12 @@ export class App {
   // raster per mask (shown while a new one is computed) and the photo as the models see it
   private seg = new Segmenter();
   private neural = new NeuralFill();
+  private depthEst = new DepthEstimator();
+  private depthJob: { key: string; p: Promise<void> } | null = null;
+  private lookRaf = 0;
+  /** the photo whose depth couldn't be worked out (not retried until Lens is picked again) */
+  private depthFailed = '';
+  private imgIds = new WeakMap<object, string>();
   private bases = new Map<string, HTMLCanvasElement>();
   private lastBase = new Map<number, HTMLCanvasElement>();
   private baseJobs = new Set<string>();
@@ -465,7 +473,11 @@ export class App {
 
   private renderNow() {
     if (!this.img || this.video?.exporting) return;
-    const st = this.viewState();
+    const st = this.video && !this.compare ? this.video.lookState(this.viewState()) : this.viewState();
+    if (!this.video && Math.round(st.v.blurType) === 3 && this.pipe.depth?.id !== this.depthKey() && this.depthFailed !== this.depthKey()) {
+      if (this.pipe.depth) this.pipe.setDepth(null, '', 0, 0);
+      void this.ensureDepth();
+    }
     const full = outputSize(st, this.img.preview.w, this.img.preview.h);
     // render only as many pixels as the screen can show (a big saving while dragging sliders)
     const w = Math.max(1, Math.round(full.w * this.rs)), h = Math.max(1, Math.round(full.h * this.rs));
@@ -481,7 +493,7 @@ export class App {
     this.pipe.showMask = this.kind() === 'masks' && (this.maskOverlayOn || this.maskInteracting || aiMode) ? this.maskSel : -1;
     try {
       // a video with nothing applied skips the whole pipeline: one copy to the screen
-      if (this.video) this.pipe.filmFrame = this.video.film(this.video.player.time);
+      if (this.video) this.pipe.filmFrame = this.video.film(this.video.player.time, st.v);
       if (this.video && this.isNeutral(st)) this.video.blitFrame(w, h);
       else this.pipe.render(this.img.preview, st, w, h, null);
       this.video?.afterRender(w, h);
@@ -773,7 +785,9 @@ export class App {
   // History
 
   commit() {
-    const s = JSON.stringify(this.state);
+    this.video?.beforeCommit();
+    // (a video's history is stored without a clip's look swapped in: see looks.ts)
+    const s = JSON.stringify(this.video ? canonical(this.state) : this.state);
     if (this.history[this.hIdx] === s) return;
     this.history = this.history.slice(0, this.hIdx + 1);
     this.history.push(s);
@@ -1146,12 +1160,22 @@ export class App {
       toolId: () => this.tool?.id ?? null,
       chip: (row, c, on, onClick) => this.chip(row, c, on, onClick),
       tile: (row, icon, label, cls, onClick) => this.tile(row, icon, label, cls, onClick),
-      renderFull: (src, w, h) => {
-        if (this.isNeutral(this.state)) return this.video!.blitTex(src.tex, w, h);
-        this.syncOverlay(this.state);
+      renderFull: (src, w, h, st) => {
+        if (this.isNeutral(st)) return this.video!.blitTex(src.tex, w, h);
+        this.syncOverlay(st);
         this.pipe.brushTex = this.atlas.tex;
         this.pipe.invalidate();
-        this.pipe.render(src, this.state, w, h, null);
+        this.pipe.render(src, st, w, h, null);
+      },
+      lookChanged: () => {
+        // another clip's look came into the sliders: show its values (once per frame at most)
+        this.look.base = null;
+        this.look.idx = -1;
+        if (this.lookRaf) return;
+        this.lookRaf = requestAnimationFrame(() => {
+          this.lookRaf = 0;
+          if (this.tool && this.tool.kind !== 'video') this.refreshSection();
+        });
       },
       save: async (blob, name) => {
         const how = await saveOrShare(blob, name, (f) => this.busy(`Saving ${Math.round(f * 100)}%`));
@@ -1177,7 +1201,7 @@ export class App {
 
   private toolList(): ToolDef[] {
     if (!this.video) return TOOLS;
-    return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t))];
+    return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t.id === 'blur' ? { ...t, subs: t.subs?.filter((x) => x.id !== '3') } : t))];
   }
 
   pickPhoto() {
@@ -1454,6 +1478,7 @@ export class App {
     }
     $('title').textContent = t ? t.label : this.video ? this.video.info : this.img?.info ?? '';
     if (t?.kind === 'video' && t !== prev) this.video?.onOpenTool(t.id);
+    this.video?.toolShown(t?.kind === 'video' ? t.id : null);
     if (t?.kind === 'looks' && this.video) this.refreshVideoThumb();
     if (prev?.kind === 'crop' || t?.kind === 'crop') this.zoom = { s: 1, x: 0, y: 0 };
     if (t?.kind === 'curves' && !this.sub.curves) this.sub.curves = 'rgb';
@@ -1533,6 +1558,7 @@ export class App {
     row.innerHTML = '';
     const t = this.tool!;
     if (t.kind === 'video') return this.video?.buildSubs(t, row);
+    if (this.video) this.video.scopeChips(row);
     if (t.kind === 'looks') return this.buildLooks();
     if (t.kind === 'masks') return this.buildMaskList();
     if (t.kind === 'leak') return this.buildLeaks();
@@ -1577,7 +1603,11 @@ export class App {
       this.paramIdx.blur = 0;
       this.commit();
       this.requestRender();
-      if (id !== '0') this.toast('Drag the orange dot to place the focus', 2400);
+      if (id === '3') {
+        this.depthFailed = '';
+        this.toast('Tap where you want it sharp', 2400);
+        void this.ensureDepth();
+      } else if (id !== '0') this.toast('Drag the orange dot to place the focus', 2400);
     } else {
       this.sub[t.id] = id;
       if (t.kind === 'heal') {
@@ -2246,6 +2276,16 @@ export class App {
             tick(true);
           }
           lastTap = { t: 0, x: 0, y: 0 };
+        } else if (this.kind() === 'blur' && Math.round(this.state.v.blurType) === 3 && this.blurOv.uvAt(e)) {
+          // lens blur: a tap puts the focus there
+          const uv = this.blurOv.uvAt(e)!;
+          this.state.v.blurX = uv.x;
+          this.state.v.blurY = uv.y;
+          this.commit();
+          this.blurOv.draw();
+          this.requestRender();
+          tick();
+          lastTap = { t: now, x: e.clientX, y: e.clientY };
         } else {
           lastTap = { t: now, x: e.clientX, y: e.clientY };
           clearTimeout(tapTimer);
@@ -3775,9 +3815,23 @@ export class App {
   /** Back: drop this section's changes. */
   private cancelSection() {
     if (this.tool?.kind === 'video') return this.setMode(null);
-    if (this.sectionStart) {
+    if (this.sectionStart && this.video) {
+      // the looks go back to how they were (the whole video's and each clip's own); timeline
+      // edits made meanwhile stay
+      const W = canonical(JSON.parse(this.sectionStart) as EditState), N = canonical(this.state);
+      N.v = W.v;
+      N.curves = W.curves;
+      for (const c of N.video?.clips ?? []) {
+        const o = W.video?.clips.find((x) => x.id === c.id);
+        if (o?.look) c.look = o.look;
+        else delete c.look;
+      }
+      const changed = JSON.stringify(N) !== JSON.stringify(canonical(this.state));
+      this.state = N;
+      this.video.onRestore();
+      if (changed) this.toast('Changes discarded', 1200);
+    } else if (this.sectionStart) {
       const before = JSON.parse(this.sectionStart) as EditState;
-      if (this.video) before.video = this.state.video;
       const changed = JSON.stringify(before) !== JSON.stringify(this.state);
       this.state = before;
       this.maskSel = Math.min(this.maskSel, this.state.masks.length - 1);
@@ -3900,7 +3954,7 @@ export class App {
         this.syncAtlasSize();
         break;
       case 'blur':
-        for (const p of ['blurType', 'blurAmt', 'blurSize', 'blurFeather', 'blurAngle', 'blurX', 'blurY']) v[p] = PARAM_MAP[p].def;
+        for (const p of ['blurType', 'blurAmt', 'blurSize', 'blurFeather', 'blurAngle', 'blurX', 'blurY', 'lensRange', 'lensBokeh']) v[p] = PARAM_MAP[p].def;
         break;
       default: {
         const subs = t.subs ? t.subs.map((x) => x.id) : [''];
@@ -3990,9 +4044,12 @@ export class App {
     const geo = this.state.geo;
     const straighten = this.state.v.straighten;
     const masks = this.state.masks;
+    const video = this.state.video;
     this.state = this.lookState(this.look.base, L, this.look.amt / 100);
     this.state.geo = geo;
     this.state.masks = masks;
+    // a video: the timeline as it is now (the look only changes the settings)
+    if (video) this.state.video = video;
     this.state.v.straighten = straighten;
   }
 
@@ -4158,6 +4215,61 @@ export class App {
     el.textContent = k === 'lama' ? 'LaMa' : k === 'migan' ? 'Built-in' : 'Ask';
     el.classList.toggle('on', k === 'lama');
   }
+  // ---- lens blur depth
+
+  private depthKey() {
+    const img = this.img;
+    if (!img) return '';
+    let id = this.imgIds.get(img);
+    if (!id) this.imgIds.set(img, (id = Math.random().toString(36).slice(2, 10)));
+    return id;
+  }
+
+  /** Work out the photo's depth (once per photo) for the lens blur. */
+  private ensureDepth(): Promise<void> {
+    const img = this.img;
+    if (!img || this.video) return Promise.resolve();
+    const key = this.depthKey();
+    if (this.pipe.depth?.id === key) return Promise.resolve();
+    if (this.depthJob?.key === key) return this.depthJob.p;
+    const p = (async () => {
+      this.busy('Finding depth');
+      await new Promise((r) => setTimeout(r, 30));
+      // the photo as it was taken (no crop / turn: the depth goes through those like the photo)
+      const k = Math.min(1, 1024 / Math.max(img.preview.w, img.preview.h));
+      const gw = Math.max(16, Math.round(img.preview.w * k)), gh = Math.max(16, Math.round(img.preview.h * k));
+      const r = this.pipe.geometryRegion(img.preview, defaultState(), gw, gh, { x: 0, y: 0, w: gw, h: gh });
+      // that's linear light; the model wants an ordinary (sRGB) picture
+      const lut = new Uint8ClampedArray(256);
+      for (let i = 0; i < 256; i++) {
+        const c = i / 255;
+        lut[i] = 255 * (c <= 0.0031308 ? c * 12.92 : 1.055 * Math.pow(c, 1 / 2.4) - 0.055);
+      }
+      const rgba = new Uint8ClampedArray(r.px.length);
+      for (let i = 0; i < r.px.length; i += 4) {
+        rgba[i] = lut[r.px[i]];
+        rgba[i + 1] = lut[r.px[i + 1]];
+        rgba[i + 2] = lut[r.px[i + 2]];
+        rgba[i + 3] = 255;
+      }
+      const map = await this.depthEst.estimate(rgba, r.w, r.h, (s) => this.busy(s));
+      if (this.img !== img) return;
+      this.pipe.setDepth(map, key, img.preview.w, img.preview.h);
+      this.requestRender();
+    })()
+      .catch((e) => {
+        console.error(e);
+        this.depthFailed = key;
+        this.toast('Lens blur needs the depth model: ' + ((e as Error).message || e), 4500);
+      })
+      .finally(() => {
+        this.busy(null);
+        if (this.depthJob?.key === key) this.depthJob = null;
+      });
+    this.depthJob = { key, p };
+    return p;
+  }
+
   private askFillModel() {
     if (this.fillModel()) return;
     this.confirm(
@@ -4438,6 +4550,7 @@ export class App {
       }
       this.atlas.sync(this.state.masks);
       this.pipe.brushTex = this.atlas.tex;
+      if (Math.round(this.state.v.blurType) === 3) await this.ensureDepth();
       await this.ensureFill(this.state);
       this.syncOverlay(this.state);
       const blob = await renderExport({
@@ -4541,6 +4654,19 @@ function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditStat
   for (let i = 0; i < b.clips.length; i++) {
     const x = a.clips[i], y = b.clips[i];
     if (x.speed !== y.speed) return 'Speed';
+    if (JSON.stringify(x.ramp) !== JSON.stringify(y.ramp)) return 'Speed ramp';
+    if (j(x.look) !== j(y.look)) {
+      if (!x.look) return 'Clip look';
+      if (!y.look) return 'Whole-video look';
+      if ((x.look.kf?.length ?? 0) !== (y.look.kf?.length ?? 0)) return 'Look keyframe';
+      // one setting changed: name it
+      const sets = (L: NonNullable<typeof x.look>) => [L.v, ...(L.kf ?? []).map((k) => k.v)];
+      const A = sets(x.look), B = sets(y.look);
+      const ids = new Set<string>();
+      B.forEach((v, n) => Object.keys(v).forEach((k) => v[k] !== A[n]?.[k] && ids.add(k)));
+      const lab = ids.size === 1 ? PARAM_MAP[[...ids][0]]?.label : '';
+      return lab ? `Clip · ${lab}` : j(x.look.curves) !== j(y.look.curves) ? 'Clip · Curves' : 'Clip look';
+    }
     if (x.vol !== y.vol) return y.vol === 0 ? 'Mute' : 'Volume';
     if (x.in !== y.in || x.out !== y.out) return 'Trim';
     if (j(x.kf) !== j(y.kf)) return (y.kf?.length ?? 0) !== (x.kf?.length ?? 0) ? 'Keyframe' : 'Framing';

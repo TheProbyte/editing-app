@@ -4,7 +4,7 @@
 // while playing, so nothing can drop out), and export uses the very same mix.
 import { AudioBufferSink } from 'mediabunny';
 import type { Media, MediaLib } from './media';
-import { clipLen, layout, type VideoProject } from './project';
+import { clipLen, layout, speedAt, srcAt, type VideoProject } from './project';
 
 export const MIX_RATE = 48000;
 /** a short ramp at every cut, so clips don't click against each other */
@@ -38,7 +38,7 @@ export class AudioEngine {
 
   /** What the mix depends on. */
   private key(p: VideoProject) {
-    return JSON.stringify([p.clips.map((c) => [c.src, c.in, c.out, c.speed, c.vol]), p.music]);
+    return JSON.stringify([p.clips.map((c) => [c.src, c.in, c.out, c.speed, c.vol, c.ramp]), p.music]);
   }
 
   /** The mixed soundtrack for the project as it is now (cached; rebuilt after edits). */
@@ -81,7 +81,13 @@ export class AudioEngine {
       g.connect(ctx.destination);
       const s = ctx.createBufferSource();
       s.buffer = buf;
-      s.playbackRate.value = c.speed;
+      if (c.ramp) {
+        // a speed ramp: the playback rate follows the curve (sampled along the timeline)
+        const n = Math.max(2, Math.ceil(len * 120));
+        const curve = new Float32Array(n);
+        for (let k = 0; k < n; k++) curve[k] = speedAt(c, srcAt(c, (k / (n - 1)) * len));
+        s.playbackRate.setValueCurveAtTime(curve, t0, len);
+      } else s.playbackRate.value = c.speed;
       s.connect(g);
       s.start(t0, Math.min(c.in, buf.duration), Math.max(0, Math.min(c.out, buf.duration) - c.in));
     }

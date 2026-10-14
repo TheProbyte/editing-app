@@ -15,6 +15,8 @@ out vec4 outColor;
 float luma(vec3 c) { return dot(c, vec3(0.2126, 0.7152, 0.0722)); }
 vec3 toPerc(vec3 l) { return pow(max(l, 0.0), vec3(1.0 / 2.2)); }
 vec3 toLin(vec3 p) { return pow(max(p, 0.0), vec3(2.2)); }
+// lens blur: how blurred something at depth d is (0 sharp … 1 the most), focus at depth f
+float lensCoc(float d, float f, float range) { return clamp((abs(d - f) - range) / 0.45, 0.0, 1.0); }
 vec3 srgbToLin(vec3 c) {
   return mix(c / 12.92, pow((c + 0.055) / 1.055, vec3(2.4)), step(0.04045, c));
 }
@@ -199,6 +201,69 @@ void main() {
     wsum += 2.0 * w;
   }
   outColor = vec4(acc / wsum, 1.0);
+}`;
+
+/**
+ * Lens blur from a depth map, at reduced resolution: each pixel gathers a disc of samples, and
+ * each sample only counts as far as its own blur reaches (Gustafsson's single-pass bokeh). Things
+ * behind the pixel can't spread wider than twice its own blur, so a sharp subject doesn't get
+ * smeared by the background, while a blurred foreground still spreads over what's behind it.
+ * Out: rgb = the blurred picture, a = how much blurred foreground covers this pixel.
+ */
+export const LENS = COMMON + `
+uniform sampler2D uSrc;
+uniform sampler2D uDepth;  // 0 far … 1 near (r)
+uniform vec2 uTexel;
+uniform vec2 uFocusUv;
+uniform float uRange;      // half the in-focus depth range
+uniform float uMaxR;       // largest blur radius, in texels
+uniform float uBokeh;      // highlight boost
+uniform int uN;            // samples
+
+float focusDepth() {
+  float d = texture(uDepth, uFocusUv).r * 4.0;
+  vec2 o = vec2(0.006);
+  d += texture(uDepth, uFocusUv + vec2(o.x, 0.0)).r + texture(uDepth, uFocusUv - vec2(o.x, 0.0)).r;
+  d += texture(uDepth, uFocusUv + vec2(0.0, o.y)).r + texture(uDepth, uFocusUv - vec2(0.0, o.y)).r;
+  return d / 8.0;
+}
+float hot(vec3 c) {
+  // bright points (lights, sparkles) weigh more, so they spread into bright discs like real
+  // bokeh; an evenly bright area (a sky) stays the same brightness
+  return 1.0 + uBokeh * 10.0 * smoothstep(0.45, 1.0, luma(c));
+}
+void main() {
+  float fd = focusDepth();
+  float cD = texture(uDepth, vUv).r;
+  float cS = lensCoc(cD, fd, uRange) * uMaxR;
+  vec3 c0 = texture(uSrc, vUv).rgb;
+  float w0 = hot(c0);
+  vec3 acc = c0 * w0;
+  float ws = w0, fg = 0.0;
+  float n = float(uN);
+  float dr = uMaxR / sqrt(n);
+  // a different turn of the spiral per pixel trades banding for fine noise
+  float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.2831853;
+  for (int i = 0; i < 256; i++) {
+    if (i >= uN) break;
+    float fi = float(i) + 0.5;
+    float r = uMaxR * sqrt(fi / n);
+    float a = fi * 2.39996323 + jit;
+    vec2 tc = vUv + vec2(cos(a), sin(a)) * r * uTexel;
+    float sD = texture(uDepth, tc).r;
+    float sS = lensCoc(sD, fd, uRange) * uMaxR;
+    // what's behind this pixel can't spread over it further than its own blur
+    if (sD < cD - 0.004) sS = min(sS, cS * 2.0);
+    // a sample counts if its own blur reaches this far
+    float m = smoothstep(r - dr * 0.5, r + dr * 0.5, sS);
+    if (m <= 0.0) continue;
+    vec3 sc = texture(uSrc, tc).rgb;
+    float w = m * hot(sc);
+    acc += sc * w;
+    ws += w;
+    if (sD > cD + 0.03) fg += m;
+  }
+  outColor = vec4(acc / ws, clamp(fg / n * 2.5, 0.0, 1.0));
 }`;
 
 /** Extract the bright parts of an image (for halation and glow). */
@@ -557,7 +622,7 @@ uniform sampler2D uB;     // develop output (padded tile)
 uniform sampler2D uHal, uHal2;   // global halation blurs (core, wide)
 uniform sampler2D uGlow, uGlow2; // global glow blurs (core, wide)
 uniform sampler2D uBlur1, uBlur2; // global lens blurs (medium, large)
-uniform int uBlurType;            // 0 off, 1 tilt-shift, 2 radial
+uniform int uBlurType;            // 0 off, 1 tilt-shift, 2 radial, 3 lens (depth)
 uniform vec4 uBlurP;              // focus x, y, size, transition
 uniform float uBlurAngle;
 uniform vec4 uBRect;      // vUv -> B uv: offset.xy, scale.zw
@@ -621,7 +686,15 @@ void main() {
     c = texture(uB, bUv).rgb;
   }
 
-  if (uBlurType > 0) {
+  if (uBlurType == 3) {
+    // lens blur: the blurred picture where the depth says it's out of focus (judged per
+    // pixel at full size, so subject edges stay crisp), plus blurred foreground spreading over
+    float fd = (texture(uBlur2, uBlurP.xy).r * 4.0 + texture(uBlur2, uBlurP.xy + vec2(0.006, 0.0)).r + texture(uBlur2, uBlurP.xy - vec2(0.006, 0.0)).r
+      + texture(uBlur2, uBlurP.xy + vec2(0.0, 0.006)).r + texture(uBlur2, uBlurP.xy - vec2(0.0, 0.006)).r) / 8.0;
+    float coc = lensCoc(texture(uBlur2, gUv).r, fd, uBlurP.z) * uBlurP.w;
+    vec4 L = texture(uBlur1, gUv);
+    c = mix(c, L.rgb, max(smoothstep(0.4, 1.6, coc), L.a));
+  } else if (uBlurType > 0) {
     float aspect = uFull.x / uFull.y;
     vec2 v = (gUv - uBlurP.xy) * vec2(aspect, 1.0);
     float dist = uBlurType == 1 ? abs(dot(v, vec2(-sin(uBlurAngle), cos(uBlurAngle)))) : length(v);

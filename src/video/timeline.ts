@@ -20,6 +20,17 @@ export interface TimelineHost {
   changed(commit: boolean): void;
   select(s: Sel): void;
   selection(): Sel;
+  /** a media file's waveform (loudest level per 1/100 s, 0…1), or null */
+  peaks(src: string): Float32Array | null;
+}
+
+const PEAK_RATE = 100;
+/** The loudest level of a waveform between two source times. */
+function peakIn(P: Float32Array, s0: number, s1: number) {
+  let i = Math.max(0, Math.floor(Math.min(s0, s1) * PEAK_RATE)), e = Math.min(P.length, Math.ceil(Math.max(s0, s1) * PEAK_RATE) + 1);
+  let mx = 0;
+  for (; i < e; i++) if (P[i] > mx) mx = P[i];
+  return mx;
 }
 
 const RULER = 16, CLIP_Y = 18, CLIP_H = 50, LANE_H = 11, TEXT_Y = CLIP_Y + CLIP_H + 5, MUSIC_Y = TEXT_Y + LANE_H + 4;
@@ -170,6 +181,18 @@ export class Timeline {
       const on = sel?.kind === 'music';
       ctx.fillStyle = on ? '#7fe0a0' : 'rgba(127,224,160,0.35)';
       ctx.fillRect(x0, MUSIC_Y, Math.max(2, x1 - x0), LANE_H);
+      // the song's waveform, centred in the lane
+      const P = this.h.peaks(p.music.src);
+      if (P) {
+        ctx.fillStyle = on ? 'rgba(20,20,20,0.35)' : 'rgba(127,224,160,0.55)';
+        const xs = Math.max(x0, 0), xe = Math.min(x1, W);
+        for (let x = xs; x < xe; x += 2) {
+          const t = p.music.in + (x - this.x(0)) / this.pps;
+          const a = peakIn(P, t, t + 2 / this.pps);
+          const bar = Math.max(1, Math.round(a * (LANE_H - 2)));
+          ctx.fillRect(x, MUSIC_Y + (LANE_H - bar) / 2, 1.5, bar);
+        }
+      }
       ctx.fillStyle = 'rgba(20,20,20,0.9)';
       ctx.font = '700 8px Silkscreen, monospace';
       ctx.save();
@@ -264,6 +287,21 @@ export class Timeline {
         const k = Math.max(tw / iw, h / ih);
         const sw = tw / k, sh = h / k;
         ctx.drawImage(th, (iw - sw) / 2, (ih - sh) / 2, sw, sh, x, y, tw, h);
+      }
+      // the clip's sound along its bottom (scaled by its volume)
+      const P = m.kind === 'video' ? this.h.peaks(cl.src) : null;
+      if (P && h > 24) {
+        const bh = Math.round(h * 0.4), by = y + h - bh;
+        ctx.fillStyle = 'rgba(10,10,10,0.55)';
+        ctx.fillRect(x0, by, x1 - x0, bh);
+        ctx.fillStyle = cl.vol > 0 ? 'rgba(242,239,232,0.85)' : 'rgba(242,239,232,0.25)';
+        const k = Math.min(1, Math.max(0.15, cl.vol));
+        const xs = Math.max(x0, 0), xe = Math.min(x1, cullW);
+        for (let x = xs; x < xe; x += 2) {
+          const a = peakIn(P, srcAt(cl, (x - x0) / this.pps), srcAt(cl, (x + 2 - x0) / this.pps)) * k;
+          const bar = Math.max(1, Math.round(a * (bh - 3)));
+          ctx.fillRect(x, by + bh - 1 - bar, 1.5, bar);
+        }
       }
     }
     ctx.restore();

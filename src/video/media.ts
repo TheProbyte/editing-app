@@ -39,9 +39,15 @@ export class MediaLib {
     return this.items.get(id) ?? null;
   }
 
-  async add(file: File): Promise<Media> {
-    if (isVideoFile(file) || isAudioFile(file)) return this.addAV(file);
-    return this.addImage(file);
+  /** Add a file (with `id`: reopening a saved project, whose clips refer to it by that id). */
+  async add(file: File, id?: string): Promise<Media> {
+    const m = isVideoFile(file) || isAudioFile(file) ? await this.addAV(file) : await this.addImage(file);
+    if (id && id !== m.id) {
+      this.items.delete(m.id);
+      m.id = id;
+      this.items.set(id, m);
+    }
+    return m;
   }
 
   private async addAV(file: File): Promise<Media> {

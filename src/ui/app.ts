@@ -11,7 +11,7 @@ import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
 import { encodeJpegBand } from '../io/jpegEncoder';
 import { encodePngBand } from '../io/pngEncoder';
-import { loadBlob, loadSession, saveBlob, saveFile, saveState } from '../io/session';
+import { dropRecent, listRecents, loadBlob, loadSession, putRecent, recentFiles, saveBlob, saveFile, saveState, touchRecent, type Recent } from '../io/session';
 import { TOOLS, ToolDef, Chip } from './tools';
 import { ICONS } from './icons';
 import { CurveEditor } from './curveEditor';
@@ -135,6 +135,9 @@ export class App {
   private depthEst = new DepthEstimator();
   private depthJob: { key: string; p: Promise<void> } | null = null;
   private lookRaf = 0;
+  /** the recent-projects entry this edit is saved as */
+  private recentId: string | null = null;
+  private recentTimer = 0;
   /** the photo whose depth couldn't be worked out (not retried until Lens is picked again) */
   private depthFailed = '';
   private imgIds = new WeakMap<object, string>();
@@ -289,8 +292,10 @@ export class App {
   }
 
   private async offerResume() {
+    await this.showRecents();
     const s = await loadSession();
-    if (!s || this.img) return;
+    // the shelf of recent projects covers "continue editing" when there is one
+    if (!s || this.img || !$('recents').hidden) return;
     const b = $<HTMLButtonElement>('btnResume');
     b.hidden = false;
     b.onclick = () => this.open(s.file, false, s.state);
@@ -299,7 +304,7 @@ export class App {
   // -----------------------------------------------------------------------------------
   // Opening images
 
-  async open(file: File, keepState = false, restoreState = '') {
+  async open(file: File, keepState = false, restoreState = '', recentId: string | null = null) {
     if (this.video) {
       this.setMode(null);
       this.closeVideo();
@@ -360,6 +365,10 @@ export class App {
           // RAW orientation is applied as a quarter turn, like the crop tool's rotate
           if (L.quarter) this.state.geo.quarter = L.quarter;
           saveFile(file);
+        }
+        if (!keepState) {
+          this.recentId = recentId ?? Math.random().toString(36).slice(2, 10);
+          void putRecent({ id: this.recentId, kind: 'photo', name: file.name, ts: Date.now(), thumb: null, state: '' }, [{ id: 'photo', file }]);
         }
         this.history = [];
         this.hIdx = -1;
@@ -803,6 +812,85 @@ export class App {
       this.saveTimer = window.setTimeout(() => saveState(this.history[this.hIdx]), 800);
     }
     if (this.video) this.video.updateTitle();
+    this.saveRecentSoon();
+  }
+
+  // ---- recent projects (the home screen shelf)
+
+  /** After edits settle: the entry's edit and thumbnail (and a video's files). */
+  private saveRecentSoon() {
+    if (!this.recentId || !this.img) return;
+    clearTimeout(this.recentTimer);
+    this.recentTimer = window.setTimeout(() => void this.saveRecent(), 1500);
+  }
+
+  private async saveRecent() {
+    const id = this.recentId;
+    if (!id || !this.img || this.video?.exporting || this.video?.player.playing) return;
+    const state = this.history[this.hIdx];
+    const thumb = await this.thumbBlob();
+    if (this.video) await putRecent({ id, kind: 'video', name: this.video.info, ts: Date.now(), thumb, state }, this.video.mediaFiles());
+    else await touchRecent(id, { state, thumb });
+  }
+
+  /** A small picture of what's on screen. */
+  private thumbBlob(): Promise<Blob | null> {
+    try {
+      this.renderNow();
+      const c = this.canvas, k = Math.min(1, 240 / Math.max(c.width, c.height));
+      const t = document.createElement('canvas');
+      t.width = Math.max(1, Math.round(c.width * k));
+      t.height = Math.max(1, Math.round(c.height * k));
+      t.getContext('2d')!.drawImage(c, 0, 0, t.width, t.height);
+      return new Promise((r) => t.toBlob((b) => r(b), 'image/jpeg', 0.8));
+    } catch {
+      return Promise.resolve(null);
+    }
+  }
+
+  /** The shelf of recent projects on the home screen. */
+  private async showRecents() {
+    const box = $('recents'), row = box.querySelector('.rrow') as HTMLElement;
+    const list = await listRecents();
+    row.querySelectorAll('img').forEach((i) => URL.revokeObjectURL(i.src));
+    row.innerHTML = '';
+    box.hidden = !list.length;
+    for (const r of list) {
+      const b = document.createElement('button');
+      b.className = 'rcard' + (r.id === this.recentId && this.img ? ' cur' : '');
+      const when = new Date(r.ts);
+      const day = when.toDateString() === new Date().toDateString() ? when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : when.toLocaleDateString([], { month: 'short', day: 'numeric' });
+      b.innerHTML = `<span class="th">${r.thumb ? `<img src="${URL.createObjectURL(r.thumb)}" alt="">` : ''}${r.kind === 'video' ? `<i class="vid">${ICONS.play}</i>` : ''}</span><small>${escapeHtml(day)}</small>`;
+      b.onclick = () => {
+        tick();
+        void this.openRecent(r);
+      };
+      const x = document.createElement('i');
+      x.className = 'rdel';
+      x.textContent = '×';
+      x.onclick = (e) => {
+        e.stopPropagation();
+        tick();
+        void dropRecent(r.id).then(() => this.showRecents());
+      };
+      b.appendChild(x);
+      row.appendChild(b);
+    }
+  }
+
+  private async openRecent(r: Recent) {
+    if (r.id === this.recentId && this.img) return this.showHome(false);
+    this.busy('Opening');
+    const files = await recentFiles(r);
+    if (!files?.length) {
+      this.busy(null);
+      this.toast('That project’s files are gone', 2600);
+      await dropRecent(r.id);
+      return this.showRecents();
+    }
+    if (this.homeOver) this.showHome(false);
+    if (r.kind === 'photo') return this.open(files[0].file, false, r.state, r.id);
+    return this.openVideo([], { files, state: r.state, id: r.id });
   }
 
   private commitAndRefresh() {
@@ -1062,7 +1150,7 @@ export class App {
   }
 
   /** Start a video project with these files. */
-  async openVideo(files: File[]) {
+  async openVideo(files: File[], restore: { files: { id: string; file: File }[]; state: string; id: string } | null = null) {
     this.setMode(null);
     if (this.video) this.closeVideo();
     else this.disposeImage();
@@ -1082,7 +1170,17 @@ export class App {
     this.appEl.classList.add('video');
     this.video = new Mode(this.videoHost());
     this.buildTools();
-    await this.video.addFiles(files);
+    this.recentId = restore?.id ?? Math.random().toString(36).slice(2, 10);
+    if (restore) {
+      await this.video.restoreMedia(restore.files);
+      try {
+        this.state = { ...defaultState(), ...JSON.parse(restore.state) };
+      } catch {
+        /* a broken entry: start empty */
+      }
+      this.commit();
+      this.video.afterRestore();
+    } else await this.video.addFiles(files);
     if (!this.state.video?.clips.length) {
       this.closeVideo();
       this.updateChrome();
@@ -1244,6 +1342,7 @@ export class App {
       this.setMode(null);
       el.classList.remove('hidden');
       el.classList.add('over', 'ready');
+      void this.saveRecent().then(() => this.showRecents());
       resume.hidden = false;
       resume.textContent = this.video ? 'Back to video' : 'Back to photo';
       if (this.video?.player.playing) this.video.togglePlay();

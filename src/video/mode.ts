@@ -99,6 +99,7 @@ export class VideoMode {
   constructor(private h: VideoHost) {
     this.comp = new Compositor(h.g);
     this.audio = new AudioEngine(this.lib);
+    this.audio.onPeaks = () => this.timeline?.thumbsChanged();
     this.player = new Player(this.lib, () => this.project, this.audio);
     // playback copies each decoded frame to the GPU the moment it arrives
     this.player.upload = (vf) => this.comp.uploadRing(vf, vf.displayWidth, vf.displayHeight);
@@ -114,6 +115,10 @@ export class VideoMode {
       this.rescope();
     };
     this.timeline = new Timeline($('tlTrack'), {
+      peaks: (id) => {
+        const m = this.lib.get(id);
+        return m ? this.audio.peaks(m) : null;
+      },
       project: () => this.project,
       time: () => this.player.time,
       scrub: (T) => {
@@ -225,6 +230,36 @@ export class VideoMode {
     this.h.refreshSection();
     this.updateTitle();
     if (!first) this.h.toast(added.length > 1 ? `Added ${added.length} clips` : 'Clip added', 1400);
+  }
+
+  /** Reopen a saved project's files (the edit itself is restored by the app). */
+  async restoreMedia(files: { id: string; file: File }[]) {
+    for (let k = 0; k < files.length; k++) {
+      this.h.busy(`Opening ${k + 1} of ${files.length}`);
+      try {
+        const m = await this.lib.add(files[k].file, files[k].id);
+        this.audio.warm(m);
+        if (m.kind === 'video') setTimeout(() => void this.player.buildKeys(m), 1200);
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    this.h.busy(null);
+  }
+
+  /** Every file the project uses, with its id (for saving it as a recent project). */
+  mediaFiles() {
+    const p = this.project;
+    const ids = new Set([...p.clips.map((c) => c.src), p.music?.src, p.bgImg].filter(Boolean) as string[]);
+    return [...ids].map((id) => this.lib.get(id)).filter((m) => m?.file).map((m) => ({ id: m!.id, file: m!.file as File }));
+  }
+
+  /** After a saved project is put back: frame, timeline, sound. */
+  afterRestore() {
+    this.onRestore();
+    this.timeline.fitAll();
+    this.player.seek(0);
+    this.updateTitle();
   }
 
   private async setMusic(f: File) {

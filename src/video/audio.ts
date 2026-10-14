@@ -31,6 +31,45 @@ export class AudioEngine {
     return p;
   }
 
+  // ---- waveforms for the timeline: the loudest sample in each 1/100 s, 0…1
+
+  static PEAK_RATE = 100;
+  private peakMap = new Map<string, Float32Array | null>();
+  /** a file's waveform became ready */
+  onPeaks: () => void = () => {};
+
+  /** The waveform of a file's sound (null until it's decoded; then onPeaks fires). */
+  peaks(m: Media): Float32Array | null {
+    if (!m.audio) return null;
+    if (this.peakMap.has(m.id)) return this.peakMap.get(m.id)!;
+    this.peakMap.set(m.id, null);
+    void this.decoded(m).then((buf) => {
+      if (!buf) return;
+      const bin = Math.max(1, Math.round(buf.sampleRate / AudioEngine.PEAK_RATE));
+      const n = Math.ceil(buf.length / bin);
+      const out = new Float32Array(n);
+      for (let c = 0; c < buf.numberOfChannels; c++) {
+        const d = buf.getChannelData(c);
+        for (let i = 0; i < n; i++) {
+          let mx = out[i];
+          const e = Math.min(d.length, (i + 1) * bin);
+          for (let j = i * bin; j < e; j += 4) {
+            const a = Math.abs(d[j]);
+            if (a > mx) mx = a;
+          }
+          out[i] = mx;
+        }
+      }
+      // scaled so a loud part reaches the top (a few clipped peaks don't flatten the rest)
+      const sorted = Float32Array.from(out).sort();
+      const top = Math.max(1e-4, sorted[Math.floor(sorted.length * 0.98)] || 0);
+      for (let i = 0; i < n; i++) out[i] = Math.min(1, Math.sqrt(out[i] / top));
+      this.peakMap.set(m.id, out);
+      this.onPeaks();
+    });
+    return null;
+  }
+
   /** Start decoding a file's sound in the background (on import). */
   warm(m: Media) {
     if (m.audio) void this.decoded(m);

@@ -16,6 +16,9 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 
 ## Video
 
+**Recent projects:** the home screen keeps your last 8 photos and videos with their edits (files, edit and a
+thumbnail are stored on the device); tap one to carry on exactly where you were, × to forget it.
+
 Pick one or more videos (and photos, as 3-second stills) with **Open media**. Every look and adjustment
 from the photo editor applies to the whole video; the timeline sits above the tool bar.
 
@@ -46,6 +49,8 @@ from the photo editor applies to the whole video; the timeline sits above the to
   **8mm / 16mm / 35mm / Clean** presets. Everything is keyed to the film frame, so the export matches the
   preview frame for frame, and exports with moving grain get extra bitrate so the grain survives encoding.
 - **Play:** the play button or a tap on the video.
+- **Waveforms:** each clip's sound is drawn along the bottom of its strip (scaled by its volume, following speed
+  ramps) and the song's in the music lane, so beats and voices are easy to cut to.
 - **How it stays smooth:** frames are decoded ahead and copied to GPU textures the moment they arrive; one
   display loop shows each on the refresh it's due, against the audio output's own clock (interpolated, and
   allowing for Bluetooth delay). The soundtrack is mixed once in the background after each edit into one

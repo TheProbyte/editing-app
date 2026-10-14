@@ -36,8 +36,8 @@ interface Queued {
 const QMAX = 4;
 
 /** Frames kept for scrubbing backwards (each a preview-size bitmap). */
-const REV_MAX = 150;
-const REV_LONG = 640;
+const REV_MAX = 90;
+const REV_LONG = 960;
 
 
 export class Player {
@@ -127,7 +127,6 @@ export class Player {
    */
   private scrub: { media: string; it: AsyncGenerator<VideoSample, void, unknown>; ts: number; peek: VideoSample | null } | null = null;
   private keySinks = new Map<string, EncodedPacketSink>();
-  private shownKey = { media: '', ts: -1 };
 
   private closeScrub() {
     const sc = this.scrub;
@@ -144,16 +143,48 @@ export class Player {
     return pk ? pk.timestamp : 0;
   }
 
-  /** The sample at source time t (exact), or the key frame before it (fast). Null: nothing new. */
+  /** The last frame put on screen while scrubbing (source time). */
+  private shownTs = { media: '', ts: -1 };
+
+  /**
+   * The frame for source time t. Exact (finger settled): decodes all the way to t. While the
+   * finger moves (fast) the rule is that the picture never jumps backwards past what's on
+   * screen: small wobbles back keep the current frame, moving forward decodes on a few frames
+   * per step (so it catches up smoothly), and only a big jump forward restarts at the key
+   * frame before t, which is then ahead of the screen. Null: keep what's showing.
+   */
   private async frameAt(m: Media, sink: VideoSampleSink, t: number, fast: boolean): Promise<VideoSample | null> {
     let sc = this.scrub?.media === m.id ? this.scrub : null;
+    const shown = this.shownTs.media === m.id ? this.shownTs.ts : null;
     const ahead = sc ? t - sc.ts : -1;
-    if (!sc || ahead < -1e-4 || ahead > (fast ? 0.6 : 1.5)) {
-      // restart at the key frame before t
+    let budget = Infinity;
+    if (fast) {
+      if (shown !== null && t < shown) return null; // a wobble back, or reverse (handled by the cache)
+      if (sc && ahead >= -1e-4 && ahead <= 1.2) {
+        budget = 8; // decode on, a few frames per step
+      } else {
+        const kt = await this.keyTime(m, t);
+        if (sc && ahead >= -1e-4 && kt <= sc.ts + 1e-4) budget = 8; // the decoder is already past t's key frame: decode on
+        else {
+          // restart at t's key frame; show it straight away only if it's ahead of the screen
+          this.closeScrub();
+          const it = sink.samples(kt);
+          const r = await it.next();
+          if (r.done) {
+            void it.return();
+            return null;
+          }
+          sc = this.scrub = { media: m.id, it, ts: r.value.timestamp, peek: r.value };
+          if (shown === null || kt > shown + 1e-4) {
+            sc.peek = null;
+            return r.value;
+          }
+          budget = 8;
+        }
+      }
+    } else if (!sc || ahead < -1e-4 || ahead > 1.5) {
+      // exact: restart at the key frame before t, then decode up to t
       const kt = await this.keyTime(m, t);
-      // close to the key frame, decoding the few frames up to t is cheap: be exact
-      const far = t - kt > 0.35;
-      if (fast && far && this.shownKey.media === m.id && Math.abs(this.shownKey.ts - kt) < 1e-4) return null;
       this.closeScrub();
       const it = sink.samples(kt);
       const r = await it.next();
@@ -162,31 +193,33 @@ export class Player {
         return null;
       }
       sc = this.scrub = { media: m.id, it, ts: r.value.timestamp, peek: r.value };
-      if (fast && far) {
-        this.shownKey = { media: m.id, ts: kt };
-        sc.peek = null;
-        return r.value;
-      }
     }
-    // decode on to the frame covering t
-    let cur: VideoSample | null = sc.peek;
-    sc.peek = null;
+    // decode on to the frame covering t (or as far as the budget goes)
+    let cur: VideoSample | null = sc!.peek;
+    sc!.peek = null;
+    let n = 0;
     for (;;) {
       if (cur && cur.timestamp + (cur.duration || 1 / 60) > t + 1e-4) break;
-      const r = await sc.it.next();
+      if (n++ >= budget) break;
+      const r = await sc!.it.next();
       if (r.done) break;
       if (r.value.timestamp > t + 1e-4) {
         // already past t: keep it for later, show what we have
-        sc.peek = r.value;
+        sc!.peek = r.value;
         break;
       }
       cur?.close();
       cur = r.value;
     }
     if (!cur) return null;
-    // `cur` goes to the screen (and is closed there); remember where we are
-    sc.ts = cur.timestamp;
-    this.shownKey = { media: '', ts: -1 };
+    sc!.ts = cur.timestamp;
+    // still behind what's on screen (catching up from a key frame): keep it, show nothing yet
+    if (fast && shown !== null && cur.timestamp < shown - 1e-4) {
+      if (sc!.peek) cur.close();
+      else sc!.peek = cur;
+      return null;
+    }
+    // `cur` goes to the screen (and is closed there)
     return cur;
   }
 
@@ -207,6 +240,15 @@ export class Player {
     if (!L) return null;
     for (const f of L) if (t >= f.ts - 1e-4 && t < f.end) return f;
     return null;
+  }
+
+  /** A cached frame within a few frames after t (and before what's on screen). */
+  private near(m: Media, t: number, before: number) {
+    const L = this.rev.get(m.id);
+    if (!L) return null;
+    let best: (typeof L)[number] | null = null;
+    for (const f of L) if (f.ts >= t && f.ts <= t + 0.15 && f.ts < before - 1e-4 && (!best || f.ts < best.ts)) best = f;
+    return best;
   }
 
   private async fillBack(m: Media, sink: VideoSampleSink, t: number) {
@@ -244,6 +286,11 @@ export class Player {
       w.list.splice(w.i, 1);
       this.revCount--;
     }
+    // still heading back: get the second before this one ready too
+    if (!this.playing && this.lastT.media === m.id && this.lastT.t < kt + 0.6 && kt > 0.05 && this.seekWant?.fast !== false) {
+      const kPrev = await this.keyTime(m, kt - 0.01);
+      if (kPrev < kt - 0.01) await this.fillBack(m, sink, kt - 0.01).catch(() => {});
+    }
     return this.cached(m, t);
   }
 
@@ -275,16 +322,21 @@ export class Player {
         // scrubbing backwards: from the cache when it has the frame; otherwise the quick
         // frame now, and the second before t goes into the cache in the background
         if (fast && this.backward(m, t)) {
-          const b = this.cached(m, t);
+          // the exact frame from the cache, else the nearest cached one just ahead of the finger
+          const b = this.cached(m, t) ?? this.near(m, t, this.shownTs.media === m.id ? this.shownTs.ts : Infinity);
           if (b) {
             this.onFrame({ clip, media: m, sample: null, bitmap: b.bmp, ts: b.ts, t: T });
+            this.shownTs = { media: m.id, ts: b.ts };
             this.lastT = { media: m.id, t };
             continue;
           }
           if (!this.filling) this.filling = this.fillBack(m, sink, t).catch(() => {}).finally(() => (this.filling = null));
         }
         const s = await this.frameAt(m, sink, t, fast);
-        if (s) this.onFrame({ clip, media: m, sample: s, t: T });
+        if (s) {
+          this.shownTs = { media: m.id, ts: s.timestamp };
+          this.onFrame({ clip, media: m, sample: s, t: T });
+        }
         this.lastT = { media: m.id, t };
       }
     } catch (e) {

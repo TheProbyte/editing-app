@@ -41,7 +41,7 @@ from the photo editor applies to the whole video; the timeline sits above the to
   display loop shows each on the refresh it's due, against the audio output's own clock (interpolated, and
   allowing for Bluetooth delay). The soundtrack is mixed once in the background after each edit into one
   continuous track, so playback has nothing to schedule and can't drop out. Scrubbing keeps a decoder open
-  (forward is just decoding on), caches the second behind the playhead for reverse scrubbing, and lands on
+  (forward is just decoding on), keeps small copies of frames it has decoded for reverse scrubbing (and decodes the second before the one you're scrubbing back through ahead of time, also while you're stopped on a frame), and lands on
   the exact frame when you stop. Every key frame of a clip is also decoded once in the background into a
   small picture: a drag faster than the decoder can follow (it learns how fast that is) shows those
   instantly, and no frame is ever shown against the direction you're dragging. 480p / 720p footage is

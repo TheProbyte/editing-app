@@ -160,7 +160,7 @@ export class VideoMode {
       this.pickMedia();
     };
     // keep the dock's swipe-up (all tools) from firing on the timeline
-    $('timeline').addEventListener('pointerdown', (e) => e.stopPropagation());
+    $('timeline').addEventListener('pointerdown', (e) => e.stopPropagation(), { signal: this.life.signal });
     $<HTMLInputElement>('fileAdd').onchange = () => {
       const files = [...($<HTMLInputElement>('fileAdd').files ?? [])];
       if (files.length) void this.addFiles(files);
@@ -207,9 +207,10 @@ export class VideoMode {
       this.h.busy(files.length > 1 ? `Opening ${k + 1} of ${files.length}` : 'Opening');
       try {
         const m = await this.lib.add(f);
+        if (this.dead) return;
         this.audio.warm(m);
         if (m.kind === 'audio') continue;
-        if (m.kind === 'video') setTimeout(() => void this.player.buildKeys(m), 1200);
+        if (m.kind === 'video') setTimeout(() => !this.dead && void this.player.buildKeys(m), 1200);
         const c: VClip = { id: uid(), src: m.id, kind: m.kind === 'image' ? 'image' : 'video', in: 0, out: m.kind === 'image' ? IMAGE_SECONDS : m.duration, speed: 1, vol: m.audio ? 1 : 0 };
         added.push(c);
       } catch (e) {
@@ -217,6 +218,7 @@ export class VideoMode {
         this.h.toast((e as Error).message || `Couldn’t open ${f.name}`, 4000);
       }
     }
+    if (this.dead) return;
     this.h.busy(null);
     if (!added.length) return;
     p.clips.splice(at, 0, ...added);
@@ -230,6 +232,17 @@ export class VideoMode {
     this.h.refreshSection();
     this.updateTitle();
     if (!first) this.h.toast(added.length > 1 ? `Added ${added.length} clips` : 'Clip added', 1400);
+  }
+
+  /** Can any of these files become a clip? (null: yes; else the reason for the first that can't) */
+  static async probe(files: File[]): Promise<string | null> {
+    let why: string | null = null;
+    for (const f of files) {
+      const r = await MediaLib.probe(f);
+      if (!r) return null;
+      why ??= r;
+    }
+    return why ?? 'Nothing to open';
   }
 
   /** Reopen a saved project's files (the edit itself is restored by the app). */
@@ -1060,7 +1073,7 @@ export class VideoMode {
   }
 
   /** The look switch at the front of an adjustment section: whole video / this clip, keyframe. */
-  scopeChips(row: HTMLElement) {
+  scopeChips(row: HTMLElement, sep: boolean) {
     const c = this.playClip();
     if (!c) return;
     const own = !!c.look;
@@ -1080,7 +1093,7 @@ export class VideoMode {
     const k = lookKeyAt(c.look, this.sNow(c)) >= 0;
     const b = this.h.chip(row, { id: 'key', label: '◆ Key' }, k, () => this.toggleLookKey(c));
     b.classList.add('keychip');
-    row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
+    if (sep) row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
   }
 
   /** Clip c gets its own look, starting from the one it shows now. */
@@ -1588,7 +1601,11 @@ export class VideoMode {
   // -----------------------------------------------------------------------------------
 
   /** Release everything (leaving video mode). */
+  /** closed: work still in flight (files being read) must not touch the screen any more */
+  private dead = false;
+
   dispose() {
+    this.dead = true;
     this.life.abort();
     this.rampEd.el.remove();
     this.player.dispose();
@@ -1603,6 +1620,11 @@ export class VideoMode {
       m.input?.dispose?.();
     }
     this.lib.items.clear();
+    this.audio.dispose();
+    this.last = null;
     $('tlTrack').innerHTML = '';
+    // handlers on elements that outlive the editor would keep all of it (and its sound) in memory
+    for (const id of ['tlPlay', 'tlAdd', 'busyCancel', 'textDone', 'textCancel', 'textSheet', 'vxCancel', 'vxGo', 'vexSheet']) $(id).onclick = null;
+    for (const id of ['fileAdd', 'fileAudio']) $(id).onchange = null;
   }
 }

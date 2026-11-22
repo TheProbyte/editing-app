@@ -31,6 +31,16 @@ export class AudioEngine {
     return p;
   }
 
+  /** Let go of every decoded track and the mix. */
+  dispose() {
+    this.full.clear();
+    this.peakMap.clear();
+    this.mixP = null;
+    this.mixBuf = null;
+    this.mixKey = '';
+    this.onPeaks = () => {};
+  }
+
   // ---- waveforms for the timeline: the loudest sample in each 1/100 s, 0…1
 
   static PEAK_RATE = 100;

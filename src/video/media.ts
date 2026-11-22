@@ -50,6 +50,29 @@ export class MediaLib {
     return m;
   }
 
+  /** Can this file become a clip? Null if so, else why not (checked before anything is closed for it). */
+  static async probe(file: File): Promise<string | null> {
+    try {
+      if (isVideoFile(file)) {
+        const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
+        try {
+          if (!(await input.canRead())) return `Can’t read ${file.name}`;
+          const video = await input.getPrimaryVideoTrack();
+          if (!video) return `${file.name} has no video`;
+          if (!(await video.canDecode())) return `This phone can’t decode ${file.name} (${video.codec ?? 'unknown'} video)`;
+          return null;
+        } finally {
+          (input as { dispose?: () => void }).dispose?.();
+        }
+      }
+      if (isAudioFile(file)) return `${file.name} is sound only`;
+      (await createImageBitmap(file)).close();
+      return null;
+    } catch {
+      return `Can’t read ${file.name}`;
+    }
+  }
+
   private async addAV(file: File): Promise<Media> {
     const input = new Input({ formats: ALL_FORMATS, source: new BlobSource(file) });
     if (!(await input.canRead())) throw new Error(`Can’t read ${file.name}`);

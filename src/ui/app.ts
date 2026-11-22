@@ -304,17 +304,30 @@ export class App {
   // -----------------------------------------------------------------------------------
   // Opening images
 
+  /** counts opens: when two overlap, only the latest one takes over the screen */
+  private openTok = 0;
+
   async open(file: File, keepState = false, restoreState = '', recentId: string | null = null) {
-    if (this.video) {
-      this.setMode(null);
-      this.closeVideo();
-    }
+    const tok = ++this.openTok;
     this.busy('Opening');
     try {
       const maxDim = Math.min(this.g.maxTex, 8192);
-      const L = await loadFile(file, maxDim, (s) => this.busy(s.replace('…', '')));
-      this.busy('Preparing');
-      await new Promise((r) => setTimeout(r, 0));
+      const L = await loadFile(file, maxDim, (s) => tok === this.openTok && this.busy(s.replace('…', '')));
+      if (tok === this.openTok) {
+        this.busy('Preparing');
+        await new Promise((r) => setTimeout(r, 0));
+      }
+      if (tok !== this.openTok) {
+        // another file was opened meanwhile: that one wins
+        if (L.kind === 'bitmap') L.bitmap.close();
+        return;
+      }
+      // only now that the new photo is read does what was open go away (a file that can't be
+      // read leaves the current photo or video as it is)
+      if (this.video) {
+        this.setMode(null);
+        this.closeVideo();
+      }
       const g = this.g;
       const gl = g.gl;
       this.disposeImage();
@@ -394,10 +407,12 @@ export class App {
       this.toast(L.note ?? L.info, L.note ? 5000 : 1800);
     } catch (e) {
       console.error(e);
-      this.toast((e as Error).message || 'Could not open that file.', 5000);
+      if (tok === this.openTok) this.toast((e as Error).message || 'Could not open that file.', 5000);
     } finally {
-      this.busy(null);
-      this.updateChrome();
+      if (tok === this.openTok) {
+        this.busy(null);
+        this.updateChrome();
+      }
     }
   }
 
@@ -1151,13 +1166,7 @@ export class App {
 
   /** Start a video project with these files. */
   async openVideo(files: File[], restore: { files: { id: string; file: File }[]; state: string; id: string } | null = null) {
-    this.setMode(null);
-    if (this.video) this.closeVideo();
-    else this.disposeImage();
-    this.file = null;
-    this.state = defaultState();
-    this.state.video = newProject();
-    this.resetEdit();
+    const tok = ++this.openTok;
     this.busy('Opening');
     let Mode: typeof VideoMode;
     try {
@@ -1167,12 +1176,28 @@ export class App {
       this.toast('Couldn’t load the video editor: ' + (e as Error).message, 5000);
       return;
     }
+    // files that can't be read leave what's open (a photo, another video) as it is
+    const why = restore ? null : await Mode.probe(files);
+    if (tok !== this.openTok) return;
+    if (why) {
+      this.busy(null);
+      this.toast(why, 4500);
+      return;
+    }
+    this.setMode(null);
+    if (this.video) this.closeVideo();
+    else this.disposeImage();
+    this.file = null;
+    this.state = defaultState();
+    this.state.video = newProject();
+    this.resetEdit();
     this.appEl.classList.add('video');
     this.video = new Mode(this.videoHost());
     this.buildTools();
     this.recentId = restore?.id ?? Math.random().toString(36).slice(2, 10);
     if (restore) {
       await this.video.restoreMedia(restore.files);
+      if (tok !== this.openTok || !this.video) return;
       try {
         this.state = { ...defaultState(), ...JSON.parse(restore.state) };
       } catch {
@@ -1181,8 +1206,15 @@ export class App {
       this.commit();
       this.video.afterRestore();
     } else await this.video.addFiles(files);
+    // (another file was opened while these were being read: that one has the screen)
+    if (tok !== this.openTok) return;
     if (!this.state.video?.clips.length) {
+      // nothing could be opened after all: back to the home screen
       this.closeVideo();
+      this.busy(null);
+      $('empty').classList.remove('hidden', 'over');
+      this.frame.classList.add('empty');
+      void this.showRecents();
       this.updateChrome();
       return;
     }
@@ -1205,6 +1237,9 @@ export class App {
     if (!this.video) return;
     this.video.dispose();
     this.video = null;
+    // the last section's buttons still point at the closed editor: drop them with it
+    $('subs').innerHTML = '';
+    $('acts').innerHTML = '';
     if (this.img) this.g.destroy(this.img.thumbT);
     this.img = null;
     this.pipe.invalidate();
@@ -1609,6 +1644,15 @@ export class App {
     }
     this.buildSubs();
     this.buildActs();
+    // a video's look switch (All clips / This clip / Key) goes in whichever row is free, so it
+    // doesn't push the section's own choices off the screen
+    if (this.video && this.tool.kind !== 'video') {
+      const subs = $('subs'), acts = $('acts');
+      const row = !acts.childElementCount ? acts : subs;
+      const tmp = document.createElement('div');
+      this.video.scopeChips(tmp, row.childElementCount > 0);
+      row.prepend(...tmp.childNodes);
+    }
     this.updateSecBar();
     if (this.kind() === 'crop') this.crop.update();
     if (this.kind() === 'curves') this.curve.draw();
@@ -1657,7 +1701,6 @@ export class App {
     row.innerHTML = '';
     const t = this.tool!;
     if (t.kind === 'video') return this.video?.buildSubs(t, row);
-    if (this.video) this.video.scopeChips(row);
     if (t.kind === 'looks') return this.buildLooks();
     if (t.kind === 'masks') return this.buildMaskList();
     if (t.kind === 'leak') return this.buildLeaks();

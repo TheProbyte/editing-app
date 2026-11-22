@@ -223,21 +223,34 @@ function seeded(seed: number) {
   return () => ((s = (Math.imul(s, 1664525) + 1013904223) >>> 0) / 4294967296);
 }
 
-const cache = new Map<string, HTMLCanvasElement>();
-export function leakCanvas(id: string): HTMLCanvasElement {
-  let c = cache.get(id);
-  if (c) return c;
+/**
+ * Draw a leak into a new w×h canvas: the LEAK_W×LEAK_H design scaled by `k`, starting `ox`
+ * design pixels in from the left. Nothing is kept: a full-size leak is ~6 MB, and there are
+ * a couple of dozen of them.
+ */
+function paint(id: string, w: number, h: number, k: number, ox: number): HTMLCanvasElement {
   const def = LEAKS.find((l) => l.id === id) ?? LEAKS[0];
-  c = document.createElement('canvas');
-  c.width = LEAK_W;
-  c.height = LEAK_H;
+  const c = document.createElement('canvas');
+  c.width = w;
+  c.height = h;
   const ctx = c.getContext('2d')!;
   ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, LEAK_W, LEAK_H);
+  ctx.fillRect(0, 0, w, h);
   ctx.globalCompositeOperation = 'lighter';
-  let h = 7;
-  for (const ch of def.id) h = Math.imul(h, 31) + ch.charCodeAt(0);
-  def.draw(ctx, LEAK_W, LEAK_H, seeded(h));
-  cache.set(id, c);
+  ctx.scale(k, k);
+  ctx.translate(-ox, 0);
+  let seed = 7;
+  for (const ch of def.id) seed = Math.imul(seed, 31) + ch.charCodeAt(0);
+  def.draw(ctx, LEAK_W, LEAK_H, seeded(seed));
   return c;
+}
+
+/** The leak at full size (for the GPU; the caller uploads it and lets it go). */
+export function leakCanvas(id: string): HTMLCanvasElement {
+  return paint(id, LEAK_W, LEAK_H, 1, 0);
+}
+
+/** A small square picture of the leak's middle, drawn at that size. */
+export function leakThumb(id: string, size: number): HTMLCanvasElement {
+  return paint(id, size, size, size / LEAK_H, (LEAK_W - LEAK_H) / 2);
 }

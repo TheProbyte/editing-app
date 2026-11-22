@@ -10,7 +10,7 @@ type Mode = 'move' | 'n' | 's' | 'e' | 'w' | 'nw' | 'ne' | 'sw' | 'se';
 /** Crop rectangle with corner/edge handles, drawn over the uncropped frame. */
 export class CropOverlay {
   private box: HTMLDivElement;
-  private drag: { mode: Mode; sx: number; sy: number; start: Rect; id: number } | null = null;
+  private drag: { mode: Mode; sx: number; sy: number; start: Rect; id: number; moved: boolean } | null = null;
 
   constructor(
     private layer: HTMLElement,
@@ -68,23 +68,30 @@ export class CropOverlay {
     else if (nearR && inY) mode = 'e';
     else if (px > x0 && px < x1 && py > y0 && py < y1) mode = 'move';
     if (!mode) return false;
-    this.drag = { mode, sx: px / L.width, sy: py / L.height, start: { ...r }, id: e.pointerId };
+    this.drag = { mode, sx: px / L.width, sy: py / L.height, start: { ...r }, id: e.pointerId, moved: false };
     this.box.classList.add('active');
     return true;
   }
 
   move(e: PointerEvent) {
-    if (!this.drag) return;
+    // only the finger that grabbed the box moves it (a second one would make it jump)
+    if (!this.drag || e.pointerId !== this.drag.id) return;
     const L = this.layer.getBoundingClientRect();
     const dx = (e.clientX - L.left) / L.width - this.drag.sx;
     const dy = (e.clientY - L.top) / L.height - this.drag.sy;
+    this.drag.moved = true;
     this.set(this.compute(this.drag.mode, this.drag.start, dx, dy), false);
     this.update();
   }
 
+  /** Drop the drag: the box goes back to where it was grabbed. */
   cancel() {
+    const d = this.drag;
     this.drag = null;
     this.box.classList.remove('active');
+    if (!d?.moved) return;
+    this.set(d.start, false);
+    this.update();
   }
 
   end() {

@@ -129,8 +129,8 @@ export const TOOLS: ToolDef[] = [
     ],
     actions: [
       { id: 'rot', label: 'Rotate', icon: ICONS.rotate },
-      { id: 'flipH', label: 'Flip', icon: ICONS.flipH },
-      { id: 'flipV', label: 'Flip', icon: ICONS.flipV },
+      { id: 'flipH', label: 'Flip H', icon: ICONS.flipH },
+      { id: 'flipV', label: 'Flip V', icon: ICONS.flipV },
     ],
   },
 ];

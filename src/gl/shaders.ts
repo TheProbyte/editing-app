@@ -241,7 +241,8 @@ void main() {
   vec3 acc = c0 * w0;
   float ws = w0, fg = 0.0;
   float n = float(uN);
-  float dr = uMaxR / sqrt(n);
+  // (never zero: smoothstep below needs its two edges apart)
+  float dr = max(uMaxR, 1e-3) / sqrt(n);
   // a different turn of the spiral per pixel trades banding for fine noise
   float jit = fract(52.9829189 * fract(dot(gl_FragCoord.xy, vec2(0.06711056, 0.00583715)))) * 6.2831853;
   for (int i = 0; i < 256; i++) {
@@ -691,7 +692,9 @@ void main() {
     // pixel at full size, so subject edges stay crisp), plus blurred foreground spreading over
     float fd = (texture(uBlur2, uBlurP.xy).r * 4.0 + texture(uBlur2, uBlurP.xy + vec2(0.006, 0.0)).r + texture(uBlur2, uBlurP.xy - vec2(0.006, 0.0)).r
       + texture(uBlur2, uBlurP.xy + vec2(0.0, 0.006)).r + texture(uBlur2, uBlurP.xy - vec2(0.0, 0.006)).r) / 8.0;
-    float coc = lensCoc(texture(uBlur2, gUv).r, fd, uBlurP.z) * uBlurP.w;
+    // the blur's size on a 1500px-short-edge picture (like the grain), so the edge of what's in
+    // focus sits at the same depth in the preview and in a full-resolution export
+    float coc = lensCoc(texture(uBlur2, gUv).r, fd, uBlurP.z) * uBlurP.w * (1500.0 / shortEdge);
     vec4 L = texture(uBlur1, gUv);
     c = mix(c, L.rgb, max(smoothstep(0.4, 1.6, coc), L.a));
   } else if (uBlurType > 0) {

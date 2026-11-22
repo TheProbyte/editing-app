@@ -19,10 +19,15 @@ export interface ExportOptions {
   progress: (f: number) => void;
 }
 
+/** The encoder workers couldn't start, or one died: the picture itself may be fine. */
+class EncoderError extends Error {}
+
 export async function renderExport(o: ExportOptions): Promise<Blob> {
   try {
     return await viaWorkers(o);
   } catch (e) {
+    // a render that failed (the GPU ran out of memory…) would only fail again on the canvas
+    if (!(e instanceof EncoderError)) throw e;
     // no workers here (or one failed to start): the browser's own encoder
     console.warn('parallel encode failed, using the canvas', e);
     if (o.format === 'png' || o.w * o.h <= CANVAS_LIMIT) return viaCanvas(o);
@@ -58,7 +63,13 @@ const BAND = 128;
 async function viaWorkers(o: ExportOptions): Promise<Blob> {
   const cores = navigator.hardwareConcurrency || 4;
   const n = Math.max(2, Math.min(8, cores - 1));
-  const pool = Array.from({ length: n }, () => new Worker(new URL('./encodeWorker.ts', import.meta.url), { type: 'module' }));
+  const pool: Worker[] = [];
+  try {
+    for (let k = 0; k < n; k++) pool.push(new Worker(new URL('./encodeWorker.ts', import.meta.url), { type: 'module' }));
+  } catch (e) {
+    for (const wk of pool) wk.terminate();
+    throw new EncoderError((e as Error).message || 'encoder workers unavailable');
+  }
   const load = new Array(n).fill(0);
   const waiting = new Map<number, { res: (d: { out: Uint8Array; adler?: number; len?: number }) => void; rej: (e: Error) => void; w: number }>();
   let failed: Error | null = null;
@@ -71,7 +82,7 @@ async function viaWorkers(o: ExportOptions): Promise<Blob> {
       job.res(e.data);
     };
     wk.onerror = (e) => {
-      failed = new Error(e.message || 'encoder worker failed');
+      failed = new EncoderError(e.message || 'encoder worker failed');
       for (const [id, job] of waiting) if (job.w === k) {
         waiting.delete(id);
         job.rej(failed);

@@ -20,6 +20,8 @@ export interface VideoExportOptions {
   quality: 'high' | 'max';
   /** extra bitrate for pictures that are hard to compress (moving film grain), 1 = none */
   boost?: number;
+  /** before a clip's frames are drawn (e.g. to read a still at full size) */
+  prepare?: (clip: VClip, media: Media) => Promise<void>;
   /** draw the finished frame for timeline time T onto the canvas (w×h) */
   drawFrame: (clip: VClip, media: Media, sample: VideoSample | null, T: number) => void;
   progress: (f: number, stage: string) => void;
@@ -71,6 +73,7 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
       const k0 = Math.ceil(start * o.fps - 1e-6), k1 = Math.min(frames, Math.ceil(end * o.fps - 1e-6));
       if (k1 <= k0) continue;
       const times = Array.from({ length: k1 - k0 }, (_, j) => (k0 + j) / o.fps);
+      await o.prepare?.(clip, m);
       if (m.kind === 'image' || !m.video) {
         for (const T of times) {
           if (o.cancelled()) throw new DOMException('cancelled', 'AbortError');
@@ -84,23 +87,28 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
       const srcTimes = times.map((T) => Math.min(clip.out - 1e-4, srcAt(clip, T - start)));
       let j = 0;
       let last: VideoSample | null = null;
-      for await (const s of sink.samplesAtTimestamps(srcTimes)) {
-        if (o.cancelled()) {
-          s?.close();
-          throw new DOMException('cancelled', 'AbortError');
+      try {
+        for await (const s of sink.samplesAtTimestamps(srcTimes)) {
+          if (o.cancelled()) {
+            s?.close();
+            throw new DOMException('cancelled', 'AbortError');
+          }
+          const T = times[j++];
+          // no frame (before the file's first one): the last one again, or at the very start
+          // of a clip its first frame, rather than whatever the previous clip left
+          if (!s && !last) last = await sink.getSample(await m.video.getFirstTimestamp()).catch(() => null);
+          const use = s ?? last;
+          o.drawFrame(clip, m, use, T);
+          if (s) {
+            if (last && last !== s) last.close();
+            last = s;
+          }
+          await video.add(T, 1 / o.fps);
+          o.progress(++n / frames, 'Exporting');
         }
-        const T = times[j++];
-        // no frame (before the first one): reuse the last
-        const use = s ?? last;
-        o.drawFrame(clip, m, use, T);
-        if (s) {
-          if (last && last !== s) last.close();
-          last = s;
-        }
-        await video.add(T, 1 / o.fps);
-        o.progress(++n / frames, 'Exporting');
+      } finally {
+        last?.close();
       }
-      last?.close();
     }
     video.close();
     o.progress(1, 'Finishing');

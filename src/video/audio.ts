@@ -96,12 +96,24 @@ export class AudioEngine {
     if (key === this.mixKey && this.mixP) return this.mixP;
     this.mixKey = key;
     const snap: VideoProject = JSON.parse(JSON.stringify(p));
-    const job = this.render(snap).then((b) => {
-      if (this.mixKey === key) this.mixBuf = b;
-      return b;
+    // one render at a time: a newer request waits for the one running, and one that has been
+    // overtaken by then just hands on the newest (so a long drag doesn't pile up renders)
+    const before = this.mixP;
+    const job: Promise<AudioBuffer | null> = (before ? before.catch(() => null) : Promise.resolve(null)).then(() => {
+      if (this.mixKey !== key) return this.mixP ?? null;
+      return this.render(snap).then((b) => {
+        if (this.mixKey === key) this.mixBuf = b;
+        return b;
+      });
     });
     this.mixP = job;
     return job;
+  }
+
+  /** Decoded sound of files the project no longer uses is let go (it's decoded again if they come back). */
+  keepOnly(ids: Set<string>) {
+    for (const id of [...this.full.keys()]) if (!ids.has(id)) this.full.delete(id);
+    for (const id of [...this.peakMap.keys()]) if (!ids.has(id)) this.peakMap.delete(id);
   }
 
   /** The mix if it's ready for this exact project, else null. */
@@ -114,6 +126,7 @@ export class AudioEngine {
     const hasSound = p.clips.some((c) => c.vol > 0 && this.lib.get(c.src)?.audio) || (p.music && p.music.vol > 0);
     if (total <= 0 || !hasSound) return null;
     const ctx = new OfflineAudioContext(2, Math.max(1, Math.ceil(total * MIX_RATE)), MIX_RATE);
+    const out = ctx.destination;
     for (let i = 0; i < p.clips.length; i++) {
       const c = p.clips[i];
       const m = this.lib.get(c.src);
@@ -127,7 +140,7 @@ export class AudioEngine {
       g.gain.linearRampToValueAtTime(c.vol, t0 + Math.min(EDGE, len / 4));
       g.gain.setValueAtTime(c.vol, Math.max(t0, t0 + len - Math.min(EDGE, len / 4)));
       g.gain.linearRampToValueAtTime(0, t0 + len);
-      g.connect(ctx.destination);
+      g.connect(out);
       const s = ctx.createBufferSource();
       s.buffer = buf;
       if (c.ramp) {
@@ -147,23 +160,76 @@ export class AudioEngine {
       if (buf) {
         const g = ctx.createGain();
         if (mu.fade) {
+          // fades at the start and at the end of the music (the video's end, or the song's
+          // if it's shorter)
+          const end = Math.max(0.05, Math.min(total, buf.duration - mu.in));
+          const fi = Math.min(1, end / 3), fo = Math.max(fi, end - 1.5);
           g.gain.setValueAtTime(0, 0);
-          g.gain.linearRampToValueAtTime(mu.vol, Math.min(1, total / 3));
-          g.gain.setValueAtTime(mu.vol, Math.max(0, total - 1.5));
-          g.gain.linearRampToValueAtTime(0, total);
+          g.gain.linearRampToValueAtTime(mu.vol, fi);
+          g.gain.setValueAtTime(mu.vol, fo);
+          g.gain.linearRampToValueAtTime(0, end);
         } else g.gain.value = mu.vol;
-        g.connect(ctx.destination);
+        g.connect(out);
         const s = ctx.createBufferSource();
         s.buffer = buf;
         s.connect(g);
         s.start(0, Math.min(mu.in, buf.duration), Math.max(0, Math.min(total, buf.duration - mu.in)));
       }
     }
-    return ctx.startRendering();
+    const mixed = await ctx.startRendering();
+    limit(mixed);
+    return mixed;
   }
 
   forget(id: string) {
     this.full.delete(id);
+  }
+}
+
+/**
+ * Keep the mix under full level. A mix that never gets there is left exactly as it is; where it
+ * would go over (a loud clip plus music, a clip at 200%) the level is turned down around those
+ * moments (starting a few ms ahead, recovering over a fraction of a second) instead of the peaks
+ * being cut off, which is what crackles.
+ */
+function limit(buf: AudioBuffer) {
+  const CEIL = 0.97, B = 16;
+  const n = buf.length, sr = buf.sampleRate;
+  const ch = Array.from({ length: buf.numberOfChannels }, (_, c) => buf.getChannelData(c));
+  // the loudest sample in each short block
+  const nb = Math.ceil(n / B);
+  const env = new Float32Array(nb);
+  let top = 0;
+  for (const d of ch) {
+    for (let b = 0, i = 0; b < nb; b++) {
+      let mx = env[b];
+      for (const e = Math.min(n, i + B); i < e; i++) {
+        const a = d[i] < 0 ? -d[i] : d[i];
+        if (a > mx) mx = a;
+      }
+      env[b] = mx;
+      if (mx > top) top = mx;
+    }
+  }
+  if (top <= CEIL) return;
+  // rise towards a peak over ~4 ms before it (backwards pass), fall away over ~150 ms after
+  const up = Math.exp(-B / (0.004 * sr)), down = Math.exp(-B / (0.15 * sr));
+  for (let b = nb - 2; b >= 0; b--) env[b] = Math.max(env[b], env[b + 1] * up);
+  for (let b = 1; b < nb; b++) env[b] = Math.max(env[b], env[b - 1] * down);
+  // each block's gain is the lowest of its neighbourhood, so easing between blocks never
+  // lets a sample through above the ceiling
+  const gain = new Float32Array(nb);
+  for (let b = 0; b < nb; b++) {
+    const e = Math.max(env[Math.max(0, b - 1)], env[b], env[Math.min(nb - 1, b + 1)]);
+    gain[b] = e > CEIL ? CEIL / e : 1;
+  }
+  for (const d of ch) {
+    for (let b = 0; b < nb; b++) {
+      const g0 = gain[b], g1 = gain[Math.min(nb - 1, b + 1)];
+      if (g0 === 1 && g1 === 1) continue;
+      const i0 = b * B, e = Math.min(n, i0 + B);
+      for (let i = i0; i < e; i++) d[i] *= g0 + ((g1 - g0) * (i - i0)) / B;
+    }
   }
 }
 

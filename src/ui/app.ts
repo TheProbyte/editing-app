@@ -11,16 +11,16 @@ import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
 import { encodeJpegBand } from '../io/jpegEncoder';
 import { encodePngBand } from '../io/pngEncoder';
-import { dropRecent, listRecents, loadBlob, loadSession, putRecent, recentFiles, saveBlob, saveFile, saveState, touchRecent, type Recent } from '../io/session';
+import { dropRecent, listRecents, loadBlob, loadSession, putRecent, recentFiles, saveBlob, saveFile, saveState, sweepStorage, touchRecent, type Recent } from '../io/session';
 import { TOOLS, ToolDef, Chip } from './tools';
 import { ICONS } from './icons';
 import { CurveEditor } from './curveEditor';
-import { CropOverlay, fitAspect } from './cropOverlay';
+import { CropOverlay, fitAspect, type Rect } from './cropOverlay';
 import { MaskOverlay } from './maskOverlay';
 import { BlurOverlay, VignetteOverlay } from './blurOverlay';
 import { HealOverlay } from './healOverlay';
 import { LayerOverlay } from './layerOverlay';
-import { LEAKS, LEAK_W, LEAK_H, leakCanvas } from '../leaks';
+import { LEAKS, LEAK_W, LEAK_H, leakCanvas, leakThumb } from '../leaks';
 import { Loupe } from './loupe';
 import { drawHistogram } from './histogram';
 import { tick } from './haptics';
@@ -114,6 +114,8 @@ export class App {
 
   private curve!: CurveEditor;
   private crop!: CropOverlay;
+  /** the crop when its box was grabbed (what's placed on the picture follows the new crop) */
+  private cropFrom: Rect | null = null;
   private maskOv!: MaskOverlay;
   private blurOv!: BlurOverlay;
   private vigOv!: VignetteOverlay;
@@ -138,6 +140,8 @@ export class App {
   /** the recent-projects entry this edit is saved as */
   private recentId: string | null = null;
   private recentTimer = 0;
+  /** that entry isn't on the shelf yet (the open project was deleted from it, then edited again) */
+  private recentFresh = false;
   /** the photo whose depth couldn't be worked out (not retried until Lens is picked again) */
   private depthFailed = '';
   private imgIds = new WeakMap<object, string>();
@@ -152,11 +156,15 @@ export class App {
   private ovAtlas!: BrushAtlas;
   private ovImg: { id: string; tex: WebGLTexture } | null = null;
   private ovLoading = '';
+  /** the second photo that couldn't be loaded (not tried again on every frame) */
+  private ovFailed = '';
   private dxMode: 'move' | 'hide' | 'show' = 'move';
   private dxStroke: Stroke | null = null;
   private ld: { kind: 'move' | 'size'; x: number; y: number; f0: { x: number; y: number }; scale: number; rot: number; d0: number; a0: number } | null = null;
   private layerOv!: LayerOverlay;
-  private lkTex = new Map<string, WebGLTexture>();
+  /** the light leak on the GPU: only the one in use (each is ~6 MB) */
+  private lkTex: { id: string; tex: WebGLTexture } | null = null;
+  private leakTiles: HTMLButtonElement[] | null = null;
   // content-aware fill results (by what they were made from), newest last
   private fillCache: { key: string; tex: WebGLTexture }[] = [];
   private fillJob = '';
@@ -193,8 +201,12 @@ export class App {
       if (commit) this.commitAndRefresh();
     });
     this.crop = new CropOverlay($('cropLayer'), () => this.state.geo.crop, (r, commit) => {
+      this.cropFrom ??= this.state.geo.crop;
       this.state.geo.crop = r;
-      if (commit) this.commitAndRefresh();
+      if (!commit) return;
+      this.recrop(this.cropFrom, r);
+      this.cropFrom = null;
+      this.commitAndRefresh();
     }, () => this.aspectNorm());
     this.maskOv = new MaskOverlay($('maskLayer'), () => ({ mask: this.selMask(), frame: this.frameInfo() }), (m, commit) => {
       this.state.masks[this.maskSel] = m;
@@ -246,11 +258,21 @@ export class App {
     this.bindGestures();
     this.bindBack();
     this.buildTools();
+    this.bindDockSwipe();
     this.setMode(null);
     this.commit();
     this.updateChrome();
     new ResizeObserver(() => this.layout()).observe(this.stage);
     new ResizeObserver(() => this.layout()).observe($('dock'));
+    // leaving the app (it may not come back): what was still waiting to be saved goes now
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) return;
+      // (a playing video stops in the background anyway; stopped first, its save isn't put off)
+      if (this.video?.player.playing) this.video.togglePlay();
+      this.flushSaves();
+    });
+    // once things have settled: files no project uses any more leave the device's storage
+    setTimeout(() => void sweepStorage(this.img ? this.history[this.hIdx] : undefined), 5000);
     // reveal the start page once fonts and the saved session are known, so nothing shifts
     const fonts = Promise.race([
       Promise.all(['700 34px Silkscreen', '700 14px Silkscreen', '500 16px "Pixelify Sans"'].map((f) => document.fonts.load(f).catch(() => []))),
@@ -269,20 +291,43 @@ export class App {
     this.canvas.addEventListener('webglcontextlost', (e) => {
       e.preventDefault();
       cancelAnimationFrame(this.raf);
+      // (left set, no frame would ever be asked for again)
+      this.raf = 0;
     });
     this.canvas.addEventListener('webglcontextrestored', async () => {
+      const clip = this.pipe.clip;
       this.g = new GL(this.canvas);
       this.pipe = new Pipeline(this.g);
+      this.pipe.clip = clip;
       this.atlas = new BrushAtlas(this.g.gl);
       this.atlas.getBase = (m) => this.maskBase(m);
       this.ovAtlas = new BrushAtlas(this.g.gl);
       this.ovAtlas.getBase = (m) => this.maskBase(m);
+      // everything that was on the GPU went with the old context
       this.ovImg = null;
-      this.lkTex.clear();
+      this.ovFailed = '';
+      this.lkTex = null;
       this.fillCache = [];
       this.img = null;
-      if (this.file) await this.open(this.file, true);
+      if (this.video) await this.reopenVideo();
+      else if (this.file) await this.open(this.file, true);
     });
+  }
+
+  /** The GPU was lost under a video: the editor is built again from its files and its edit, as when a recent project is opened. */
+  private async reopenVideo() {
+    if (!this.video) return;
+    this.setMode(null);
+    const hist = this.history, at = this.hIdx, state = hist[at];
+    const files = this.video.mediaFiles();
+    if (!state || !files.length) return;
+    await this.openVideo([], { files, state, id: this.recentId ?? Math.random().toString(36).slice(2, 10) });
+    // the steps taken so far are still good: undo keeps working
+    if (this.video && this.history.length === 1 && this.history[0] === state) {
+      this.history = hist;
+      this.hIdx = at;
+      this.updateChrome();
+    }
   }
 
   private fatal(msg: string) {
@@ -381,7 +426,10 @@ export class App {
         }
         if (!keepState) {
           this.recentId = recentId ?? Math.random().toString(36).slice(2, 10);
-          void putRecent({ id: this.recentId, kind: 'photo', name: file.name, ts: Date.now(), thumb: null, state: '' }, [{ id: 'photo', file }]);
+          this.recentFresh = false;
+          // a project from the shelf keeps its saved edit and picture until this session saves over them
+          if (recentId) void touchRecent(recentId, {});
+          else void putRecent({ id: this.recentId, kind: 'photo', name: file.name, ts: Date.now(), thumb: null, state: '' }, [{ id: 'photo', file }]);
         }
         this.history = [];
         this.hIdx = -1;
@@ -416,8 +464,42 @@ export class App {
     }
   }
 
+  /** Everything worked out for the photo that's leaving: GPU textures, AI rasters, zoom and export buffers. */
+  private clearPhotoCaches() {
+    const gl = this.g.gl;
+    for (const f of this.fillCache) gl.deleteTexture(f.tex);
+    this.fillCache = [];
+    this.pipe.fill = null;
+    if (this.ovImg) gl.deleteTexture(this.ovImg.tex);
+    this.ovImg = null;
+    this.ovFailed = '';
+    this.pipe.overlay = null;
+    this.pipe.setDepth(null, '', 0, 0);
+    this.depthFailed = '';
+    this.bases.clear();
+    this.lastBase.clear();
+    this.baseFailed.clear();
+    this.frameImg = null;
+    this.analysisCache = null;
+    this.statsCache = null;
+    this.thumbCache = [];
+    this.thumbsKey = '';
+    this.estSamples = null;
+    this.detail = null;
+    this.zv.img = null;
+    this.origKey = '';
+    this.setZoomView(false);
+    // (a canvas keeps its pixels until it's resized)
+    for (const id of ['detail', 'orig', 'zoomView']) {
+      const c = $<HTMLCanvasElement>(id);
+      c.classList.remove('on');
+      c.width = c.height = 1;
+    }
+  }
+
   private disposeImage() {
     if (!this.img) return;
+    this.clearPhotoCaches();
     if (this.video) {
       // the frame textures belong to the video editor
       this.g.destroy(this.img.thumbT);
@@ -513,6 +595,7 @@ export class App {
     const aiMode = this.selMask()?.type === 'subject' && (this.brushMode === 'aiAdd' || this.brushMode === 'aiSub');
     this.atlas.sync(st.masks);
     this.pipe.brushTex = this.atlas.tex;
+    this.pipe.brushVer = this.atlas.version;
     this.syncOverlay(st);
     this.pipe.showMask = this.kind() === 'masks' && (this.maskOverlayOn || this.maskInteracting || aiMode) ? this.maskSel : -1;
     try {
@@ -578,8 +661,8 @@ export class App {
       this.setZoomView(false);
     };
     if (!this.img || this.compare || this.kind() === 'crop' || this.zoom.s <= 1.01) return off();
-    // mid-stroke or mid-drag: the full-resolution render would stall the finger; wait until it's done
-    if (this.stroke || this.dxStroke || this.vd || this.aiStroke || this.healPaint) {
+    // mid-stroke or mid-drag (or mid-pan / pinch): the full-resolution render would stall the finger; wait until it's done
+    if (this.touching || this.stroke || this.dxStroke || this.vd || this.aiStroke || this.healPaint) {
       this.detailTimer = window.setTimeout(() => this.renderDetail(), 160);
       return;
     }
@@ -608,6 +691,7 @@ export class App {
       try {
         this.atlas.sync(this.state.masks);
         this.pipe.brushTex = this.atlas.tex;
+        this.pipe.brushVer = this.atlas.version;
         this.syncOverlay(this.viewState());
         const px = this.pipe.renderRegion(this.img.full, this.img.preview, this.viewState(), W, H, { x, y, w, h });
         this.detail = { px, x, y, w, h, W, H, ver: this.renderVer };
@@ -764,7 +848,21 @@ export class App {
     if (this.kind() === 'curves') this.curve.draw();
   }
 
+  /** fingers on the photo right now */
+  private touching = false;
+  private zoomRaf = 0;
+  /** Pinch / pan: every finger sends its own move, several a frame; the screen follows once per frame. */
+  private zoomSoon() {
+    if (this.zoomRaf) return;
+    this.zoomRaf = requestAnimationFrame(() => {
+      this.zoomRaf = 0;
+      this.applyZoom();
+    });
+  }
+
   private applyZoom(animate = false) {
+    cancelAnimationFrame(this.zoomRaf);
+    this.zoomRaf = 0;
     const z = this.zoom;
     const V = this.view;
     if (animate) {
@@ -814,20 +912,53 @@ export class App {
     const s = JSON.stringify(this.video ? canonical(this.state) : this.state);
     if (this.history[this.hIdx] === s) return;
     this.history = this.history.slice(0, this.hIdx + 1);
+    this.hLabels.length = Math.min(this.hLabels.length, this.history.length);
     this.history.push(s);
-    if (this.history.length > 200) this.history.shift();
+    // (the step names move along with the steps)
+    const drop = () => {
+      this.hLabels.shift();
+      return this.history.shift()!;
+    };
+    if (this.history.length > 200) drop();
     // brush-heavy edits make big states: keep the whole history under ~60 MB of text
     let size = 0;
     for (const h of this.history) size += h.length;
-    while (size > 60_000_000 && this.history.length > 3) size -= this.history.shift()!.length;
+    while (size > 60_000_000 && this.history.length > 3) size -= drop().length;
     this.hIdx = this.history.length - 1;
     this.updateChrome();
+    if (this.video) this.video.updateTitle();
+    // deleted from the shelf while open, and now edited again: it goes back there as a new project
+    if (!this.recentId && this.img && (this.video || this.file)) {
+      this.recentId = Math.random().toString(36).slice(2, 10);
+      this.recentFresh = true;
+    }
+    this.saveSoon();
+  }
+
+  /** After a change settles (an edit, an undo): the autosaved edit, and the recent-projects entry. */
+  private saveSoon() {
     if (this.img && !this.video) {
       clearTimeout(this.saveTimer);
-      this.saveTimer = window.setTimeout(() => saveState(this.history[this.hIdx]), 800);
+      this.saveTimer = window.setTimeout(() => {
+        this.saveTimer = 0;
+        saveState(this.history[this.hIdx]);
+      }, 800);
     }
-    if (this.video) this.video.updateTitle();
     this.saveRecentSoon();
+  }
+
+  /** What was still waiting to be saved is saved now (the app is being left). */
+  private flushSaves() {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = 0;
+      if (this.img && !this.video) saveState(this.history[this.hIdx]);
+    }
+    if (this.recentTimer) {
+      clearTimeout(this.recentTimer);
+      this.recentTimer = 0;
+      void this.saveRecent();
+    }
   }
 
   // ---- recent projects (the home screen shelf)
@@ -836,16 +967,26 @@ export class App {
   private saveRecentSoon() {
     if (!this.recentId || !this.img) return;
     clearTimeout(this.recentTimer);
-    this.recentTimer = window.setTimeout(() => void this.saveRecent(), 1500);
+    this.recentTimer = window.setTimeout(() => {
+      this.recentTimer = 0;
+      void this.saveRecent();
+    }, 1500);
   }
 
   private async saveRecent() {
     const id = this.recentId;
-    if (!id || !this.img || this.video?.exporting || this.video?.player.playing) return;
+    if (!id || !this.img) return;
+    // not while frames are being played or exported (the canvas is theirs): right after
+    if (this.video?.exporting || this.video?.player.playing) return this.saveRecentSoon();
     const state = this.history[this.hIdx];
     const thumb = await this.thumbBlob();
+    // (another project was opened meanwhile: this one's entry is left as it was)
+    if (id !== this.recentId) return;
     if (this.video) await putRecent({ id, kind: 'video', name: this.video.info, ts: Date.now(), thumb, state }, this.video.mediaFiles());
-    else await touchRecent(id, { state, thumb });
+    else if (this.recentFresh && this.file) {
+      this.recentFresh = false;
+      await putRecent({ id, kind: 'photo', name: this.file.name, ts: Date.now(), thumb, state }, [{ id: 'photo', file: this.file }]);
+    } else await touchRecent(id, { state, thumb });
   }
 
   /** A small picture of what's on screen. */
@@ -883,10 +1024,24 @@ export class App {
       const x = document.createElement('i');
       x.className = 'rdel';
       x.textContent = '×';
+      x.setAttribute('role', 'button');
+      x.setAttribute('aria-label', 'Delete this project');
       x.onclick = (e) => {
         e.stopPropagation();
         tick();
-        void dropRecent(r.id).then(() => this.showRecents());
+        const open = r.id === this.recentId && !!this.img;
+        this.confirm('Delete this project?', open
+          ? 'It leaves this list. It stays open for now, and comes back here if you edit it again.'
+          : 'Its edit and its copy of the files leave this device. Photos and videos you exported stay.', () => {
+          if (r.id === this.recentId) {
+            // the open project: no longer saved under the entry that's going
+            this.recentId = null;
+            this.recentFresh = false;
+            clearTimeout(this.recentTimer);
+            this.recentTimer = 0;
+          }
+          void dropRecent(r.id).then(() => this.showRecents());
+        });
       };
       b.appendChild(x);
       row.appendChild(b);
@@ -929,12 +1084,24 @@ export class App {
     b.classList.add('kick');
   }
 
+  /** what each step did, worked out once (naming one means reading two whole edits: slow with a lot of brush work) */
+  private hLabels: ({ a: string; b: string; t: string } | undefined)[] = [];
+  private stepLabel(i: number) {
+    if (i <= 0) return 'Opened';
+    const a = this.history[i - 1], b = this.history[i];
+    const c = this.hLabels[i];
+    if (c && c.a === a && c.b === b) return c.t;
+    const t = describeChange(a, b) || 'Edit';
+    this.hLabels[i] = { a, b, t };
+    return t;
+  }
+
   /** Every step of the edit, newest first. Tap one to jump there. */
   private openHistory() {
     const list = $('histList');
     list.innerHTML = '';
     for (let i = this.history.length - 1; i >= 0; i--) {
-      const label = i === 0 ? 'Opened' : describeChange(this.history[i - 1], this.history[i]) || 'Edit';
+      const label = this.stepLabel(i);
       const b = document.createElement('button');
       b.className = 'hrow' + (i === this.hIdx ? ' on' : i > this.hIdx ? ' future' : '');
       b.innerHTML = `<span class="n">${i}</span><span class="t">${escapeHtml(label)}</span>${i === this.hIdx ? '<span class="m">NOW</span>' : ''}`;
@@ -975,6 +1142,8 @@ export class App {
     this.requestRender();
     this.refreshSection();
     this.updateChrome();
+    // where undo / redo / history left the edit is what gets saved, like any other change
+    this.saveSoon();
   }
 
   // -----------------------------------------------------------------------------------
@@ -1109,6 +1278,9 @@ export class App {
       tick();
       this.openHistory();
     };
+    $('historySheet').onclick = (e) => {
+      if (e.target === e.currentTarget) $('historySheet').classList.remove('on');
+    };
     $('btnMore').innerHTML = ICONS.more;
     $('secReset').innerHTML = ICONS.reset;
     $('secDone').innerHTML = ICONS.check;
@@ -1187,6 +1359,8 @@ export class App {
     this.setMode(null);
     if (this.video) this.closeVideo();
     else this.disposeImage();
+    // (a photo's depth map means nothing to a video's frames)
+    this.pipe.setDepth(null, '', 0, 0);
     this.file = null;
     this.state = defaultState();
     this.state.video = newProject();
@@ -1195,6 +1369,7 @@ export class App {
     this.video = new Mode(this.videoHost());
     this.buildTools();
     this.recentId = restore?.id ?? Math.random().toString(36).slice(2, 10);
+    this.recentFresh = false;
     if (restore) {
       await this.video.restoreMedia(restore.files);
       if (tok !== this.openTok || !this.video) return;
@@ -1242,16 +1417,23 @@ export class App {
     $('acts').innerHTML = '';
     if (this.img) this.g.destroy(this.img.thumbT);
     this.img = null;
+    this.clearPhotoCaches();
     this.pipe.invalidate();
-    this.appEl.classList.remove('video');
+    this.appEl.classList.remove('video', 'live');
     this.pipe.filmFrame = { seed: 1337, dust: 7331, flicker: 0 };
     this.buildTools();
   }
 
-  private videoHost(): VideoHost {
+  private videoHost(): VideoHost & { setLive(on: boolean): void } {
+    const app = this;
     return {
-      g: this.g,
-      pipe: this.pipe,
+      // (read each time: a lost and restored GPU context means a new GL and pipeline)
+      get g() {
+        return app.g;
+      },
+      get pipe() {
+        return app.pipe;
+      },
       canvas: this.canvas,
       state: () => this.state,
       commit: () => this.commit(),
@@ -1297,6 +1479,7 @@ export class App {
         if (this.isNeutral(st)) return this.video!.blitTex(src.tex, w, h);
         this.syncOverlay(st);
         this.pipe.brushTex = this.atlas.tex;
+        this.pipe.brushVer = this.atlas.version;
         this.pipe.invalidate();
         this.pipe.render(src, st, w, h, null);
       },
@@ -1317,6 +1500,8 @@ export class App {
         else if (how === 'shared') this.toast('Shared');
         else this.toast(`Saved · Downloads/${name}`, 3000);
       },
+      // the video is playing or exporting (the canvas changes every frame): the glass over it goes plain
+      setLive: (on) => this.appEl.classList.toggle('live', on),
     };
   }
 
@@ -1377,10 +1562,10 @@ export class App {
       this.setMode(null);
       el.classList.remove('hidden');
       el.classList.add('over', 'ready');
+      if (this.video?.player.playing) this.video.togglePlay();
       void this.saveRecent().then(() => this.showRecents());
       resume.hidden = false;
       resume.textContent = this.video ? 'Back to video' : 'Back to photo';
-      if (this.video?.player.playing) this.video.togglePlay();
       resume.onclick = () => this.showHome(false);
     } else {
       el.classList.remove('over');
@@ -1425,12 +1610,13 @@ export class App {
   /** What the original looks like at the current on-screen size (geometry only). */
   private origState(): EditState {
     const s = this.state;
-    return { v: { ...defaultValues(), straighten: s.v.straighten }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null, leak: null, fills: [] };
+    // (straighten and lens distortion move the picture: the original keeps them, so it lines up with the edit)
+    return { v: { ...defaultValues(), straighten: s.v.straighten, distortion: s.v.distortion }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null, leak: null, fills: [] };
   }
   private prepareOrig() {
     if (!this.img) return false;
     const w = this.canvas.width, h = this.canvas.height;
-    const key = JSON.stringify([this.img.name, this.img.preview.w, this.state.geo, this.state.v.straighten, w, h]);
+    const key = JSON.stringify([this.img.name, this.img.preview.w, this.state.geo, this.state.v.straighten, this.state.v.distortion, w, h]);
     if (key === this.origKey) return true;
     try {
       const px = this.pipe.renderPixels(this.img.preview, this.origState(), w, h);
@@ -1484,7 +1670,6 @@ export class App {
       nav.appendChild(b);
     }
     this.buildAll();
-    this.bindDockSwipe();
   }
 
   // ---- all tools: a grid you swipe up from the tool bar
@@ -1890,9 +2075,14 @@ export class App {
   private bindSlider() {
     const sl = $('slider');
     let lastX = 0, downT = 0, downX = 0, lastTap = 0, moved = false;
+    // the finger that's dragging: another one landing on the slider is ignored (it used to take
+    // over the start point, and the value jumped by the gap between the two)
+    let active = -1;
     sl.addEventListener('pointerdown', (e) => {
       const id = this.currentParam();
       if (!id) return;
+      if (active !== -1 && this.vd && sl.hasPointerCapture(active)) return;
+      active = e.pointerId;
       sl.setPointerCapture(e.pointerId);
       lastX = downX = e.clientX;
       downT = e.timeStamp;
@@ -1901,7 +2091,7 @@ export class App {
       this.beginValue(id);
     });
     sl.addEventListener('pointermove', (e) => {
-      if (!this.vd || !sl.hasPointerCapture(e.pointerId)) return;
+      if (!this.vd || e.pointerId !== active || !sl.hasPointerCapture(e.pointerId)) return;
       if (Math.abs(e.clientX - downX) > 3) moved = true;
       const d = this.def(this.vd.id);
       const track = sl.querySelector('.track') as HTMLElement;
@@ -1909,7 +2099,8 @@ export class App {
       lastX = e.clientX;
     });
     const up = (e: PointerEvent) => {
-      if (!this.vd) return;
+      if (!this.vd || e.pointerId !== active) return;
+      active = -1;
       sl.classList.remove('active');
       const id = this.vd.id;
       if (!moved && e.timeStamp - downT < 250) {
@@ -1995,12 +2186,17 @@ export class App {
   private bindValueInput() {
     const btn = $<HTMLButtonElement>('paramValue');
     const input = $<HTMLInputElement>('paramInput');
+    // what the box was filled with: left as it is, nothing changes (the value itself has more
+    // decimals than are shown, so writing the shown number back would nudge it and add a step)
+    let shown = '';
     btn.onclick = () => {
       const id = this.currentParam();
       if (!id) return;
       const d = this.def(id);
       const v = this.get(id);
-      input.value = String(Math.abs(d.max - d.min) <= 10 ? Math.round(v * 100) / 100 : Math.round(v));
+      // as many decimals as the readout shows (at least two for the small ranges)
+      const dec = Math.max(/\d[.,](\d+)/.exec(this.fmt(id))?.[1].length ?? 0, Math.abs(d.max - d.min) <= 10 ? 2 : 0);
+      input.value = shown = String(+v.toFixed(Math.min(4, dec)));
       btn.hidden = true;
       input.hidden = false;
       input.focus();
@@ -2012,7 +2208,7 @@ export class App {
       const n = parseFloat(input.value.replace(',', '.').replace('°', ''));
       input.hidden = true;
       btn.hidden = false;
-      if (apply && id && Number.isFinite(n)) {
+      if (apply && id && input.value !== shown && Number.isFinite(n)) {
         this.set(id, n);
         this.commit();
         this.refreshSection();
@@ -2043,6 +2239,9 @@ export class App {
     let holdTimer = 0, tapTimer = 0;
     let armed = false;
     let lastTap = { t: 0, x: 0, y: 0 };
+    // the finger a one-finger gesture belongs to: any other finger on the glass meanwhile is
+    // ignored (the gestures keep one start point, so a second finger made things jump)
+    let primary = -1;
 
     const stageXY = (cx: number, cy: number) => {
       const r = st.getBoundingClientRect();
@@ -2058,6 +2257,7 @@ export class App {
       }
       st.setPointerCapture(e.pointerId);
       pts.set(e.pointerId, { x: e.clientX, y: e.clientY });
+      this.touching = true;
       if (pts.size === 2 && this.kind() !== 'crop') {
         clearTimeout(holdTimer);
         clearTimeout(tapTimer);
@@ -2067,8 +2267,16 @@ export class App {
           this.aiStroke = null;
           this.hideBrushRing();
         }
-        if (mode === 'dx') this.layerUp();
-        if (mode === 'mask') this.maskOv.cancel();
+        // (a dab that was really the first finger of a pinch isn't kept; a move so far is)
+        if (mode === 'dx') {
+          if (this.dxStroke) this.layerCancel();
+          else this.layerUp();
+        }
+        if (mode === 'mask') {
+          this.maskOv.cancel();
+          this.maskInteracting = false;
+          this.loupe.hide();
+        }
         if (mode === 'pick') this.endPick(false);
         if (mode === 'heal') this.healCancel();
         this.hideBrushRing();
@@ -2107,6 +2315,7 @@ export class App {
         return;
       }
       if (pts.size > 1) return;
+      primary = e.pointerId;
       sx = e.clientX;
       sy = e.clientY;
       const k = this.kind();
@@ -2207,7 +2416,7 @@ export class App {
         const px = (pinch0.mx - V.cx - pinch0.x) / E0;
         const py = (pinch0.my - V.cy - pinch0.y) / E0;
         this.zoom = s === 1 ? { s: 1, x: 0, y: 0 } : { s, x: m.x - V.cx - px * E1, y: m.y - V.cy - py * E1 };
-        this.applyZoom();
+        this.zoomSoon();
         return;
       }
       if (mode === 'shape' && pts.size >= 2 && this.shape0) {
@@ -2228,6 +2437,11 @@ export class App {
         if (id) this.showHud(id);
         return;
       }
+      if (mode === 'lshape') {
+        if (pts.size >= 2 && this.lshape0) this.layerPinch(pts);
+        return;
+      }
+      if (e.pointerId !== primary) return;
       if (mode === 'vig') return this.vigOv.moveTo(e);
       if (mode === 'crop') return this.crop.move(e);
       if (mode === 'blur') return this.blurOv.moveTo(e);
@@ -2245,13 +2459,12 @@ export class App {
       if (mode === 'paint') return this.continueStroke(e);
       if (mode === 'ai') return this.continueAiStroke(e);
       if (mode === 'dx') return this.layerMove(e);
-      if (mode === 'lshape' && pts.size >= 2 && this.lshape0) return this.layerPinch(pts);
       if (mode === 'pick') return this.pickAt(e);
       if (mode === 'heal') return this.healMove(e);
       if (mode === 'vtext') return this.video?.stageMove(e, this.frame.getBoundingClientRect());
       if (mode === 'pan') {
         this.zoom = { ...this.zoom, x: pan0.x + e.clientX - sx, y: pan0.y + e.clientY - sy };
-        this.applyZoom();
+        this.zoomSoon();
         return;
       }
       const dx = e.clientX - sx;
@@ -2324,6 +2537,14 @@ export class App {
     const up = (e: PointerEvent) => {
       if (!pts.has(e.pointerId)) return;
       pts.delete(e.pointerId);
+      this.touching = pts.size > 0;
+      const two = mode === 'pinch' || mode === 'vpinch' || mode === 'lshape' || mode === 'shape';
+      // an extra finger lifting: the gesture carries on with the finger that started it
+      if (!two && e.pointerId !== primary) return;
+      if (!two) primary = -1;
+      // the touch was taken away (the system's back swipe from the screen edge, a palm): what
+      // was being drawn or dragged is dropped, not kept as if the finger had been lifted
+      const cancelled = e.type !== 'pointerup';
       clearTimeout(holdTimer);
       $('pill').classList.remove('armed');
       if (armed && mode === 'pending') mode = 'none'; // a hold that never moved isn't a tap
@@ -2363,28 +2584,40 @@ export class App {
         return;
       }
       if (mode === 'crop') {
-        this.crop.end();
+        if (cancelled) {
+          this.crop.cancel();
+          this.cropFrom = null;
+        } else this.crop.end();
         this.updateSecBar();
       } else if (mode === 'blur') {
         this.blurOv.end();
         this.updateSecBar();
       } else if (mode === 'mask') {
-        this.maskOv.end();
+        if (cancelled) this.maskOv.cancel();
+        else this.maskOv.end();
         this.maskInteracting = false;
         this.loupe.hide();
         this.requestRender();
       } else if (mode === 'paint') {
-        this.endStroke();
+        if (cancelled) {
+          this.cancelStroke();
+          this.hideBrushRing();
+        } else this.endStroke();
       } else if (mode === 'ai') {
-        this.endAiStroke();
+        if (cancelled) {
+          this.aiStroke = null;
+          this.hideBrushRing();
+        } else this.endAiStroke();
       } else if (mode === 'dx') {
-        this.layerUp();
+        if (cancelled) this.layerCancel();
+        else this.layerUp();
       } else if (mode === 'pick') {
-        this.endPick(true);
+        this.endPick(!cancelled);
       } else if (mode === 'vtext') {
         this.video?.stageUp();
       } else if (mode === 'heal') {
-        this.healUp();
+        if (cancelled) this.healCancel();
+        else this.healUp();
       } else if (mode === 'compare') {
         this.setCompare(false);
       } else if (mode === 'value' || mode === 'menu') {
@@ -2427,7 +2660,8 @@ export class App {
           this.blurOv.draw();
           this.requestRender();
           tick();
-          lastTap = { t: now, x: e.clientX, y: e.clientY };
+          // (not the first half of a double tap: a second focus tap nearby must not reset the slider)
+          lastTap = { t: 0, x: 0, y: 0 };
         } else {
           lastTap = { t: now, x: e.clientX, y: e.clientY };
           clearTimeout(tapTimer);
@@ -2439,6 +2673,9 @@ export class App {
     };
     st.addEventListener('pointerup', up);
     st.addEventListener('pointercancel', up);
+    // (normally comes after one of the two above and finds nothing left to do: a finger that
+    // went away without either must not be counted as still down)
+    st.addEventListener('lostpointercapture', up);
     st.addEventListener('contextmenu', (e) => e.preventDefault());
     st.addEventListener('wheel', (e) => {
       if (!this.img || this.kind() === 'crop') return;
@@ -2952,7 +3189,9 @@ export class App {
   }
   private cancelStroke() {
     const m = this.selMask();
-    if (m && this.stroke) m.strokes.splice(m.strokes.indexOf(this.stroke), 1);
+    // (only if it's still there: an undo in the middle of a stroke puts another edit in its place)
+    const i = m && this.stroke ? m.strokes.indexOf(this.stroke) : -1;
+    if (i >= 0) m!.strokes.splice(i, 1);
     this.stroke = null;
     this.maskInteracting = false;
     this.requestRender();
@@ -3165,6 +3404,8 @@ export class App {
     this.hd = null;
     this.healPaint = null;
     this.loupe.hide();
+    this.loupe.ring = 0;
+    this.loupe.zoom = 3.2;
     this.hideBrushRing();
     this.healOv.draw();
     this.requestRender();
@@ -3521,6 +3762,19 @@ export class App {
     this.requestRender();
   }
 
+  /** Drop the drag or the dab in progress: the layer and its brush go back to how they were. */
+  private layerCancel() {
+    const k = this.layerKey(), L = this.layerOf(k), v = this.state.v, D = this.ld;
+    const i = L && this.dxStroke ? L.strokes.indexOf(this.dxStroke) : -1;
+    if (i >= 0) L!.strokes.splice(i, 1);
+    if (k && D) Object.assign(v, { [k + 'X']: D.x, [k + 'Y']: D.y, [k + 'Scale']: D.scale, [k + 'Rot']: D.rot });
+    this.ld = null;
+    this.dxStroke = null;
+    this.hideBrushRing();
+    this.layerOv.draw();
+    this.requestRender();
+  }
+
   private layerUp() {
     const changed = !!this.ld || !!this.dxStroke;
     this.ld = null;
@@ -3662,6 +3916,7 @@ export class App {
     gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, bmp);
     bmp.close();
     this.ovImg = { id, tex };
+    this.ovFailed = '';
     this.pipe.invalidate();
   }
 
@@ -3674,6 +3929,8 @@ export class App {
       if (this.state.overlay?.id === id) this.uploadOverlay(id, bmp);
       else bmp.close();
     } catch {
+      // (said once: without this, every frame would try again)
+      this.ovFailed = id;
       this.toast('The double-exposure photo isn’t on this device any more', 3000);
     } finally {
       this.ovLoading = '';
@@ -3700,51 +3957,54 @@ export class App {
   }
 
   private leakTexture(id: string) {
-    let tex = this.lkTex.get(id);
-    if (!tex) {
+    if (this.lkTex?.id !== id) {
       const gl = this.g.gl;
+      // one at a time: the last leak's texture goes, and so does the canvas this one is drawn on
+      if (this.lkTex) gl.deleteTexture(this.lkTex.tex);
       const c = leakCanvas(id);
-      tex = this.g.texture(c.width, c.height, 'u8');
+      const tex = this.g.texture(c.width, c.height, 'u8');
       gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, c);
-      this.lkTex.set(id, tex);
+      c.width = c.height = 1;
+      this.lkTex = { id, tex };
     }
-    return tex;
+    return this.lkTex.tex;
   }
 
   private buildLeaks() {
     const row = $('subs');
     const cur = this.state.leak?.id;
-    const off = document.createElement('button');
-    off.className = 'look save';
-    off.innerHTML = `<span class="th">${ICONS.off}</span><small>None</small>`;
-    off.onclick = () => {
-      tick();
-      this.state.leak = null;
-      this.commit();
-      this.refreshSection();
-      this.requestRender();
-    };
-    row.appendChild(off);
-    for (const L of LEAKS) {
-      const b = document.createElement('button');
-      b.className = 'look' + (L.id === cur ? ' on' : '');
-      const c = document.createElement('canvas');
-      c.className = 'th';
-      c.width = 132;
-      c.height = 132;
-      const x = c.getContext('2d')!;
-      x.fillStyle = '#000';
-      x.fillRect(0, 0, 132, 132);
-      const src = leakCanvas(L.id);
-      x.drawImage(src, (src.width - src.height) / 2, 0, src.height, src.height, 0, 0, 132, 132);
-      b.appendChild(c);
-      const label = document.createElement('small');
-      label.textContent = L.name;
-      b.appendChild(label);
-      b.onclick = () => {
+    // the tiles are made once (each small picture is drawn at its own size) and put back on
+    // every refresh: only which one is chosen changes
+    if (!this.leakTiles) {
+      const off = document.createElement('button');
+      off.className = 'look save';
+      off.innerHTML = `<span class="th">${ICONS.off}</span><small>None</small>`;
+      off.onclick = () => {
         tick();
-        this.setLeak(L.id);
+        this.state.leak = null;
+        this.commit();
+        this.refreshSection();
+        this.requestRender();
       };
+      this.leakTiles = [off];
+      for (const L of LEAKS) {
+        const b = document.createElement('button');
+        b.dataset.id = L.id;
+        const c = leakThumb(L.id, 132);
+        c.className = 'th';
+        b.appendChild(c);
+        const label = document.createElement('small');
+        label.textContent = L.name;
+        b.appendChild(label);
+        b.onclick = () => {
+          tick();
+          this.setLeak(L.id);
+        };
+        this.leakTiles.push(b);
+      }
+    }
+    for (const b of this.leakTiles) {
+      if (b.dataset.id) b.className = 'look' + (b.dataset.id === cur ? ' on' : '');
       row.appendChild(b);
     }
   }
@@ -3752,7 +4012,7 @@ export class App {
   /** Bring the GPU side (layers, their brush, the content-aware fill) in line with a state before rendering. */
   private syncOverlay(st: EditState) {
     const ov = st.overlay, lk = st.leak;
-    if (ov && this.ovImg?.id !== ov.id && this.ovLoading !== ov.id) void this.loadOverlay(ov.id);
+    if (ov && this.ovImg?.id !== ov.id && this.ovLoading !== ov.id && this.ovFailed !== ov.id) void this.loadOverlay(ov.id);
     this.pipe.overlay = ov && this.ovImg?.id === ov.id ? this.ovImg : null;
     this.pipe.leak = lk ? { id: lk.id, tex: this.leakTexture(lk.id) } : null;
     // a layer's mask: the person in the photo (AI, optional) plus its brush strokes
@@ -3762,6 +4022,7 @@ export class App {
       : ({ id: 0, type: 'radial', strokes: [] } as unknown as Mask);
     this.ovAtlas.sync([slot(ov, -1), slot(lk, -2)]);
     this.pipe.overlayMask = this.ovAtlas.tex[0];
+    this.pipe.overlayMaskVer = this.ovAtlas.version;
     this.syncFill(st);
   }
 
@@ -3909,8 +4170,16 @@ export class App {
       this.camera.close();
       return true;
     }
+    // something is being worked on (opening, exporting, an AI model): back stops it if it can be
+    // stopped, and otherwise does nothing: it must not close things underneath, or leave the app
+    if ($('busy').classList.contains('on')) {
+      const stop = $('busyCancel');
+      if (!stop.hidden) stop.click();
+      return true;
+    }
     const sheet = document.querySelector('.sheet.on');
     if (sheet) {
+      if (sheet.id === 'resultSheet') this.closeResult();
       sheet.classList.remove('on');
       return true;
     }
@@ -3939,7 +4208,7 @@ export class App {
   }
 
   private canGoBack() {
-    return this.camera.isOpen() || !!document.querySelector('.sheet.on') || this.allOpen || !!this.tool ||
+    return this.camera.isOpen() || $('busy').classList.contains('on') || !!document.querySelector('.sheet.on') || this.allOpen || !!this.tool ||
       (this.homeOver ? this.homeFromButton : !!this.img);
   }
 
@@ -3971,14 +4240,14 @@ export class App {
       const changed = JSON.stringify(N) !== JSON.stringify(canonical(this.state));
       this.state = N;
       this.video.onRestore();
-      if (changed) this.toast('Changes discarded', 1200);
+      if (changed) this.toast('Changes discarded · Undo brings them back', 2200);
     } else if (this.sectionStart) {
       const before = JSON.parse(this.sectionStart) as EditState;
       const changed = JSON.stringify(before) !== JSON.stringify(this.state);
       this.state = before;
       this.maskSel = Math.min(this.maskSel, this.state.masks.length - 1);
       this.syncAtlasSize();
-      if (changed) this.toast('Changes discarded', 1200);
+      if (changed) this.toast('Changes discarded · Undo brings them back', 2200);
     }
     this.look.base = null;
     this.look.idx = -1;
@@ -4030,19 +4299,20 @@ export class App {
         this.curve.draw();
         break;
       }
-      case 'rot':
-        this.transformMasks('rot');
-        g.quarter = (g.quarter + 1) % 4;
-        g.crop = fitAspect(this.aspectNorm());
+      case 'rot': {
+        this.turnGeo('rot');
+        // a locked shape the turned crop no longer has: the largest crop of that shape instead
+        const a = this.aspectNorm(), c = g.crop;
+        if (a && Math.abs(c.w / c.h - a) > 1e-3) {
+          g.crop = fitAspect(a);
+          this.recrop(c, g.crop);
+        }
         this.syncAtlasSize();
         break;
+      }
       case 'flipH':
-        this.transformMasks('flipH');
-        g.flipH = !g.flipH;
-        break;
       case 'flipV':
-        this.transformMasks('flipV');
-        g.flipV = !g.flipV;
+        this.turnGeo(kind);
         break;
     }
     this.commit();
@@ -4060,9 +4330,12 @@ export class App {
         if (this.look.base) {
           const geo = this.state.geo;
           const masks = this.state.masks;
+          const video = this.state.video;
           this.state = cloneState(this.look.base);
           this.state.geo = geo;
           this.state.masks = masks;
+          // a video: the timeline as it is now (only the look goes back)
+          if (video) this.state.video = video;
         }
         this.look.idx = 0;
         break;
@@ -4087,9 +4360,12 @@ export class App {
         this.state.curves = defaultState().curves;
         break;
       case 'crop':
-        if (g.flipH) this.transformMasks('flipH');
-        if (g.flipV) this.transformMasks('flipV');
-        for (let q = g.quarter; q % 4 !== 0; q++) this.transformMasks('rot');
+        // undo each flip and turn as it was done (masks, patches and what's placed on the picture
+        // follow every step), then open the crop up again
+        if (g.flipH) this.turnGeo('flipH');
+        if (g.flipV) this.turnGeo('flipV');
+        while (g.quarter % 4) this.turnGeo('rot');
+        this.recrop(g.crop, { x: 0, y: 0, w: 1, h: 1 });
         this.state.geo = defaultState().geo;
         v.straighten = 0;
         this.aspectId = 'free';
@@ -4110,6 +4386,47 @@ export class App {
     this.toast(`${t.label} reset`, 1200);
   }
 
+  /**
+   * One quarter turn clockwise, or a mirror flip, of the whole picture: the frame, the crop, and
+   * everything placed on it (masks, patches, fills; the blur focus and vignette centre).
+   *
+   * The geometry shader goes from a frame point to the photo by straightening, then flipping,
+   * then turning (srcAt in shaders.ts). So a turn on top of a flip has to swap the two flips, or
+   * the picture would turn the other way from what's on it; and a flip has to reverse the
+   * straighten angle, or the mirrored picture would be tilted twice over.
+   */
+  private turnGeo(kind: 'rot' | 'flipH' | 'flipV') {
+    const g = this.state.geo, v = this.state.v, c = g.crop;
+    this.transformMasks(kind);
+    if (kind === 'rot') {
+      g.quarter = (g.quarter + 1) % 4;
+      [g.flipH, g.flipV] = [g.flipV, g.flipH];
+      g.crop = { x: 1 - c.y - c.h, y: c.x, w: c.h, h: c.w };
+    } else {
+      if (kind === 'flipH') g.flipH = !g.flipH;
+      else g.flipV = !g.flipV;
+      g.crop = kind === 'flipH' ? { ...c, x: 1 - c.x - c.w } : { ...c, y: 1 - c.y - c.h };
+      v.straighten = -v.straighten;
+    }
+    // the crop went with the picture, so what's placed on the cropped picture moves the same way within it
+    this.movePlaced((x, y) => (kind === 'rot' ? [1 - y, x] : kind === 'flipH' ? [1 - x, y] : [x, 1 - y]));
+    if (Math.round(v.blurType) === 1) v.blurAngle = wrap90(kind === 'rot' ? v.blurAngle + 90 : -v.blurAngle);
+  }
+
+  /** The blur focus and the vignette centre are positions on the cropped picture (0..1): move the ones in use. */
+  private movePlaced(f: (x: number, y: number) => [number, number]) {
+    const v = this.state.v;
+    const cl = (x: number) => Math.min(1, Math.max(0, x));
+    if (Math.round(v.blurType) > 0) [v.blurX, v.blurY] = f(v.blurX, v.blurY).map(cl);
+    if (v.vignette !== 0) [v.vigX, v.vigY] = f(v.vigX, v.vigY).map(cl);
+  }
+
+  /** The crop changed: the blur focus and vignette centre stay on the same part of the photo (or at the nearest edge). */
+  private recrop(from: Rect, to: Rect) {
+    if (from.x === to.x && from.y === to.y && from.w === to.w && from.h === to.h) return;
+    this.movePlaced((x, y) => [(from.x + x * from.w - to.x) / to.w, (from.y + y * from.h - to.y) / to.h]);
+  }
+
   private aspectNorm(): number | null {
     const a = ASPECTS[this.aspectId];
     if (!a || !this.img) return null;
@@ -4121,7 +4438,11 @@ export class App {
   private setAspect(id: string) {
     this.aspectId = id;
     const a = this.aspectNorm();
-    if (a) this.state.geo.crop = fitAspect(a);
+    if (a) {
+      const from = this.state.geo.crop;
+      this.state.geo.crop = fitAspect(a);
+      this.recrop(from, this.state.geo.crop);
+    }
     this.commit();
     this.crop.update();
     this.requestRender();
@@ -4168,7 +4489,9 @@ export class App {
 
   private lookState(base: EditState, L0: Look, t: number): EditState {
     const L = this.resolveLook(base, L0);
-    const s = cloneState(base);
+    // only the settings and curves change: copying everything else too (every brush stroke, a
+    // video's whole timeline) on each move of the strength slider is what made it drag
+    const s: EditState = { ...base, v: { ...base.v }, curves: { ...base.curves } };
     for (const [k, val] of Object.entries(L.v)) {
       if (!(k in s.v)) continue;
       s.v[k] = base.v[k] + (val - base.v[k]) * t;
@@ -4183,16 +4506,11 @@ export class App {
   private applyLookValues() {
     const L = this.allLooks()[this.look.idx];
     if (!L || !this.look.base) return;
-    const geo = this.state.geo;
-    const straighten = this.state.v.straighten;
-    const masks = this.state.masks;
-    const video = this.state.video;
-    this.state = this.lookState(this.look.base, L, this.look.amt / 100);
-    this.state.geo = geo;
-    this.state.masks = masks;
-    // a video: the timeline as it is now (the look only changes the settings)
-    if (video) this.state.video = video;
-    this.state.v.straighten = straighten;
+    const cur = this.state;
+    // the look only changes the settings: everything else stays what it is now (a video's
+    // timeline too), and nothing is shared with the saved starting point
+    this.state = { ...cur, ...this.lookState({ ...cur, v: this.look.base.v, curves: this.look.base.curves }, L, this.look.amt / 100) };
+    this.state.v.straighten = cur.v.straighten;
   }
 
   private buildLooks() {
@@ -4493,10 +4811,18 @@ export class App {
           this.openPresetSheet();
         } else if (a === 'resetAll') {
           this.confirm('Reset all edits?', 'You can still undo this.', () => {
+            // a video keeps its timeline (clips, texts, music): only the looks go, the whole
+            // video's and each clip's own
+            const video = this.video ? canonical(this.state).video : undefined;
             this.state = defaultState();
+            if (video) {
+              for (const c of video.clips) delete c.look;
+              this.state.video = video;
+            }
             this.maskSel = -1;
             this.aspectId = 'free';
             this.look = { base: null, idx: -1, amt: 100 };
+            this.video?.onRestore();
             this.syncAtlasSize();
             this.commit();
             this.requestRender();
@@ -4575,7 +4901,7 @@ export class App {
       this.scheduleEstimate();
     };
     $('exGo').onclick = () => this.doExport();
-    $('resultDone').onclick = () => $('resultSheet').classList.remove('on');
+    $('resultDone').onclick = () => this.closeResult();
   }
 
   private exportDims(size: string) {
@@ -4635,6 +4961,7 @@ export class App {
       if (this.estSamples?.key !== key) {
         this.atlas.sync(this.state.masks);
         this.pipe.brushTex = this.atlas.tex;
+        this.pipe.brushVer = this.atlas.version;
         await this.ensureFill(this.state);
         this.syncOverlay(this.state);
         const N = 8, R = Math.min(32, Math.max(1, Math.floor(d.h / N) - 1)), TW = 2048;
@@ -4692,6 +5019,7 @@ export class App {
       }
       this.atlas.sync(this.state.masks);
       this.pipe.brushTex = this.atlas.tex;
+      this.pipe.brushVer = this.atlas.version;
       if (Math.round(this.state.v.blurType) === 3) await this.ensureDepth();
       await this.ensureFill(this.state);
       this.syncOverlay(this.state);
@@ -4733,6 +5061,13 @@ export class App {
     $<HTMLImageElement>('resultImg').src = this.resultUrl;
     $('resultSheet').classList.add('on');
   }
+  /** Put the result away, and let go of the exported file it was showing. */
+  private closeResult() {
+    $('resultSheet').classList.remove('on');
+    $<HTMLImageElement>('resultImg').removeAttribute('src');
+    if (this.resultUrl) URL.revokeObjectURL(this.resultUrl);
+    this.resultUrl = '';
+  }
 
   // -----------------------------------------------------------------------------------
   // Feedback
@@ -4741,8 +5076,11 @@ export class App {
   private busyRows: SVGElement[] = [];
   private busy(msg: string | null) {
     const b = $('busy');
+    const was = b.classList.contains('on');
     b.classList.toggle('on', !!msg);
     if (!msg) return;
+    // (back is swallowed meanwhile: in the browser that needs the guard entry)
+    if (!was) this.syncGuard();
     (b.querySelector('.msg') as HTMLElement).textContent = msg;
     if (!this.busyRows.length) this.busyRows = [...b.querySelectorAll<SVGElement>('.sun .s')];
     const m = /(\d+)%/.exec(msg);

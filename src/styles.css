@@ -145,6 +145,11 @@ svg { display: block; }
   background: linear-gradient(to top, rgba(14, 14, 14, 0.86), rgba(14, 14, 14, 0.6) 70%, rgba(14, 14, 14, 0.2));
   -webkit-mask-image: linear-gradient(to top, #000 82%, transparent); mask-image: linear-gradient(to top, #000 82%, transparent);
 }
+/* A playing or exporting video redraws the canvas every frame, and glass over it would be
+   blurred again every frame too: meanwhile the bars are plain, a little more solid instead. */
+#app.live .top::before, #app.live #dock::before { -webkit-backdrop-filter: none; backdrop-filter: none; }
+#app.live .top::before { background: linear-gradient(to bottom, rgba(14, 14, 14, 0.88), rgba(14, 14, 14, 0.52) 70%, rgba(14, 14, 14, 0)); }
+#app.live #dock::before { background: linear-gradient(to top, rgba(14, 14, 14, 0.92), rgba(14, 14, 14, 0.72) 70%, rgba(14, 14, 14, 0.3)); }
 
 /* ---------------------------------------------------------------- top bar */
 .top { top: 0; display: flex; align-items: center; gap: 0; padding: calc(var(--safe-t) + 8px) 8px 22px; }
@@ -273,6 +278,8 @@ svg { display: block; }
 .rcard .vid svg { width: 10px; height: 10px; }
 .rcard small { font: 600 11px var(--mono); color: var(--muted); }
 .rcard .rdel { position: absolute; top: -4px; right: -4px; width: 22px; height: 22px; border-radius: 8px; background: #2a2925; color: var(--ink); font: 700 14px/22px var(--mono); font-style: normal; text-align: center; }
+/* the × stays small; what a finger can hit around it is 44px */
+.rcard .rdel::before { content: ''; position: absolute; inset: -12px -6px -10px -16px; }
 
 /* ---------------------------------------------------------------- dock: tools / section */
 #dock { bottom: 0; padding: 6px 0 calc(var(--safe-b) + 6px); display: flex; flex-direction: column; }
@@ -414,6 +421,7 @@ svg { display: block; }
 /* ---------------------------------------------------------------- busy + sheets */
 #busy { position: fixed; inset: 0; background: rgba(14, 14, 14, 0.45); -webkit-backdrop-filter: blur(20px); backdrop-filter: blur(20px); display: none; place-items: center; align-content: center; gap: 18px; z-index: 20; }
 #busy.on { display: grid; }
+#app.live ~ #busy { -webkit-backdrop-filter: none; backdrop-filter: none; background: rgba(14, 14, 14, 0.84); }
 /* the logo's sun: it rises row by row with the progress, or shimmers when there's no number */
 #busy .sun { width: 80px; height: 88px; justify-self: center; image-rendering: pixelated; overflow: visible; }
 #busy .sun .s { opacity: 0.14; transition: opacity 0.2s steps(2); }

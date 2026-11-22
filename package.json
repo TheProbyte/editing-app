@@ -6,7 +6,7 @@
   "scripts": {
     "copy-libraw": "node scripts/copy-libraw.mjs",
     "dev": "npm run copy-libraw && vite --host",
-    "build": "npm run copy-libraw && tsc --noEmit && vite build",
+    "build": "npm run copy-libraw && tsc --noEmit && vite build && node scripts/stamp-sw.mjs",
     "preview": "vite preview --host",
     "typecheck": "tsc --noEmit"
   },

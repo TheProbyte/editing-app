@@ -21,14 +21,19 @@ export interface Media {
   input: Input | null;
   video: InputVideoTrack | null;
   audio: InputAudioTrack | null;
-  /** decoded still */
+  /** decoded still (at most STILL_LONG on its long side; exports read the file again when they need more) */
   bitmap: ImageBitmap | null;
+  /** a still's own long side, in pixels */
+  srcLong?: number;
   /** small frames for the timeline, in source order */
   thumbs: { t: number; c: CanvasImageSource }[];
   thumbsDone: boolean;
 }
 
 export { isVideoFile, isAudioFile } from './project';
+
+/** stills are kept at most this big (long side) */
+export const STILL_LONG = 2048;
 
 export class MediaLib {
   items = new Map<string, Media>();
@@ -39,8 +44,31 @@ export class MediaLib {
     return this.items.get(id) ?? null;
   }
 
+  /** A still at up to `long` pixels, read from its file again (for exports; the caller closes it). */
+  async fullStill(m: Media, long: number): Promise<ImageBitmap | null> {
+    try {
+      let bmp = await createImageBitmap(m.file, { imageOrientation: 'from-image' });
+      const k = Math.min(1, long / Math.max(bmp.width, bmp.height));
+      if (k < 1) {
+        const b2 = await createImageBitmap(bmp, { resizeWidth: Math.round(bmp.width * k), resizeHeight: Math.round(bmp.height * k), resizeQuality: 'high' });
+        bmp.close();
+        bmp = b2;
+      }
+      return bmp;
+    } catch {
+      return null;
+    }
+  }
+
   /** Add a file (with `id`: reopening a saved project, whose clips refer to it by that id). */
   async add(file: File, id?: string): Promise<Media> {
+    // the same file again (a second copy of a clip, the same song): the one already open
+    if (!id) {
+      for (const x of this.items.values()) {
+        const f = x.file as File;
+        if (f.name === file.name && f.size === file.size && f.lastModified === file.lastModified) return x;
+      }
+    }
     const m = isVideoFile(file) || isAudioFile(file) ? await this.addAV(file) : await this.addImage(file);
     if (id && id !== m.id) {
       this.items.delete(m.id);
@@ -110,8 +138,10 @@ export class MediaLib {
     } catch {
       throw new Error(`Can’t open ${file.name}`);
     }
-    // keep stills at a sane size for a video frame
-    const k = Math.min(1, 3840 / Math.max(bmp.width, bmp.height));
+    // kept at a size that suits the preview (a dozen full-size photos would be over a
+    // gigabyte); an export bigger than this reads the file again, one photo at a time
+    const srcLong = Math.max(bmp.width, bmp.height);
+    const k = Math.min(1, STILL_LONG / srcLong);
     if (k < 1) {
       const b2 = await createImageBitmap(bmp, { resizeWidth: Math.round(bmp.width * k), resizeHeight: Math.round(bmp.height * k), resizeQuality: 'high' });
       bmp.close();
@@ -119,7 +149,7 @@ export class MediaLib {
     }
     const thumb = await createImageBitmap(bmp, { resizeHeight: 96, resizeQuality: 'medium' });
     const m: Media = {
-      id: uid(), name: file.name, file, kind: 'image', duration: 0, w: bmp.width, h: bmp.height, fps: 30,
+      id: uid(), name: file.name, file, kind: 'image', duration: 0, w: bmp.width, h: bmp.height, fps: 30, srcLong,
       input: null, video: null, audio: null, bitmap: bmp, thumbs: [{ t: 0, c: thumb }], thumbsDone: true,
     };
     this.items.set(m.id, m);

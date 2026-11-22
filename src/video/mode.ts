@@ -8,7 +8,7 @@ import type { EditState, ParamDef } from '../params';
 import type { Chip, ToolDef } from '../ui/tools';
 import { ICONS } from '../ui/icons';
 import { tick } from '../ui/haptics';
-import { MediaLib, isAudioFile, isVideoFile, type Media } from './media';
+import { MediaLib, STILL_LONG, isAudioFile, isVideoFile, type Media } from './media';
 import { Player, type Frame } from './player';
 import { Compositor, type FrameSource, type GpuFrame, type Placement } from './compose';
 import { Timeline, TIMELINE_H, type Sel } from './timeline';
@@ -47,6 +47,8 @@ export interface VideoHost {
   renderFull(src: Source, w: number, h: number, st: EditState): void;
   /** the settings in the edit changed underneath the sliders (another clip's look came in) */
   lookChanged(): void;
+  /** the picture is changing every frame (playing, exporting): the bars over it drop their blur */
+  setLive(on: boolean): void;
   save(blob: Blob, name: string): Promise<void>;
 }
 
@@ -131,6 +133,10 @@ export class VideoMode {
         this.interactive();
         this.player.peek(T, true);
       },
+      setTime: (T) => {
+        this.player.setTime(T);
+        this.onTime();
+      },
       changed: (commit) => this.changed(commit),
       select: (s) => this.select(s),
       selection: () => this.sel,
@@ -144,6 +150,8 @@ export class VideoMode {
 
   get project(): VideoProject {
     const st = this.h.state();
+    // (closed: the app's state is a photo's now, which must not grow a timeline)
+    if (this.dead) return st.video ?? newProject();
     st.video ??= newProject();
     return st.video;
   }
@@ -247,16 +255,21 @@ export class VideoMode {
 
   /** Reopen a saved project's files (the edit itself is restored by the app). */
   async restoreMedia(files: { id: string; file: File }[]) {
+    let missing = 0;
     for (let k = 0; k < files.length; k++) {
       this.h.busy(`Opening ${k + 1} of ${files.length}`);
       try {
         const m = await this.lib.add(files[k].file, files[k].id);
+        if (this.dead) return;
         this.audio.warm(m);
-        if (m.kind === 'video') setTimeout(() => void this.player.buildKeys(m), 1200);
+        if (m.kind === 'video') setTimeout(() => !this.dead && void this.player.buildKeys(m), 1200);
       } catch (e) {
         console.error(e);
+        missing++;
       }
     }
+    if (this.dead) return;
+    if (missing) this.h.toast(missing > 1 ? `${missing} files of this project couldn’t be opened` : 'One file of this project couldn’t be opened', 4000);
     this.h.busy(null);
   }
 
@@ -343,9 +356,27 @@ export class VideoMode {
 
   private imageGpu(m: Media): GpuFrame | null {
     if (!m.bitmap) return null;
+    const big = this.exportStill;
+    if (this.exporting && big?.id === m.id) return { tex: big.tex, w: big.w, h: big.h };
     let t = this.imgTex.get(m.id);
-    if (!t) this.imgTex.set(m.id, (t = this.comp.imageTexture(m.bitmap)));
+    if (t) this.imgTex.delete(m.id); // (put back below: most recently used last)
+    else {
+      t = this.comp.imageTexture(m.bitmap);
+      // a few stills' textures at a time: a long slideshow doesn't fill the GPU's memory
+      while (this.imgTex.size >= 4) {
+        const [old, tex] = this.imgTex.entries().next().value as [string, WebGLTexture];
+        this.h.g.gl.deleteTexture(tex);
+        this.imgTex.delete(old);
+      }
+    }
+    this.imgTex.set(m.id, t);
     return { tex: t, w: m.bitmap.width, h: m.bitmap.height };
+  }
+  /** a still read at full size for the export (one at a time) */
+  private exportStill: { id: string; tex: WebGLTexture; w: number; h: number } | null = null;
+  private dropExportStill() {
+    if (this.exportStill) this.h.g.gl.deleteTexture(this.exportStill.tex);
+    this.exportStill = null;
   }
 
   /** How a frame of `clip` (at source time s) sits in a w×h project frame. */
@@ -416,12 +447,14 @@ export class VideoMode {
   }
 
   private showFrame(f: Frame) {
-    if (this.exporting) {
+    if (this.exporting || this.dead) {
       f.sample?.close();
       return;
     }
     if (!this.frameT) this.ensureFrame();
-    const src = this.srcFor(f.media, f.sample, this.previewLong(), !this.player.playing, f.bitmap, f.pre, f.upright);
+    // (frames shown while a finger moves skip the extra smoothing a big source gets; the exact
+    // frame that follows has it)
+    const src = this.srcFor(f.media, f.sample, this.previewLong(), !this.player.playing && !f.fast, f.bitmap, f.pre, f.upright);
     const s = f.sample?.timestamp ?? f.ts ?? (f.t !== undefined ? this.srcTime(f.clip, f.t) : f.clip.in);
     f.sample?.close();
     this.last = { src, media: f.media.id, clip: f.clip.id, s };
@@ -614,6 +647,14 @@ export class VideoMode {
       this.player.seek(this.player.time);
     } else {
       if (!this.project.clips.length) return this.pickMedia();
+      // (a flick still coasting would seek, and stop it again)
+      this.timeline.stopCoast();
+      // while it plays every clip is drawn with its own look; a slider moved meanwhile
+      // changes the whole video's look, not the clip that happened to be under the playhead
+      if (this.project.scope) {
+        this.unscope();
+        this.h.lookChanged();
+      }
       this.dynCheck = { t: performance.now(), drops: 0, shown: 0, calm: 0 };
       void this.player.play().then(() => {
         this.syncPlayButton();
@@ -624,6 +665,7 @@ export class VideoMode {
   }
 
   private syncPlayButton() {
+    this.h.setLive(this.player.playing || this.exporting);
     $('tlPlay').innerHTML = this.player.playing ? ICONS.pause : ICONS.play;
     $('tlPlay').classList.toggle('on', this.player.playing);
   }
@@ -631,6 +673,7 @@ export class VideoMode {
   private lastTextKey = '';
   private lastLabel = '';
   private onTime() {
+    if (this.dead) return;
     const T = this.player.time;
     const total = layout(this.project).total;
     // the label changes ten times a second at most: only touch the DOM then
@@ -687,20 +730,43 @@ export class VideoMode {
   /** Rebuild the soundtrack in the background a moment after the last edit. */
   private remixTimer = 0;
   private remix() {
+    if (this.dead) return;
     clearTimeout(this.remixTimer);
-    this.remixTimer = window.setTimeout(() => void this.audio.mix(this.project), 250);
+    this.remixTimer = window.setTimeout(() => {
+      if (this.dead) return;
+      const p = this.project;
+      this.audio.keepOnly(new Set([...p.clips.map((c) => c.src), ...(p.music ? [p.music.src] : [])]));
+      void this.audio.mix(p);
+    }, 250);
   }
 
   private changed(commit: boolean) {
+    if (this.player.playing) {
+      // the timeline changed under a running playback (its frames and sound were planned
+      // for the old one): stop where it is
+      const T = this.player.time;
+      this.player.pause();
+      this.syncPlayButton();
+      this.player.seek(Math.min(T, layout(this.project).total));
+    }
     this.remix();
     this.rescope();
-    // clips are shorter / longer: text past the end comes back in
+    // another clip came first: with the Original canvas, the frame takes its shape
+    const d = this.dims(this.previewLong());
+    if (this.frameT && (this.frameT.w !== d.w || this.frameT.h !== d.h)) {
+      this.ensureFrame();
+      this.replace();
+    }
+    // clips are shorter / longer: text past the end comes back in (once the change is
+    // final: mid-drag the length passes through values it won't keep)
     const total = layout(this.project).total;
-    for (const t of this.project.texts) {
-      if (t.t1 > total) t.t1 = Math.max(t.t0 + 0.3, total);
-      if (t.t0 >= total) {
-        t.t0 = Math.max(0, total - 1);
-        t.t1 = total;
+    if (commit && total > 0) {
+      for (const t of this.project.texts) {
+        if (t.t1 > total) t.t1 = Math.max(t.t0 + 0.3, total);
+        if (t.t0 >= total) {
+          t.t0 = Math.max(0, total - 1);
+          t.t1 = total;
+        }
       }
     }
     this.h.requestRender();
@@ -746,7 +812,8 @@ export class VideoMode {
     const local = T - at.start;
     if (local < MIN_CLIP || clipLen(c) - local < MIN_CLIP) return this.h.toast('Move the playhead into the clip to split it');
     const cut = srcAt(c, local);
-    const b: VClip = { ...c, id: uid(), in: cut, look: c.look && JSON.parse(JSON.stringify(c.look)) };
+    // (its own copy of everything: the two would otherwise share their keyframes)
+    const b: VClip = { ...(JSON.parse(JSON.stringify(c)) as VClip), id: uid(), in: cut };
     if (c.ramp) {
       // each half keeps its part of the ramp
       const u = (cut - c.in) / (c.out - c.in);
@@ -771,9 +838,10 @@ export class VideoMode {
       this.sel = p.clips[i] ? { kind: 'clip', id: p.clips[i].id } : p.clips[i - 1] ? { kind: 'clip', id: p.clips[i - 1].id } : null;
       if (!p.clips.length) this.last = null;
       this.ensureFrame();
+      if (!p.clips.length) this.replace(); // nothing left: the picture goes too
       this.player.seek(Math.min(this.player.time, layout(p).total));
     } else if (what === 'copy') {
-      const d = { ...c, id: uid(), look: c.look && JSON.parse(JSON.stringify(c.look)) };
+      const d: VClip = { ...(JSON.parse(JSON.stringify(c)) as VClip), id: uid() };
       p.clips.splice(i + 1, 0, d);
       this.sel = { kind: 'clip', id: d.id };
     } else {
@@ -1003,6 +1071,8 @@ export class VideoMode {
   /** when the clip in the edit is animated: where (clip, source time) its settings were loaded from */
   private kfAnchor: { clip: string; s: number; v: string } | null = null;
 
+  private scopeClip: string | undefined;
+
   /** The clip under the playhead. */
   playClip(): VClip | null {
     const at = clipAt(this.project, this.player.time);
@@ -1062,7 +1132,10 @@ export class VideoMode {
         reloaded = !!a;
       }
     } else this.kfAnchor = null;
-    if (before !== p.scope || reloaded) this.h.lookChanged();
+    // (also when the playhead moves onto another clip: the look switch shows that clip's choice)
+    const moved = c?.id !== this.scopeClip;
+    this.scopeClip = c?.id;
+    if (before !== p.scope || reloaded || moved) this.h.lookChanged();
   }
 
   /** The edit as a frame of `clip` at source time s is drawn (its clip's look, animated). */
@@ -1077,21 +1150,27 @@ export class VideoMode {
     const c = this.playClip();
     if (!c) return;
     const own = !!c.look;
+    // (the clip is looked up again at the tap: the playhead may have moved on since the row was built)
     this.h.chip(row, { id: 'all', label: 'All clips' }, !own, () => {
-      if (!c.look) return;
+      const c = this.playClip();
+      if (!c?.look) return;
       this.unscope();
       delete c.look;
       this.h.toast('This clip follows the whole video’s look again', 2200);
       this.lookEdited();
     });
     this.h.chip(row, { id: 'clip', label: 'This clip' }, own, () => {
-      if (c.look) return;
+      const c = this.playClip();
+      if (!c || c.look) return;
       this.giveLook(c);
       this.h.toast('Changes now apply to this clip only', 2200);
       this.lookEdited();
     });
     const k = lookKeyAt(c.look, this.sNow(c)) >= 0;
-    const b = this.h.chip(row, { id: 'key', label: '◆ Key' }, k, () => this.toggleLookKey(c));
+    const b = this.h.chip(row, { id: 'key', label: '◆ Key' }, k, () => {
+      const c = this.playClip();
+      if (c) this.toggleLookKey(c);
+    });
     b.classList.add('keychip');
     if (sep) row.appendChild(Object.assign(document.createElement('i'), { className: 'sep' }));
   }
@@ -1461,6 +1540,10 @@ export class VideoMode {
   // export
 
   private ex = { res: 1080, fps: 30, q: 'high' as 'high' | 'max' };
+  /** the export choices made last time, per kind of footage (so they don't have to be made again) */
+  private exKey() {
+    return `lumen.vex.${this.sourceLong()}.${this.sourceFps()}`;
+  }
 
   private sourceLong() {
     let L = 0;
@@ -1485,8 +1568,14 @@ export class VideoMode {
     this.syncPlayButton();
     const L = this.sourceLong();
     // the footage's own size, up to 1080p (1440p / 4K are there to pick)
-    this.ex.res = L >= 1800 ? 1920 : L >= 1200 ? 1280 : 720;
+    this.ex.res = L >= 1800 ? 1920 : 1280;
     this.ex.fps = this.sourceFps();
+    try {
+      const s = JSON.parse(localStorage.getItem(this.exKey()) ?? 'null') as typeof this.ex | null;
+      if (s && [1280, 1920, 2560, 3840].includes(s.res) && [24, 30, 60].includes(s.fps)) this.ex = { res: s.res, fps: s.fps, q: s.q === 'max' ? 'max' : 'high' };
+    } catch {
+      /* no saved choice */
+    }
     this.buildExport();
     $('vexSheet').classList.add('on');
   }
@@ -1523,7 +1612,7 @@ export class VideoMode {
     seg('vxQ', [['high', 'High', true], ['max', 'Max', true]], this.ex.q, (v) => (this.ex.q = v as 'high' | 'max'));
     const d = this.dims(this.ex.res);
     const total = layout(this.project).total;
-    const mbps = Math.min(80e6, d.w * d.h * this.ex.fps * (this.ex.q === 'max' ? 0.3 : 0.16)) / 1e6;
+    const mbps = Math.min(80e6, d.w * d.h * this.ex.fps * (this.ex.q === 'max' ? 0.3 : 0.16) * this.grainBoost()) / 1e6;
     const mb = (mbps * total) / 8 + (0.192 * total) / 8;
     $('vxHint').textContent = `${fmtTime(total, false)} · about ${mb >= 10 ? Math.round(mb) : mb.toFixed(1)} MB · MP4`;
   }
@@ -1546,6 +1635,22 @@ export class VideoMode {
     this.exporting = true;
     this.cancelExport = false;
     this.player.pause();
+    this.syncPlayButton();
+    try {
+      localStorage.setItem(this.exKey(), JSON.stringify(this.ex));
+    } catch {
+      /* private mode */
+    }
+    this.h.setLive(true);
+    // the export gets the memory and the decoders scrubbing was holding, and the screen
+    // stays on until it's done
+    this.player.freeScrub();
+    let wake: { release(): Promise<void> } | null = null;
+    try {
+      wake = (await (navigator as Navigator & { wakeLock?: { request(t: 'screen'): Promise<{ release(): Promise<void> }> } }).wakeLock?.request('screen')) ?? null;
+    } catch {
+      /* not allowed here: carry on */
+    }
     const canvas = this.h.canvas;
     const keep = { w: canvas.width, h: canvas.height };
     this.h.busy('Exporting 0%');
@@ -1558,11 +1663,24 @@ export class VideoMode {
       const out = this.exportT;
       const blob = await exportVideo({
         lib: this.lib, audio: this.audio, project: st.video!, canvas, w, h, fps: this.ex.fps, quality: this.ex.q, boost: this.grainBoost(),
+        prepare: async (_clip, m) => {
+          // a still bigger than the one kept for the preview: read it at the export's size
+          this.dropExportStill();
+          const long = Math.max(w, h);
+          if (m.kind !== 'image' || !m.bitmap || (m.srcLong ?? 0) <= STILL_LONG || long <= STILL_LONG * 0.9) return;
+          const bmp = await this.lib.fullStill(m, Math.min(4096, long * 1.25));
+          if (!bmp) return;
+          this.exportStill = { id: m.id, tex: this.comp.imageTexture(bmp), w: bmp.width, h: bmp.height };
+          bmp.close();
+        },
         drawFrame: (clip, m, sample, T) => {
-          const look = this.lookState(this.h.state(), clip, sample?.timestamp ?? this.srcTime(clip, T), false);
+          // (looks and framing follow the output frame's own moment, not the source frame's:
+          // in slow motion one source frame covers several output frames)
+          const s = this.srcTime(clip, T);
+          const look = this.lookState(this.h.state(), clip, s, false);
           this.h.pipe.filmFrame = this.film(T, look.v);
           const src = this.srcFor(m, sample, Math.max(w, h));
-          this.comp.place(src, out, this.placement(clip, sample?.timestamp ?? this.srcTime(clip, T), w, h));
+          this.comp.place(src, out, this.placement(clip, s, w, h));
           this.h.renderFull({ tex: out.tex, w, h, linear: false }, w, h, look);
           const vis = this.visibleTexts(T);
           this.comp.setText(vis.length ? JSON.stringify([vis, w, h]) : '', w, h, vis.length ? this.paintTexts(vis) : null);
@@ -1583,6 +1701,9 @@ export class VideoMode {
       }
     } finally {
       this.exporting = false;
+      this.h.setLive(false);
+      this.dropExportStill();
+      void wake?.release().catch(() => {});
       $('busyCancel').hidden = true;
       if (this.exportT) this.h.g.destroy(this.exportT);
       this.exportT = null;
@@ -1607,6 +1728,10 @@ export class VideoMode {
   dispose() {
     this.dead = true;
     this.life.abort();
+    clearTimeout(this.remixTimer);
+    clearTimeout(this.capTimer);
+    this.timeline.dispose();
+    this.dropExportStill();
     this.rampEd.el.remove();
     this.player.dispose();
     this.comp.dispose();
@@ -1625,6 +1750,9 @@ export class VideoMode {
     $('tlTrack').innerHTML = '';
     // handlers on elements that outlive the editor would keep all of it (and its sound) in memory
     for (const id of ['tlPlay', 'tlAdd', 'busyCancel', 'textDone', 'textCancel', 'textSheet', 'vxCancel', 'vxGo', 'vexSheet']) $(id).onclick = null;
-    for (const id of ['fileAdd', 'fileAudio']) $(id).onchange = null;
+    for (const id of ['fileAdd', 'fileAudio', 'fileBg']) {
+      const el = document.getElementById(id);
+      if (el) el.onchange = null;
+    }
   }
 }

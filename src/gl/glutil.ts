@@ -61,6 +61,9 @@ function compile(gl: WebGL2RenderingContext, type: number, src: string) {
   return s;
 }
 
+/** Most GPU memory the idle render targets in the pool may hold (the oldest go first). */
+const POOL_BYTES = 256 * 1024 * 1024;
+
 export class GL {
   gl: WebGL2RenderingContext;
   floatRT: boolean;
@@ -123,8 +126,16 @@ export class GL {
   release(t: Target | null | undefined) {
     if (!t) return;
     this.pool.push(t);
-    // keep the pool bounded so memory doesn't balloon after exports
-    while (this.pool.length > 24) this.destroy(this.pool.shift()!);
+    // keep the pool bounded, by count and by memory, so it doesn't balloon after exports or
+    // deep-zoom renders (every pan there asks for a new size, and those targets are big)
+    const size = (p: Target) => p.w * p.h * (p.fmt === 'f16' ? 8 : 4);
+    let bytes = 0;
+    for (const p of this.pool) bytes += size(p);
+    while (this.pool.length > 24 || (bytes > POOL_BYTES && this.pool.length > 1)) {
+      const old = this.pool.shift()!;
+      bytes -= size(old);
+      this.destroy(old);
+    }
   }
 
   destroy(t: Target) {

@@ -73,18 +73,29 @@ export class Camera {
     void fromBack;
   }
 
+  /** counts starts: a camera that arrives after it was closed (or flipped again) is switched off */
+  private startTok = 0;
+
   private async start() {
     this.stop();
+    const tok = ++this.startTok;
+    let stream: MediaStream;
     try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
+      stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
         video: { facingMode: this.facing, width: { ideal: 4032 }, height: { ideal: 3024 } },
       });
     } catch (e) {
+      if (tok !== this.startTok || !this.isOpen()) return;
       this.toast('Camera not available: ' + ((e as Error).message || 'permission denied'), 4000);
       this.close();
       return;
     }
+    if (tok !== this.startTok || !this.isOpen()) {
+      stream.getTracks().forEach((t) => t.stop());
+      return;
+    }
+    this.stream = stream;
     this.video.srcObject = this.stream;
     const track = this.stream.getVideoTracks()[0];
     const c = (track.getCapabilities?.() ?? {}) as Record<string, any>;

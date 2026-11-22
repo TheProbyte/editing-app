@@ -8,7 +8,7 @@ import { CanvasSink, EncodedPacketSink, type VideoSample, type VideoSampleSink }
 import type { Media, MediaLib } from './media';
 import type { AudioEngine } from './audio';
 import type { GpuFrame } from './compose';
-import { clipAt, clipLen, layout, localAt, type VClip, type VideoProject } from './project';
+import { clipAt, clipLen, layout, localAt, srcAt, type VClip, type VideoProject } from './project';
 
 export interface Frame {
   clip: VClip;
@@ -25,6 +25,8 @@ export interface Frame {
   t?: number;
   /** the bitmap is already rotated upright (key frame cache) */
   upright?: boolean;
+  /** shown while a finger is moving (the exact frame follows): draw it the quick way */
+  fast?: boolean;
 }
 
 /** a decoded frame waiting for its moment */
@@ -42,6 +44,8 @@ const REV_BYTES = 240e6;
 const REV_MIN = 60;
 /** cached key frames in all (each a small picture, KEY_LONG px on the long side) */
 const KEYS_MAX = 240;
+/** … and at most this many per file */
+const KEYS_PER = 80;
 const KEY_LONG = 480;
 const REV_LONG = 960;
 
@@ -119,6 +123,20 @@ export class Player {
     this.peek(this.T, fast);
   }
 
+  /** Let go of what scrubbing keeps ready (before an export, which needs the memory and the decoders). */
+  freeScrub() {
+    clearTimeout(this.settle);
+    this.seekWant = null;
+    this.closeScrub();
+    this.clearRev();
+    this.scrubClip = '';
+  }
+
+  /** Move the playhead without showing its frame (paused only). */
+  setTime(T: number) {
+    if (!this.playing) this.T = Math.max(0, T);
+  }
+
   /** Show the frame at T without moving the playhead (e.g. the edge being trimmed). */
   peek(T: number, fast = false) {
     // how fast the finger is going, in timeline seconds per second
@@ -140,6 +158,8 @@ export class Player {
     if (!this.seekBusy) void this.seekLoop();
   }
   private settle = 0;
+  /** the clip the scrub tracking below belongs to */
+  private scrubClip = '';
   private speed = 0;
   private hist: [number, number][] = [];
   /** which way the finger is going: 1, -1, or 0 (still / unclear) */
@@ -162,23 +182,39 @@ export class Player {
   private keys = new Map<string, { ts: number; bmp: ImageBitmap }[]>();
   private keyBusy = new Set<string>();
   private keyTotal = 0;
+  /** when each file's key frames were last used (the longest unused make room for others) */
+  private keyUsed = new Map<string, number>();
+  private disposed = false;
 
   async buildKeys(m: Media) {
-    if (!m.video || this.keys.has(m.id) || this.keyBusy.has(m.id) || this.keyTotal > KEYS_MAX) return;
+    if (!m.video || this.disposed || this.keys.has(m.id) || this.keyBusy.has(m.id)) return;
     this.keyBusy.add(m.id);
     try {
       let ks = this.keySinks.get(m.id);
       if (!ks) this.keySinks.set(m.id, (ks = new EncodedPacketSink(m.video)));
       const ts: number[] = [];
       let pk = await ks.getKeyPacket(0, { metadataOnly: true });
-      while (pk && ts.length < 900) {
+      while (pk && ts.length < 20000) {
         ts.push(pk.timestamp);
         pk = await ks.getNextKeyPacket(pk, { metadataOnly: true });
       }
-      // a very long clip with many key frames: keep an even spread
-      const room = Math.max(8, KEYS_MAX - this.keyTotal);
-      const step = Math.max(1, Math.ceil(ts.length / room));
+      if (this.disposed) return;
+      // every file gets its share: a long one keeps an even spread of its key frames, and
+      // when the cache is full the file that's gone unused the longest makes room
+      const step = Math.max(1, Math.ceil(ts.length / KEYS_PER));
       const pick = ts.filter((_, i) => i % step === 0);
+      while (this.keyTotal + pick.length > KEYS_MAX) {
+        let old: string | null = null;
+        for (const id of this.keys.keys()) {
+          if (id === m.id || this.keyBusy.has(id)) continue;
+          if (old === null || (this.keyUsed.get(id) ?? 0) < (this.keyUsed.get(old) ?? 0)) old = id;
+        }
+        if (old === null) break;
+        for (const k of this.keys.get(old)!) k.bmp.close();
+        this.keyTotal -= this.keys.get(old)!.length;
+        this.keys.delete(old);
+      }
+      this.keyUsed.set(m.id, performance.now());
       const sink = new CanvasSink(m.video, { width: m.w >= m.h ? KEY_LONG : undefined, height: m.w < m.h ? KEY_LONG : undefined, fit: 'contain' });
       const out: { ts: number; bmp: ImageBitmap }[] = [];
       this.keys.set(m.id, out);
@@ -187,7 +223,13 @@ export class Player {
         const t = pick[i++];
         if (!w) continue;
         // (the sink's picture is already turned upright, unlike raw frames: see Frame.upright)
-        out.push({ ts: w.timestamp ?? t, bmp: await createImageBitmap(w.canvas) });
+        const bmp = await createImageBitmap(w.canvas);
+        if (this.disposed || this.keys.get(m.id) !== out) {
+          // closed (or made room for another file) meanwhile
+          bmp.close();
+          break;
+        }
+        out.push({ ts: w.timestamp ?? t, bmp });
         this.keyTotal++;
         if (this.playing) await new Promise((r) => setTimeout(r, 50)); // stay out of playback's way
       }
@@ -207,7 +249,13 @@ export class Player {
    */
   private keyNear(m: Media, t: number, dir: number, shown: number | null, wide: boolean) {
     const K = this.keys.get(m.id);
-    if (!K?.length) return null;
+    if (!K) {
+      // (made room for other files earlier: get them back now that this one is being scrubbed)
+      void this.buildKeys(m);
+      return null;
+    }
+    if (!K.length) return null;
+    this.keyUsed.set(m.id, performance.now());
     const sc = this.scrub?.media === m.id ? this.scrub : null;
     let best: (typeof K)[number] | null = null;
     for (const k of K) {
@@ -465,7 +513,7 @@ export class Player {
   private async seekLoop() {
     this.seekBusy = true;
     try {
-      while (this.seekWant !== null) {
+      while (this.seekWant !== null && !this.disposed) {
         const { T, fast } = this.seekWant;
         this.seekWant = null;
         const p = this.project();
@@ -475,12 +523,25 @@ export class Player {
         const m = this.lib.get(clip.src);
         if (!m) continue;
         if (m.kind === 'image') {
+          this.scrubClip = clip.id;
           this.onFrame({ clip, media: m, sample: null, t: T });
           continue;
         }
         const sink = this.vSink(m);
         if (!sink) continue;
         const t = Math.min(at.src, m.duration - 1e-3);
+        if (clip.id !== this.scrubClip) {
+          // onto another clip: what was on screen says nothing about this one (it can be the
+          // same file at an earlier moment, a copy or a moved half). Coming in backwards, it
+          // carries on as a reverse drag from just past this point
+          this.scrubClip = clip.id;
+          const back = fast && this.dragDir < 0;
+          this.shownTs = { media: back ? m.id : '', ts: Infinity, end: Infinity };
+          this.lastT = { media: back ? m.id : '', t: t + 1e-3 };
+        } else if (this.shownTs.ts === Infinity && this.dragDir > 0) {
+          // came in backwards, turned round before anything showed: an ordinary forward drag
+          this.shownTs = { media: '', ts: -1, end: -1 };
+        }
         // a fast drag: the cached key frame nearest the finger, no decoding at all
         if (fast && this.speed > 2.5) {
           const dir = this.dragDir || (this.lastT.media === m.id ? Math.sign(t - this.lastT.t) : 1);
@@ -491,7 +552,7 @@ export class Player {
           if (k) {
             // the decoder is behind it: start it again from this key frame (t's own, going forward)
             if (dir > 0) this.closeScrub();
-            this.onFrame({ clip, media: m, sample: null, bitmap: k.bmp, ts: k.ts, t: T, upright: true });
+            this.onFrame({ clip, media: m, sample: null, bitmap: k.bmp, ts: k.ts, t: T, upright: true, fast: true });
             this.shownTs = { media: m.id, ts: k.ts, end: k.ts + 1 / (m.fps || 30) };
             this.lastT = { media: m.id, t };
             continue;
@@ -522,7 +583,7 @@ export class Player {
             continue;
           }
           if (b) {
-            this.onFrame({ clip, media: m, sample: null, bitmap: b.bmp, ts: b.ts, t: T });
+            this.onFrame({ clip, media: m, sample: null, bitmap: b.bmp, ts: b.ts, t: T, fast: true });
             this.shownTs = { media: m.id, ts: b.ts, end: b.end };
             this.lastT = { media: m.id, t };
             this.prefetchBack(m, sink, t);
@@ -537,7 +598,7 @@ export class Player {
         }
         if (s) {
           this.shownTs = { media: m.id, ts: s.timestamp, end: s.timestamp + (s.duration || 1 / (m.fps || 30)) };
-          this.onFrame({ clip, media: m, sample: s, t: T });
+          this.onFrame({ clip, media: m, sample: s, t: T, fast });
           // stopped on a frame: have the second before it ready in case the finger goes back
           if (!fast && !this.seekWant) this.prefetchBack(m, sink, t);
         }
@@ -567,7 +628,13 @@ export class Player {
     // the scrub decoder isn't needed while playing (phones have only a few decoders)
     this.closeScrub();
     clearTimeout(this.settle);
+    clearTimeout(this.idle);
     this.seekWant = null;
+    // what the last scrub left on screen says nothing about where playback ends up
+    this.scrubClip = '';
+    this.shownTs = { media: '', ts: -1, end: -1 };
+    this.lastT = { media: '', t: -1 };
+    this.hist = [];
     this.playing = true;
     this.drops = 0;
     this.shown = 0;
@@ -614,7 +681,13 @@ export class Player {
     this.nodes = [];
     this.queue = [];
     this.space?.();
+    // the sound output rests after a few quiet seconds (it wakes on the next play)
+    clearTimeout(this.idle);
+    this.idle = window.setTimeout(() => !this.playing && void this.ctx?.suspend().catch(() => {}), 4000);
   }
+  private idle = 0;
+  /** how long one screen refresh takes, in seconds (measured while playing) */
+  private refresh = 1 / 60;
 
   private alive(token: number) {
     return this.playing && token === this.token;
@@ -626,7 +699,16 @@ export class Player {
     const { starts } = layout(p);
     const at = clipAt(p, T);
     if (!at) return [];
-    return p.clips.slice(at.i).map((c, k) => ({ clip: c, start: starts[at.i + k], from: k === 0 ? at.src : c.in }));
+    const items = p.clips.slice(at.i).map((c, k) => ({ clip: c, start: starts[at.i + k], from: k === 0 ? at.src : c.in }));
+    // clips that carry straight on in the same file (the halves of a split) play as one run,
+    // through one decoder: no restart at the cut
+    const runs: { parts: { clip: VClip; start: number }[]; from: number }[] = [];
+    for (const it of items) {
+      const last = runs[runs.length - 1], prev = last?.parts[last.parts.length - 1].clip;
+      if (prev && prev.kind === 'video' && it.clip.kind === 'video' && prev.src === it.clip.src && Math.abs(it.clip.in - prev.out) < 1e-3) last.parts.push({ clip: it.clip, start: it.start });
+      else runs.push({ parts: [{ clip: it.clip, start: it.start }], from: it.from });
+    }
+    return runs;
   }
 
   /** Decode ahead, clip after clip, copying frames to the GPU as they come. */
@@ -634,20 +716,20 @@ export class Player {
     const room = async () => {
       while (this.alive(token) && this.queue.length >= QMAX) await new Promise<void>((r) => (this.space = r));
     };
-    for (const { clip, start, from } of plan) {
+    for (const { parts, from } of plan) {
       if (!this.alive(token)) return;
-      const m = this.lib.get(clip.src);
+      const m = this.lib.get(parts[0].clip.src);
       if (!m) continue;
       if (m.kind === 'image') {
         await room();
         if (!this.alive(token)) return;
-        this.queue.push({ clip, media: m, tl: start, pre: null });
+        this.queue.push({ clip: parts[0].clip, media: m, tl: parts[0].start, pre: null });
         continue;
       }
       const sink = this.vSink(m);
       if (!sink) continue;
-      const it = sink.samples(from, clip.out);
-      let lastTl = -Infinity;
+      let it = sink.samples(from, parts[parts.length - 1].clip.out);
+      let lastTl = -Infinity, pi = 0, first = true;
       try {
         for (;;) {
           const r = await it.next();
@@ -657,12 +739,32 @@ export class Player {
             s.close();
             return;
           }
+          // which clip of the run this frame belongs to
+          while (pi < parts.length - 1 && s.timestamp >= parts[pi].clip.out - 1e-4) pi++;
+          const { clip, start } = parts[pi];
           const tl = Math.max(start, start + localAt(clip, s.timestamp));
           // sped up: frames that would land on the same screen refresh are never seen, don't upload them
-          if (tl - lastTl < 1 / 125 && tl < start + clipLen(clip) - 0.05) {
+          if (tl - lastTl < this.refresh * 0.9 && tl < start + clipLen(clip) - 0.05) {
             s.close();
             continue;
           }
+          // decoding has fallen behind the sound: late frames are dropped unshown (uploading
+          // them is what costs), and far behind, decoding jumps ahead to where the sound is
+          const late = this.time - tl;
+          if (!first && late > 0.08) {
+            s.close();
+            this.drops++;
+            if (late > 0.75) {
+              const to = this.time + 0.25;
+              const q = parts.findIndex((x) => to < x.start + clipLen(x.clip));
+              if (q < 0) break;
+              pi = q;
+              void it.return().catch(() => {});
+              it = sink.samples(srcAt(parts[q].clip, Math.max(0, to - parts[q].start)), parts[parts.length - 1].clip.out);
+            }
+            continue;
+          }
+          first = false;
           lastTl = tl;
           const vf = s.toVideoFrame();
           let pre: GpuFrame;
@@ -685,8 +787,11 @@ export class Player {
 
   /** One loop, once per screen refresh: show the frame that's due, move the playhead. */
   private present(token: number) {
-    const step = () => {
+    let prev = 0;
+    const step = (now: number) => {
       if (!this.alive(token)) return;
+      if (prev && now - prev > 3 && now - prev < 40) this.refresh += ((now - prev) / 1000 - this.refresh) * 0.1;
+      prev = now;
       const t = this.time;
       const total = layout(this.project()).total;
       if (t >= total) {
@@ -720,7 +825,11 @@ export class Player {
 
   /** Forget decoders for media no longer used. */
   dispose() {
+    this.disposed = true;
     this.pause();
+    clearTimeout(this.idle);
+    clearTimeout(this.settle);
+    this.seekWant = null;
     this.closeScrub();
     this.clearRev();
     for (const K of this.keys.values()) for (const k of K) k.bmp.close();

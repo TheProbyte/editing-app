@@ -16,6 +16,8 @@ export interface TimelineHost {
   scrub(T: number): void;
   /** show the frame at T without moving the playhead (trimming) */
   peek(T: number): void;
+  /** move the playhead without showing its frame (the view following a trim) */
+  setTime(T: number): void;
   /** the project changed in place: re-render / remember it */
   changed(commit: boolean): void;
   select(s: Sel): void;
@@ -62,7 +64,22 @@ export class Timeline {
     host.appendChild(this.c);
     this.ctx = this.c.getContext('2d')!;
     this.bind();
-    new ResizeObserver(() => this.draw()).observe(this.c);
+    this.ro = new ResizeObserver(() => this.draw());
+    this.ro.observe(this.c);
+  }
+  private ro: ResizeObserver;
+
+  /** The editor is closing: nothing here runs again. */
+  dispose() {
+    this.ro.disconnect();
+    cancelAnimationFrame(this.coast);
+    cancelAnimationFrame(this.raf);
+    clearTimeout(this.hold);
+  }
+
+  /** Stop a flick that's still coasting. */
+  stopCoast() {
+    cancelAnimationFrame(this.coast);
   }
 
   /** Fit the whole project in view (at most a sensible zoom). */
@@ -372,8 +389,9 @@ export class Timeline {
         const i = p.clips.findIndex((c) => c.id === sel.id);
         if (i >= 0) {
           const x0 = this.x(starts[i]), x1 = this.x(starts[i] + clipLen(p.clips[i]));
-          if (Math.abs(x - (x0 - HANDLE / 2)) < HANDLE + 4) return { what: 'trimL' as const, i };
-          if (Math.abs(x - (x1 + HANDLE / 2)) < HANDLE + 4) return { what: 'trimR' as const, i };
+          // the nearer handle (on a short clip both are within reach of one touch)
+          const dl = Math.abs(x - (x0 - HANDLE / 2)), dr = Math.abs(x - (x1 + HANDLE / 2));
+          if (Math.min(dl, dr) < HANDLE + 4) return { what: dl <= dr ? ('trimL' as const) : ('trimR' as const), i };
         }
       }
       for (let i = 0; i < p.clips.length; i++) {
@@ -418,6 +436,8 @@ export class Timeline {
       const hit = this.hit(q.x, q.y);
       if (hit?.what === 'trimL' || hit?.what === 'trimR') {
         const cl = p.clips[hit.i];
+        // (stops a running playback where it is, before the clip changes under it)
+        this.h.scrub(this.h.time());
         this.drag = { kind: hit.what, id: cl.id, x0: q.x, in0: cl.in, out0: cl.out, T0: this.h.time(), start: layout(p).starts[hit.i], lastTick: 0 };
         tick();
         return;
@@ -504,7 +524,7 @@ export class Timeline {
           }
           // keep the right edge where it was: the view follows the left handle
           const shrink = clipLen({ ...cl, in: d.in0, out: d.out0 }) - clipLen(cl);
-          this.h.scrub(Math.max(0, d.T0 - shrink));
+          this.h.setTime(Math.max(0, d.T0 - shrink));
           this.h.peek(d.start);
         } else {
           cl.out = Math.max(cl.in + MIN_CLIP * rate, Math.min(maxOut, d.out0 + ds));
@@ -601,6 +621,6 @@ export class Timeline {
     c.addEventListener('pointercancel', up);
     // a tap here can open a section, which moves the dock; without this the browser's
     // follow-up click lands on whatever button just slid under the finger
-    c.addEventListener('touchend', (e) => e.preventDefault(), { passive: false });
+    c.addEventListener('touchend', (e) => e.cancelable && e.preventDefault(), { passive: false });
   }
 }

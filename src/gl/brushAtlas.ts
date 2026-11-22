@@ -33,6 +33,8 @@ function fingerprint(strokes: Stroke[], n: number) {
  */
 export class BrushAtlas {
   tex: [WebGLTexture, WebGLTexture];
+  /** Goes up every time the pixels change (strokes, an AI selection arriving, a clear): for cache keys. */
+  version = 0;
   private w = 1;
   private h = 1;
   private slots: (Slot | null)[] = new Array(8).fill(null);
@@ -67,6 +69,7 @@ export class BrushAtlas {
     this.h = h;
     this.slots = new Array(8).fill(null);
     this.packed = [new Uint8Array(w * h * 4), new Uint8Array(w * h * 4)];
+    this.version++;
     const gl = this.gl;
     for (const t of this.tex) {
       gl.bindTexture(gl.TEXTURE_2D, t);
@@ -208,6 +211,7 @@ export class BrushAtlas {
 
   /** Copy one slot's alpha into its texture channel for the given rect and upload it. */
   private writeChannel(i: number, ctx: CanvasRenderingContext2D | null, x: number, y: number, w: number, h: number) {
+    this.version++;
     const ti = i < 4 ? 0 : 1;
     const ch = i % 4;
     const buf = this.packed[ti];

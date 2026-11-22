@@ -159,9 +159,14 @@ export class MaskOverlay {
     this.draw();
   }
 
+  /** Drop the drag: the mask goes back to how it was grabbed (nothing is kept). */
   cancel() {
+    const d = this.drag;
     this.drag = null;
     this.svg.classList.remove('active');
+    if (!d) return;
+    this.change(d.start, false);
+    this.draw();
   }
 
   draw() {

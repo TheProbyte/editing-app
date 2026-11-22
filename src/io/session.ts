@@ -9,29 +9,65 @@ interface Saved {
   ts: number;
 }
 
+/** One connection for the whole session (opened on first use, again if the browser closes it). */
+let dbp: Promise<IDBDatabase> | null = null;
 function db(): Promise<IDBDatabase> {
-  return new Promise((res, rej) => {
+  if (dbp) return dbp;
+  const p = new Promise<IDBDatabase>((res, rej) => {
     const r = indexedDB.open('lumen', 1);
     r.onupgradeneeded = () => r.result.createObjectStore('kv');
-    r.onsuccess = () => res(r.result);
+    r.onsuccess = () => {
+      const d = r.result;
+      const drop = () => {
+        if (dbp === p) dbp = null;
+      };
+      d.onclose = drop;
+      d.onversionchange = () => {
+        d.close();
+        drop();
+      };
+      res(d);
+    };
     r.onerror = () => rej(r.error);
   });
+  dbp = p;
+  p.catch(() => {
+    if (dbp === p) dbp = null;
+  });
+  return p;
 }
 
 async function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBRequest<T>): Promise<T> {
   const d = await db();
   return new Promise((res, rej) => {
-    const t = d.transaction('kv', mode);
+    let t: IDBTransaction;
+    try {
+      t = d.transaction('kv', mode);
+    } catch (e) {
+      // the connection went away: open a new one next time
+      dbp = null;
+      rej(e);
+      return;
+    }
     const req = fn(t.objectStore('kv'));
-    req.onsuccess = () => res(req.result);
-    req.onerror = () => rej(req.error);
+    // done only once the transaction commits: a file that doesn't fit (quota) fails there, as an
+    // abort, after its request has already "succeeded"
+    t.oncomplete = () => res(req.result);
+    t.onabort = t.onerror = () => rej(t.error ?? req.error ?? new Error('storage transaction failed'));
   });
 }
+
+// The photo and its edit are kept under separate keys: the edit is saved after every change, and
+// writing it must not write the (large) photo again each time.
+const STATE_KEY = 'session:state';
 
 export async function saveFile(file: File) {
   try {
     const s: Saved = { file, name: file.name, type: file.type, state: '', ts: Date.now() };
-    await tx('readwrite', (st) => st.put(s, 'session'));
+    await tx('readwrite', (st) => {
+      st.put('', STATE_KEY);
+      return st.put(s, 'session');
+    });
   } catch {
     /* storage unavailable (private mode, quota) — autosave is best effort */
   }
@@ -39,11 +75,7 @@ export async function saveFile(file: File) {
 
 export async function saveState(state: string) {
   try {
-    const s = await tx<Saved | undefined>('readonly', (st) => st.get('session'));
-    if (!s) return;
-    s.state = state;
-    s.ts = Date.now();
-    await tx('readwrite', (st) => st.put(s, 'session'));
+    await tx('readwrite', (st) => st.put(state, STATE_KEY));
   } catch {
     /* best effort */
   }
@@ -53,7 +85,9 @@ export async function loadSession(): Promise<{ file: File; state: string } | nul
   try {
     const s = await tx<Saved | undefined>('readonly', (st) => st.get('session'));
     if (!s || !s.file) return null;
-    return { file: new File([s.file], s.name, { type: s.type }), state: s.state };
+    // (an autosave from before the edit had its own key carries it inside the record)
+    const state = await tx<string | undefined>('readonly', (st) => st.get(STATE_KEY));
+    return { file: new File([s.file], s.name, { type: s.type }), state: typeof state === 'string' ? state : s.state ?? '' };
   } catch {
     return null;
   }
@@ -62,6 +96,7 @@ export async function loadSession(): Promise<{ file: File; state: string } | nul
 /** Extra photos used by an edit (double exposure), kept on the device by id. */
 export async function saveBlob(key: string, blob: Blob) {
   try {
+    fresh.add('blob:' + key);
     await tx('readwrite', (st) => st.put(blob, 'blob:' + key));
   } catch {
     /* best effort */
@@ -99,6 +134,35 @@ export interface Recent {
 
 const RECENT_MAX = 8;
 const fileKey = (f: File) => `${f.name}|${f.size}|${f.lastModified}`;
+/** Keys written since the app started: the clean-up below never touches these. */
+const fresh = new Set<string>();
+/** Files that didn't fit on the device: not tried again this session (a video can be gigabytes to copy). */
+const tooBig = new Set<string>();
+/** putRecent calls in flight, and the clean-up while it runs: they wait for each other. */
+let writers = 0;
+let sweeping: Promise<void> | null = null;
+let askedPersist = false;
+
+/** False when the browser says this many bytes clearly won't fit in the app's storage. */
+async function fits(bytes: number) {
+  try {
+    const { quota, usage } = await navigator.storage.estimate();
+    return !quota || bytes < (quota - (usage ?? 0)) * 0.9;
+  } catch {
+    return true;
+  }
+}
+
+/** Ask the browser not to clear the app's storage (projects, downloaded models) when space runs low. */
+function keepStorage() {
+  if (askedPersist) return;
+  askedPersist = true;
+  try {
+    void navigator.storage.persist().catch(() => {});
+  } catch {
+    /* not supported */
+  }
+}
 
 export async function listRecents(): Promise<Recent[]> {
   try {
@@ -110,7 +174,9 @@ export async function listRecents(): Promise<Recent[]> {
 
 /** Remember (or update) a project. `files` = what it's made from (stored if they're new). */
 export async function putRecent(r: Omit<Recent, 'files'>, files: { id: string; file: File }[] | null) {
+  writers++;
   try {
+    if (sweeping) await sweeping;
     const list = await listRecents();
     const old = list.find((x) => x.id === r.id);
     let metas = old?.files ?? [];
@@ -118,18 +184,32 @@ export async function putRecent(r: Omit<Recent, 'files'>, files: { id: string; f
       metas = [];
       for (const { id, file } of files) {
         const key = fileKey(file);
+        // a project is only remembered whole: if a file can't be kept, the list stays as it was
+        if (tooBig.has(key)) throw new Error('no room for ' + file.name);
         const have = await tx<number>('readonly', (st) => st.count('rfile:' + key));
-        if (!have) await tx('readwrite', (st) => st.put(file, 'rfile:' + key));
+        if (!have) {
+          fresh.add('rfile:' + key);
+          try {
+            if (!(await fits(file.size))) throw new Error('no room for ' + file.name);
+            await tx('readwrite', (st) => st.put(file, 'rfile:' + key));
+          } catch (e) {
+            tooBig.add(key);
+            throw e;
+          }
+        }
         metas.push({ id, key, name: file.name, type: file.type });
       }
     }
     const next = [{ ...r, files: metas }, ...list.filter((x) => x.id !== r.id)].slice(0, RECENT_MAX);
     await tx('readwrite', (st) => st.put(next, 'recent:list'));
+    keepStorage();
     // files no project uses any more
     const used = new Set(next.flatMap((x) => x.files.map((f) => f.key)));
     for (const x of [...list, ...(old ? [old] : [])]) for (const f of x.files) if (!used.has(f.key)) await tx('readwrite', (st) => st.delete('rfile:' + f.key));
   } catch (e) {
     console.warn('recent projects: not saved', e);
+  } finally {
+    writers--;
   }
 }
 
@@ -171,4 +251,45 @@ export async function dropRecent(id: string) {
   } catch {
     /* best effort */
   }
+}
+
+/**
+ * Clean-up, once after launch: stored files no recent project lists any more (left behind if the
+ * app was closed mid-save) and double-exposure photos no edit refers to. `liveState` is the edit
+ * on screen (JSON), so what it uses stays. Careful by design: if anything can't be read, or a
+ * project is being saved right now, nothing is deleted.
+ */
+export function sweepStorage(liveState = ''): Promise<void> {
+  if (writers || sweeping) return sweeping ?? Promise.resolve();
+  const p = (async () => {
+    try {
+      const keys = await tx<IDBValidKey[]>('readonly', (st) => st.getAllKeys());
+      const list = (await tx<Recent[] | undefined>('readonly', (st) => st.get('recent:list'))) ?? [];
+      const session = await tx<Saved | undefined>('readonly', (st) => st.get('session'));
+      const state = await tx<string | undefined>('readonly', (st) => st.get(STATE_KEY));
+      if (!Array.isArray(list) || list.some((r) => !r || !Array.isArray(r.files))) return;
+      const used = new Set(list.flatMap((r) => r.files.map((f) => 'rfile:' + f.key)));
+      // every edit that could name a double-exposure photo, as text: an id found anywhere in it counts
+      const edits = [liveState, state, session?.state, ...list.map((r) => r.state)].filter((x) => typeof x === 'string').join('\n');
+      const dead = keys.filter((k): k is string => {
+        if (typeof k !== 'string' || fresh.has(k)) return false;
+        if (k.startsWith('rfile:')) return !used.has(k);
+        if (k.startsWith('blob:ov:')) return !edits.includes(k.slice(8));
+        return false;
+      });
+      if (!dead.length) return;
+      await tx('readwrite', (st) => {
+        let last!: IDBRequest<undefined>;
+        for (const k of dead) last = st.delete(k);
+        return last;
+      });
+    } catch {
+      /* best effort */
+    }
+  })();
+  sweeping = p;
+  void p.then(() => {
+    if (sweeping === p) sweeping = null;
+  });
+  return p;
 }

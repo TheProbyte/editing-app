@@ -15,7 +15,7 @@ interface Globals {
   w: number;
   h: number;
   A: Target;
-  /** Large blurs for texture / clarity / dehaze / diffusion; only made when one of those is in use. */
+  /** Large blurs for texture / clarity / dehaze / diffusion…; each is only made when something that reads it is in use. */
   texB: Target | null;
   clarB: Target | null;
   largeB: Target | null;
@@ -67,6 +67,13 @@ export class Pipeline {
   private black: WebGLTexture;
   /** Brush mask atlas (two RGBA textures = 8 channels), owned by the app. */
   brushTex: [WebGLTexture, WebGLTexture] | null = null;
+  /**
+   * Bumped by the app whenever the pixels of the brush atlas / the layer mask change (BrushAtlas
+   * `version`): an AI selection arrives later than the edit that asked for it, so the edit alone
+   * doesn't say when the cached passes are out of date.
+   */
+  brushVer = 0;
+  overlayMaskVer = 0;
   /** Index of the mask to tint on screen, or -1. */
   showMask = -1;
   /** Highlight clipped highlights/shadows on screen. */
@@ -119,13 +126,20 @@ export class Pipeline {
     const maxRB = Pipeline.lensMaxR(v, S);
     const k = Math.min(1, Math.max(0.2, cap / Math.max(1, maxRB)));
     const ww = Math.max(8, Math.round(B.w * k)), wh = Math.max(8, Math.round(B.h * k));
-    const small = this.resize(B, ww, wh);
-    // the depth at the frame's own size (it decides per pixel what's sharp, in the finish pass)
-    const dF = g.acquire(B.w, B.h);
+    // a small blur is done at full size: no copy needed then
+    const scaled = ww !== B.w || wh !== B.h;
+    const small = scaled ? this.resize(B, ww, wh) : B;
+    // the depth in frame space (it decides per pixel what's sharp, in the finish pass, which
+    // reads it by uv); the depth map itself is no bigger than about 1024 px
+    const dk = Math.min(1, 1024 / Math.max(B.w, B.h));
+    const dw = Math.max(8, Math.round(B.w * dk)), dh = Math.max(8, Math.round(B.h * dk));
+    const dF = g.acquire(dw, dh);
     const bare: EditState = { ...state, spots: [], overlay: null, leak: null, fills: [] };
-    this.geometryPass({ tex: D.tex, w: D.w, h: D.h, linear: true }, bare, { w: B.w, h: B.h }, { x: 0, y: 0, w: B.w, h: B.h }, dF);
+    this.geometryPass({ tex: D.tex, w: D.w, h: D.h, linear: true }, bare, { w: dw, h: dh }, { x: 0, y: 0, w: dw, h: dh }, dF);
     const out = g.acquire(ww, wh);
-    const n = cap > 16 ? 192 : 128;
+    // as many samples as the disc needs: the full count at the largest radius, fewer for a small one
+    const nMax = cap > 16 ? 192 : 128;
+    const n = Math.round(Math.min(nMax, Math.max(32, nMax * ((maxRB * k) / cap) ** 2)));
     g.draw(this.lensP, out, ww, wh, (p) => {
       g.bindTex(p, 'uSrc', small.tex);
       g.bindTex(p, 'uDepth', dF.tex);
@@ -136,7 +150,7 @@ export class Pipeline {
       gl.uniform1f(p.loc('uBokeh'), (v.lensBokeh ?? 35) / 100);
       gl.uniform1i(p.loc('uN'), n);
     });
-    g.release(small);
+    if (scaled) g.release(small);
     return [out, dF] as const;
   }
 
@@ -197,7 +211,7 @@ export class Pipeline {
   private devKey(state: EditState, geoKey: string) {
     const v: Record<string, number> = {};
     for (const k in state.v) if (!FINISH_ONLY.test(k) && !BRUSH_ONLY.test(k)) v[k] = state.v[k];
-    return JSON.stringify([geoKey, v, state.curves, state.masks, this.showMask]);
+    return JSON.stringify([geoKey, v, state.curves, state.masks, this.showMask, this.brushVer]);
   }
 
   private clearSmall() {
@@ -355,7 +369,7 @@ export class Pipeline {
       st && t?.id === st.id ? [st, v[pre + 'Opacity'], v[pre + 'Scale'], v[pre + 'Rot'], v[pre + 'Blend'], v[pre + 'X'], v[pre + 'Y']] : null;
     const ov = [lay(state.overlay, this.overlay, 'dx'), lay(state.leak, this.leak, 'lk')];
     const fill = state.fills?.length && this.fill ? this.fill.key : null;
-    return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, state.spots, ov, fill]);
+    return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, state.spots, ov, fill, this.overlayMaskVer]);
   }
 
   /** The full-frame analysis image and its large blurs, at (w, h). Cached by geometry. */
@@ -377,16 +391,18 @@ export class Pipeline {
   }
 
   private ensureBlurs(glb: Globals, state: EditState) {
-    if (glb.texB) return;
-    const v = state.v;
-    // everything in the develop shader that reads the blurred copies (see yTex / yClar / yLarge there)
-    const need = v.texture !== 0 || v.clarity !== 0 || v.dehaze !== 0 || v.diffuse > 0 || v.shadows !== 0 || v.highlights !== 0 ||
-      v.colorDenoise > 0 || v.sharpenMask > 0 || (state.masks ?? []).length > 0;
-    if (!need && !this.forceBlurs) return;
+    const v = state.v, masks = state.masks ?? [], all = this.forceBlurs;
+    // each blurred copy is made only when something that reads it in the develop shader is in use:
+    //  uTexB (pTex / yTex): texture, color noise, sharpen masking
+    //  uClarB (yClar, diffusion's soft copy): clarity, diffusion, a mask's clarity
+    //  uLargeB (pLarge / yLarge): dehaze, shadows / highlights, a mask's dehaze
+    const tex = v.texture !== 0 || v.colorDenoise > 0 || v.sharpenMask > 0;
+    const clar = v.clarity !== 0 || v.diffuse > 0 || masks.some((m) => !!m.a?.clarity);
+    const large = v.dehaze !== 0 || v.shadows !== 0 || v.highlights !== 0 || masks.some((m) => !!m.a?.dehaze);
     const S = Math.min(glb.w, glb.h);
-    glb.texB = this.blur(glb.A, S * 0.004);
-    glb.clarB = this.blur(glb.A, S * 0.02);
-    glb.largeB = this.blur(glb.A, S * 0.06);
+    if (!glb.texB && (tex || all)) glb.texB = this.blur(glb.A, S * 0.004);
+    if (!glb.clarB && (clar || all)) glb.clarB = this.blur(glb.A, S * 0.02);
+    if (!glb.largeB && (large || all)) glb.largeB = this.blur(glb.A, S * 0.06);
   }
 
   private releaseFx(fx: ReturnType<Pipeline['effects']>) {
@@ -421,6 +437,13 @@ export class Pipeline {
         const k = name + sigma.toFixed(3);
         let t = this.smallCache.get(k);
         if (!t) {
+          // one blur per kind: dragging the sharpen radius asks for a new sigma every frame, and
+          // the earlier ones would otherwise all stay until the geometry changes
+          for (const [old, ot] of this.smallCache) {
+            if (old[0] !== name) continue;
+            this.g.release(ot);
+            this.smallCache.delete(old);
+          }
           t = this.blur(A, sigma);
           this.smallCache.set(k, t);
         }
@@ -458,7 +481,7 @@ export class Pipeline {
       this.g.bindTex(p, 'uA', A.tex);
       this.g.bindTex(p, 'uSharpB', small.sharp.tex);
       this.g.bindTex(p, 'uNoiseB', small.noise.tex);
-      // unused (and not computed) while texture / clarity / dehaze / diffusion are off
+      // each is unused (and not computed) while the settings that read it are off (see ensureBlurs)
       this.g.bindTex(p, 'uTexB', (glb.texB ?? A).tex);
       this.g.bindTex(p, 'uClarB', (glb.clarB ?? A).tex);
       this.g.bindTex(p, 'uLargeB', (glb.largeB ?? A).tex);
@@ -514,6 +537,9 @@ export class Pipeline {
     const v = state.v;
     const S = Math.min(B.w, B.h);
     const slot = (name: string, key: string | null, build: () => readonly [Target | null, Target | null]) => {
+      // off (no key) means off for an uncached render too: an export must not build a blur the
+      // preview doesn't show, or a lens blur without its depth map
+      if (key === null && !devKey) return [null, null] as const;
       if (!devKey) return build();
       const old = this.fxCache.get(name);
       if (key === null) {
@@ -769,17 +795,24 @@ export class Pipeline {
   /** Full-resolution pixels for a region of the output (used for pixel-level zoom). */
   renderRegion(full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number, r: Tile) {
     const P = this.prepareGlobal(full, analysisSrc, state, outW, outH);
-    const px = this.renderTile(full, state, outW, outH, r, P);
-    this.releaseGlobal(P);
-    return px;
+    try {
+      return this.renderTile(full, state, outW, outH, r, P);
+    } finally {
+      this.releaseGlobal(P);
+      // a region can be several megapixels, and the next one is rarely the same size
+      this.g.trim(2048 * 2048);
+    }
   }
 
   /** Several small regions of the output at full quality (for estimating the file size). */
   renderSamples(full: Source, analysisSrc: Source, state: EditState, outW: number, outH: number, rs: Tile[]) {
     const P = this.prepareGlobal(full, analysisSrc, state, outW, outH);
-    const out = rs.map((r) => this.renderTile(full, state, outW, outH, r, P));
-    this.releaseGlobal(P);
-    return out;
+    try {
+      return rs.map((r) => this.renderTile(full, state, outW, outH, r, P));
+    } finally {
+      this.releaseGlobal(P);
+      this.g.trim(2048 * 2048);
+    }
   }
 
   /**
@@ -794,30 +827,49 @@ export class Pipeline {
     align = 1,
   ) {
     const g = this.g;
+    // errors left over from before the export don't count against it
+    this.gpuFailed();
     const P = this.prepareGlobal(full, analysisSrc, state, outW, outH);
-    const S = Math.min(outW, outH);
-    const pad = Math.ceil(S * 0.012) + 8;
-    const T = Math.floor(Math.min(2048, g.maxTex - pad * 2) / align) * align;
-    const tilesX = Math.ceil(outW / T);
-    const tilesY = Math.ceil(outH / T);
-    let done = 0;
-    for (let ty = 0; ty < tilesY; ty++) {
-      const y = ty * T;
-      const h = Math.min(T, outH - y);
-      const strip = new Uint8Array(outW * h * 4);
-      for (let tx = 0; tx < tilesX; tx++) {
-        const x = tx * T;
-        const w = Math.min(T, outW - x);
-        const px = this.renderTile(full, state, outW, outH, { x, y, w, h }, P);
-        for (let r = 0; r < h; r++) strip.set(px.subarray(r * w * 4, (r + 1) * w * 4), (r * outW + x) * 4);
-        done++;
-        progress(done / (tilesX * tilesY));
-        await new Promise((r) => setTimeout(r, 0));
+    try {
+      const S = Math.min(outW, outH);
+      const pad = Math.ceil(S * 0.012) + 8;
+      const T = Math.floor(Math.min(2048, g.maxTex - pad * 2) / align) * align;
+      const tilesX = Math.ceil(outW / T);
+      const tilesY = Math.ceil(outH / T);
+      let done = 0;
+      for (let ty = 0; ty < tilesY; ty++) {
+        const y = ty * T;
+        const h = Math.min(T, outH - y);
+        const strip = new Uint8Array(outW * h * 4);
+        for (let tx = 0; tx < tilesX; tx++) {
+          const x = tx * T;
+          const w = Math.min(T, outW - x);
+          const px = this.renderTile(full, state, outW, outH, { x, y, w, h }, P);
+          // a lost context or a failed allocation reads back as black: stop rather than save that
+          if (this.gpuFailed()) throw new Error('The GPU ran out of memory — try a smaller size');
+          for (let r = 0; r < h; r++) strip.set(px.subarray(r * w * 4, (r + 1) * w * 4), (r * outW + x) * 4);
+          done++;
+          progress(done / (tilesX * tilesY));
+          await new Promise((r) => setTimeout(r, 0));
+        }
+        await onStrip(strip, y, h);
       }
-      await onStrip(strip, y, h);
+    } finally {
+      this.releaseGlobal(P);
+      g.trim(2048 * 2048);
     }
-    this.releaseGlobal(P);
-    g.trim(2048 * 2048);
+  }
+
+  /** True if the GPU gave up since the last call: context lost, out of memory, or a target it couldn't make. */
+  private gpuFailed() {
+    const gl = this.g.gl;
+    let bad = gl.isContextLost();
+    for (let i = 0; i < 8; i++) {
+      const e = gl.getError();
+      if (e === gl.NO_ERROR) break;
+      if (e === gl.OUT_OF_MEMORY || e === gl.CONTEXT_LOST_WEBGL || e === gl.INVALID_FRAMEBUFFER_OPERATION) bad = true;
+    }
+    return bad;
   }
 }
 

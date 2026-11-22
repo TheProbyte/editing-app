@@ -64,7 +64,12 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Export:** 720p / 1080p / 1440p / 4K (up to the source), 24 / 30 / 60 fps, MP4 with the phone's hardware
   encoder (H.264 where available, else HEVC / VP9 / AV1) and AAC or Opus sound (the same mix the preview
   plays); saved to Movies/Lumen in the Android app. Each frame goes through the same GPU pipeline as the
-  preview, at full size.
+  preview, at full size. The screen stays on while it exports, photos in the timeline are read at the
+  export's size (the preview keeps smaller copies), and the last size / frame rate / quality you chose
+  for that kind of footage is remembered.
+- **Sound that doesn't crackle:** the mix passes through a limiter that does nothing below full level
+  and turns the level down smoothly around moments that would go over (a loud clip plus music, a clip
+  at 200%).
 - Undo, redo and the history list cover timeline edits too.
 - Built on **Mediabunny** (demuxing, frame-exact decoding and MP4 muxing through WebCodecs), loaded only
   when a video is opened. Video projects aren't autosaved yet.
@@ -127,7 +132,11 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Crop & rotate:** free or fixed aspect ratios, straighten, rotate 90°, flip.
 - Undo/redo with a history list (tap any step to jump there), histogram, copy/paste edits, **full-resolution export** (JPEG/PNG, tiled rendering
   plus a streaming JPEG encoder, so even 40+ MP files export on a phone), saves straight to the phone on Android (Downloads), Share sheet on iPhone.
-- Works offline once loaded, and autosaves — reopen the app and tap **Continue editing**.
+- Works offline once loaded (the whole app, video editor included, is saved ahead; the big decoders
+  and AI runtimes are kept from first use and survive app updates, as do downloaded models), and
+  autosaves — reopen the app and pick up from **Recent**.
+- A file that can't be read never costs you what's open, and after the GPU hiccups (context loss) the
+  photo or video comes back as it was.
 - Clipping warnings, per-tool Reset, zoom badge (tap to fit).
 - Pixel look: Pixelify Sans + Silkscreen type, hand-drawn pixel icons, yellow on near-black.
 
@@ -177,7 +186,8 @@ Code map:
 - `src/io/` — file loading (incl. RAW), export, and the JPEG / PNG encoders that split an export
   into bands of rows and encode them on every core while the GPU is still rendering.
 - `public/sw.js` — offline cache + the cross-origin isolation headers the multi-threaded RAW
-  decoder needs on static hosts like GitHub Pages.
+  decoder needs on static hosts like GitHub Pages. `scripts/stamp-sw.mjs` (run by `npm run build`)
+  tells it which files make up the build.
 
 ## Credits and licences
 

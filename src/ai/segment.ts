@@ -82,8 +82,16 @@ export async function fetchModel(url: string, progress: (f: number) => void): Pr
     if (total) progress(got / total);
   }
   const out = got === buf.length ? buf : buf.subarray(0, got);
+  // a model that ships with the app is already on the device (the app's own offline cache, or
+  // the installed app): a second copy here would only take space
+  let own = false;
   try {
-    await cache?.put(url, new Response(out, { headers: { 'content-type': 'application/octet-stream' } }));
+    own = new URL(url, location.href).origin === location.origin;
+  } catch {
+    /* not a URL we can judge: keep it */
+  }
+  try {
+    if (!own) await cache?.put(url, new Response(out, { headers: { 'content-type': 'application/octet-stream' } }));
   } catch {
     /* storage full: fine, we just download again next time */
   }

@@ -68,7 +68,9 @@ export function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
   });
 }
 
-export async function fetchModel(url: string, progress: (f: number) => void, signal?: AbortSignal): Promise<Uint8Array> {
+/** `keep`: keep it in the models cache even when it comes from the app's own site (a model the app
+ * doesn't ship inside it, like the captions model, which is fetched from the site on first use). */
+export async function fetchModel(url: string, progress: (f: number) => void, signal?: AbortSignal, keep = false): Promise<Uint8Array> {
   if (signal?.aborted) throw abortError();
   let cache: Cache | null = null;
   try {
@@ -121,7 +123,7 @@ export async function fetchModel(url: string, progress: (f: number) => void, sig
     /* not a URL we can judge: keep it */
   }
   try {
-    if (!own) await cache?.put(url, new Response(out, { headers: { 'content-type': 'application/octet-stream' } }));
+    if (!own || keep) await cache?.put(url, new Response(out, { headers: { 'content-type': 'application/octet-stream' } }));
   } catch {
     /* storage full: fine, we just download again next time */
   }

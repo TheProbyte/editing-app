@@ -149,6 +149,8 @@ self.addEventListener('fetch', (e) => {
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
   if (url.pathname.endsWith('.apk')) return; // let Chrome download the app directly
+  // the captions model: fetched once by the app, which keeps it with its other models
+  if (url.pathname.includes('/asr/')) return;
   if (req.cache === 'only-if-cached' && req.mode !== 'same-origin') return;
   e.waitUntil(ensureShell());
   e.respondWith((async () => {

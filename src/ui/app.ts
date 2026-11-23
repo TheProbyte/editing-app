@@ -10,6 +10,7 @@ import { LOOKS, Look, ImgStats, measure } from '../presets';
 import { addCube, cubeList, loadCubes, removeCube } from '../io/cubes';
 import { photoDate } from '../io/photoDate';
 import { Enhancer, enhanceFits, type EnhanceMode } from '../ai/enhance';
+import { Captioner } from '../ai/captions';
 import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
 import { encodeJpegBand } from '../io/jpegEncoder';
@@ -140,6 +141,8 @@ export class App {
   private neural = new NeuralFill();
   private depthEst = new DepthEstimator();
   private enhancer = new Enhancer();
+  /** auto captions (video) */
+  captions = new Captioner();
   /** the photo as it was before AI denoise / upscale replaced its pixels (to go back) */
   private aiOriginal: File | null = null;
   private depthJob: { key: string; p: Promise<void> } | null = null;

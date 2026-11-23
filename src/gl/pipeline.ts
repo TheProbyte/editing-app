@@ -220,7 +220,7 @@ export class Pipeline {
 
   /** Forget cached blurs (call when the source image changes). */
   /** Per-frame film state for video: grain seed (changes per film frame) and flicker. */
-  filmFrame = { seed: 1337, dust: 7331, flicker: 0 };
+  filmFrame: { seed: number; dust: number; flicker: number; /** the video's time (s), for what moves smoothly */ t?: number } = { seed: 1337, dust: 7331, flicker: 0 };
 
   invalidate() {
     if (this.globals) {
@@ -361,12 +361,22 @@ export class Pipeline {
         on[i] = ok ? 1 : 0;
         this.g.bindTex(p, i ? 'uLy1' : 'uLy0', ok ? L.tex!.tex : this.black);
         if (!ok) return;
+        // a moving leak (video): slow drifts, a turn, a swell and the light breathing, from
+        // waves at unrelated rates so it never visibly repeats
+        const m = i === 1 && this.filmFrame.t !== undefined ? (v.lkMotion || 0) / 100 : 0, t = this.filmFrame.t ?? 0;
+        const mv = m ? {
+          x: m * 0.14 * (Math.sin(t * 0.37) + 0.5 * Math.sin(t * 0.91 + 1.3)),
+          y: m * 0.09 * Math.sin(t * 0.53 + 0.7),
+          rot: m * 0.16 * Math.sin(t * 0.29 + 2.0),
+          s: 1 + m * 0.12 * Math.sin(t * 0.23 + 0.4),
+          a: 1 - m * 0.5 * (0.5 + 0.5 * Math.sin(t * 1.3 + 1.5 * Math.sin(t * 0.47))),
+        } : { x: 0, y: 0, rot: 0, s: 1, a: 1 };
         // at 100% the layer just covers the frame
-        const k = Math.max(f.w / L.st!.aspect, f.h) * (v[L.pre + 'Scale'] / 100);
-        LC.set([v[L.pre + 'X'], v[L.pre + 'Y']], i * 2);
+        const k = Math.max(f.w / L.st!.aspect, f.h) * (v[L.pre + 'Scale'] / 100) * mv.s;
+        LC.set([v[L.pre + 'X'] + mv.x, v[L.pre + 'Y'] + mv.y], i * 2);
         LH.set([(L.st!.aspect * k) / 2, k / 2], i * 2);
-        rot[i] = (v[L.pre + 'Rot'] * Math.PI) / 180;
-        op[i] = v[L.pre + 'Opacity'] / 100;
+        rot[i] = (v[L.pre + 'Rot'] * Math.PI) / 180 + mv.rot;
+        op[i] = (v[L.pre + 'Opacity'] / 100) * mv.a;
         bl[i] = Math.round(v[L.pre + 'Blend']);
         const has = !!((L.st!.strokes.length || L.st!.person) && this.overlayMask);
         maskOn[i] = L.st!.invert ? (has ? 2 : -1) : has ? 1 : 0;
@@ -404,6 +414,8 @@ export class Pipeline {
     const lay = (st: EditState['overlay'], t: { id: string } | null, pre: string) =>
       st && t?.id === st.id ? [st, v[pre + 'Opacity'], v[pre + 'Scale'], v[pre + 'Rot'], v[pre + 'Blend'], v[pre + 'X'], v[pre + 'Y']] : null;
     const ov = [lay(state.overlay, this.overlay, 'dx'), lay(state.leak, this.leak, 'lk')];
+    // a moving leak is somewhere else at every moment
+    if (ov[1] && v.lkMotion > 0 && this.filmFrame.t !== undefined) ov.push([v.lkMotion, this.filmFrame.t]);
     const fill = state.fills?.length && this.fill ? this.fill.key : null;
     return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, v.perspV, v.perspH, state.spots, ov, fill, this.overlayMaskVer]);
   }

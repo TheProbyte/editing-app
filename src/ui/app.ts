@@ -619,7 +619,7 @@ export class App {
     this.pipe.showMask = this.kind() === 'masks' && (this.maskOverlayOn || this.maskInteracting || aiMode) ? this.maskSel : -1;
     try {
       // a video with nothing applied skips the whole pipeline: one copy to the screen
-      if (this.video) this.pipe.filmFrame = this.video.film(this.video.player.time, st.v);
+      if (this.video) this.pipe.filmFrame = { ...this.video.film(this.video.player.time, st.v), t: this.video.player.time };
       if (this.video && this.isNeutral(st)) this.video.blitFrame(w, h);
       else this.pipe.render(this.img.preview, st, w, h, null);
       this.video?.afterRender(w, h);
@@ -1783,7 +1783,7 @@ export class App {
 
   private toolList(): ToolDef[] {
     if (!this.video) return TOOLS;
-    return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t.id === 'blur' ? { ...t, subs: t.subs?.filter((x) => x.id !== '3') } : t))];
+    return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t.id === 'blur' ? { ...t, subs: t.subs?.filter((x) => x.id !== '3') } : t.id === 'leak' ? { ...t, params: (s: string) => [...t.params(s), 'lkMotion'] } : t))];
   }
 
   pickPhoto() {

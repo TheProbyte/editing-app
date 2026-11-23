@@ -141,6 +141,8 @@ export const PARAMS: ParamDef[] = [
   p('lkScale', 'Size', 10, 300, 100, { fmt: (v) => Math.round(v) + '%' }),
   p('lkRot', 'Rotate', -180, 180, 0, { fmt: (v) => Math.round(v) + '°' }),
   p('lkBlend', 'Blend', 0, 8, 2, { fmt: (v) => BLEND_MODES[Math.round(v)] }),
+  // video: the leak drifts, turns and breathes over time
+  p('lkMotion', 'Motion', 0, 100, 0),
   p('lkBrush', 'Brush size', 1, 100, 30),
   p('lkHard', 'Hardness', 0, 100, 35),
   p('lkX', 'Position X', 0, 1, 0.5),

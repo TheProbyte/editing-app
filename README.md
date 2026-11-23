@@ -54,6 +54,19 @@ from the photo editor applies to the whole video; the timeline sits above the to
   (picture and sound), and again to go back. Frame-step buttons beside play; drags snap to cuts and
   keyframes; titles stay with the moment of their clip.
 - **Light leaks that move:** Leaks in a video get **Motion** (drift, turn, breathing light).
+- **Transitions:** tap the marker on a cut: Crossfade, Black, White, Zoom, Whip, Burn, 0.2–2 s (the clips
+  overlap; the sound crossfades too); Preview, All cuts, Remove.
+- **Fades:** Edit → Fade: picture from / to black and the sound in / out, per clip.
+- **Voiceover:** Voice → record (3-2-1, then the video plays while you talk); each take is a clip on its own
+  lane you can move, trim, set the volume of or delete. The music ducks under the voice.
+- **Captions:** Text → Captions listens to the clips (on the phone, Whisper tiny; a one-time 44 MB download)
+  and adds titles at the right moments; run it again to redo them, edit any like a title.
+- **Beats:** the song's beats show on the music lane and drags snap to them; Music → **Cut to beat** trims
+  the clips so every cut lands on a beat (every 1, 2 or 4).
+- **Cine motion:** Frame → Motion holds the picture at 18 / 12 / 8 fps for a film-camera feel (the sound
+  stays as it is).
+- **Person:** the AI follows the people through the video: brighten or color them, darken or grey the
+  background (Spotlight, Color pop, Bright subject).
 - **Film grain that moves:** in Grain, video adds **Motion** (Still / 12 fps / 24 fps / every frame),
   **Flicker**, **Gate weave** (the picture drifting in the projector gate) and **Dust & scratches**, plus
   **8mm / 16mm / 35mm / Clean** presets. Everything is keyed to the film frame, so the export matches the

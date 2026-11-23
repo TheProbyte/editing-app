@@ -1,7 +1,7 @@
 {
   "name": "Lumen Photo Editor",
   "short_name": "Lumen",
-  "description": "Photo editor for your phone \u2014 RAW, masks, blur, film grain, halation, curves and color.",
+  "description": "Photo and video editor for your phone — RAW, masks, lens blur, film grain, halation, curves, color and a timeline.",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",
@@ -49,6 +49,14 @@
           ".raf",
           ".orf",
           ".rw2"
+        ],
+        "video/*": [
+          ".mp4",
+          ".mov",
+          ".m4v",
+          ".webm",
+          ".mkv",
+          ".3gp"
         ]
       }
     }
@@ -56,5 +64,25 @@
   "display_override": [
     "fullscreen",
     "standalone"
-  ]
+  ],
+  "share_target": {
+    "action": "./share-target",
+    "method": "POST",
+    "enctype": "multipart/form-data",
+    "params": {
+      "files": [
+        {
+          "name": "media",
+          "accept": [
+            "image/*",
+            "video/*",
+            ".dng",
+            ".mov",
+            ".mp4",
+            ".webm"
+          ]
+        }
+      ]
+    }
+  }
 }

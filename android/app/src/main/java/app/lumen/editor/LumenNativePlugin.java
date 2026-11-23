@@ -23,10 +23,16 @@ import com.getcapacitor.PluginCall;
 import com.getcapacitor.PluginMethod;
 import com.getcapacitor.annotation.ActivityCallback;
 import com.getcapacitor.annotation.CapacitorPlugin;
+import android.database.Cursor;
+import android.provider.OpenableColumns;
+import com.getcapacitor.JSArray;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.ArrayList;
+import java.util.List;
 
 /** Native bits for Lumen: haptic ticks, gallery saves, RAW capture and a DNG decoder fallback. */
 @CapacitorPlugin(name = "LumenNative")
@@ -35,6 +41,89 @@ public class LumenNativePlugin extends Plugin {
     private OutputStream out;
     private Uri pendingUri;
     private File pendingFile;
+
+    // ---------------------------------------------------------------- shared to the app
+
+    /** What another app handed over (Share, Open with, Edit), until the page takes it. */
+    private static final List<Uri> shared = new ArrayList<>();
+    private static LumenNativePlugin live;
+
+    @Override
+    public void load() {
+        live = this;
+    }
+
+    /** Called by the activity with each intent it gets: keeps the photos / videos it carries. */
+    static void offer(Activity a, Intent intent) {
+        if (intent == null || intent.getAction() == null) return;
+        List<Uri> uris = new ArrayList<>();
+        String act = intent.getAction();
+        if (Intent.ACTION_SEND.equals(act)) {
+            Uri u = intent.getParcelableExtra(Intent.EXTRA_STREAM);
+            if (u != null) uris.add(u);
+        } else if (Intent.ACTION_SEND_MULTIPLE.equals(act)) {
+            ArrayList<Uri> list = intent.getParcelableArrayListExtra(Intent.EXTRA_STREAM);
+            if (list != null) uris.addAll(list);
+        } else if (Intent.ACTION_VIEW.equals(act) || Intent.ACTION_EDIT.equals(act)) {
+            if (intent.getData() != null) uris.add(intent.getData());
+        }
+        if (uris.isEmpty()) return;
+        synchronized (shared) {
+            shared.clear();
+            shared.addAll(uris);
+        }
+        // (consumed: rotating or coming back to the app doesn't open them again)
+        intent.setAction(Intent.ACTION_MAIN);
+        if (live != null) live.notifyListeners("shared", new JSObject(), true);
+    }
+
+    /**
+     * The shared files, copied into the app's cache (a gallery item is only readable through
+     * Android, not as a path): [{ path, name, mime }]. Copies from earlier shares are removed.
+     */
+    @PluginMethod
+    public void takeShared(PluginCall call) {
+        List<Uri> uris;
+        synchronized (shared) {
+            uris = new ArrayList<>(shared);
+            shared.clear();
+        }
+        new Thread(() -> {
+            File dir = new File(getContext().getCacheDir(), "shared");
+            File[] old = dir.listFiles();
+            if (old != null) for (File f : old) //noinspection ResultOfMethodCallIgnored
+                f.delete();
+            //noinspection ResultOfMethodCallIgnored
+            dir.mkdirs();
+            JSArray out = new JSArray();
+            ContentResolver cr = getContext().getContentResolver();
+            int n = 0;
+            for (Uri u : uris) {
+                String name = "shared_" + (n++);
+                try (Cursor c = cr.query(u, new String[] { OpenableColumns.DISPLAY_NAME }, null, null, null)) {
+                    if (c != null && c.moveToFirst() && c.getString(0) != null) name = c.getString(0);
+                } catch (Exception ignored) {}
+                String mime = cr.getType(u);
+                File f = new File(dir, n + "_" + name.replaceAll("[\\\\/:*?\"<>|]", "_"));
+                try (InputStream in = cr.openInputStream(u); FileOutputStream os = new FileOutputStream(f)) {
+                    if (in == null) continue;
+                    byte[] buf = new byte[1 << 16];
+                    int r;
+                    while ((r = in.read(buf)) > 0) os.write(buf, 0, r);
+                } catch (Exception e) {
+                    continue;
+                }
+                JSObject o = new JSObject();
+                o.put("path", f.getAbsolutePath());
+                o.put("name", name);
+                o.put("mime", mime != null ? mime : "");
+                out.put(o);
+            }
+            JSObject r = new JSObject();
+            r.put("files", out);
+            call.resolve(r);
+        }).start();
+    }
 
     // ---------------------------------------------------------------- haptics
 

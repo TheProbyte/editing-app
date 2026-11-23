@@ -4,7 +4,7 @@
 // thin lanes underneath.
 import { tick } from '../ui/haptics';
 import type { MediaLib } from './media';
-import { clipLen, layout, localAt, MIN_CLIP, fmtTime, speedAt, srcAt, type VClip, type VideoProject } from './project';
+import { anchorAt, clipLen, layout, localAt, MIN_CLIP, fmtTime, speedAt, srcAt, type VClip, type VideoProject } from './project';
 
 export type Sel = { kind: 'clip' | 'text' | 'music'; id: string } | null;
 
@@ -38,6 +38,8 @@ function peakIn(P: Float32Array, s0: number, s1: number) {
 const RULER = 16, CLIP_Y = 18, CLIP_H = 50, LANE_H = 11, TEXT_Y = CLIP_Y + CLIP_H + 5, MUSIC_Y = TEXT_Y + LANE_H + 4;
 export const TIMELINE_H = MUSIC_Y + LANE_H + 4;
 const HANDLE = 12;
+/** how close (px) something has to be to catch on a cut or keyframe */
+const SNAP_PX = 7;
 const ACCENT = '#ffc83d';
 
 type Drag =
@@ -75,6 +77,35 @@ export class Timeline {
     cancelAnimationFrame(this.coast);
     cancelAnimationFrame(this.raf);
     clearTimeout(this.hold);
+  }
+
+  private snapped: number | null = null;
+
+  /**
+   * T pulled onto the nearest cut, keyframe, title edge (or the playhead, for things other than
+   * the playhead itself) within a few pixels; a tick when it catches.
+   */
+  snap(T: number, p: VideoProject, skipText: string | null, playhead = false) {
+    const { starts, total } = layout(p);
+    const pts = [0, total, ...starts];
+    p.clips.forEach((c, i) => {
+      for (const k of c.kf ?? []) pts.push(starts[i] + localAt(c, k.s));
+      for (const k of c.look?.kf ?? []) pts.push(starts[i] + localAt(c, k.s));
+    });
+    for (const t of p.texts) if (t.id !== skipText) pts.push(t.t0, t.t1);
+    if (!playhead) pts.push(this.h.time());
+    const reach = SNAP_PX / this.pps;
+    let best: number | null = null;
+    for (const x of pts) if (Math.abs(x - T) < reach && (best === null || Math.abs(x - T) < Math.abs(best - T))) best = x;
+    if (best !== null && best !== this.snapped) tick();
+    this.snapped = best;
+    return best ?? T;
+  }
+
+  /** The title being dragged right now, if any (it isn't put back on its shot meanwhile). */
+  draggingText() {
+    const d = this.drag;
+    return d && (d.kind === 'textMove' || d.kind === 'textL' || d.kind === 'textR') ? d.id : undefined;
   }
 
   /** Stop a flick that's still coasting. */
@@ -494,7 +525,9 @@ export class Timeline {
         d.vx = 0.7 * d.vx + 0.3 * ((q.x - d.lastX) / dt);
         d.lastX = q.x;
         d.lastT = e.timeStamp;
-        this.h.scrub(Math.max(0, Math.min(total, d.T0 - (q.x - d.x0) / this.pps)));
+        const T = Math.max(0, Math.min(total, d.T0 - (q.x - d.x0) / this.pps));
+        // a slow drag catches on cuts and keyframes (a quick one runs straight past)
+        this.h.scrub(Math.abs(d.vx) < 0.5 ? this.snap(T, p, null, true) : T);
         return;
       }
       if (d.kind === 'reorder') {
@@ -544,12 +577,17 @@ export class Timeline {
         if (!tx) return;
         const dt = (q.x - d.x0) / this.pps;
         const total = Math.max(0.5, layout(p).total);
+        // the edge being moved catches on cuts, keyframes, other titles and the playhead
         if (d.kind === 'textMove') {
           const len = d.t10 - d.t00;
-          tx.t0 = Math.max(0, Math.min(total - len, d.t00 + dt));
+          let t0 = this.snap(Math.max(0, Math.min(total - len, d.t00 + dt)), p, tx.id);
+          const t1 = this.snap(t0 + len, p, tx.id);
+          if (t1 !== t0 + len && t0 === Math.max(0, Math.min(total - len, d.t00 + dt))) t0 = t1 - len;
+          tx.t0 = Math.max(0, t0);
           tx.t1 = tx.t0 + len;
-        } else if (d.kind === 'textL') tx.t0 = Math.max(0, Math.min(tx.t1 - 0.3, d.t00 + dt));
-        else tx.t1 = Math.min(total, Math.max(tx.t0 + 0.3, d.t10 + dt));
+        } else if (d.kind === 'textL') tx.t0 = Math.max(0, Math.min(tx.t1 - 0.3, this.snap(d.t00 + dt, p, tx.id)));
+        else tx.t1 = Math.min(total, Math.max(tx.t0 + 0.3, this.snap(d.t10 + dt, p, tx.id)));
+        tx.anchor = anchorAt(p, tx.t0);
         this.h.changed(false);
         this.draw();
       }

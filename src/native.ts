@@ -8,6 +8,9 @@ interface LumenNativePlugin {
   writeChunk(o: { data: string }): Promise<void>;
   writeFinish(): Promise<{ path?: string; uri?: string }>;
   decodeFile(o: { path: string }): Promise<{ path: string; width: number; height: number }>;
+  /** photos / videos another app shared to Lumen (copied into the app's cache) */
+  takeShared(): Promise<{ files: { path: string; name: string; mime: string }[] }>;
+  addListener(event: 'shared', fn: () => void): Promise<{ remove(): Promise<void> }>;
 }
 
 export const isNative = Capacitor.isNativePlatform();

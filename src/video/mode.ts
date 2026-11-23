@@ -15,12 +15,13 @@ import { Timeline, TIMELINE_H, type Sel } from './timeline';
 import { exportVideo } from './exporter';
 import { AudioEngine } from './audio';
 import {
-  IMAGE_SECONDS, MIN_CLIP, clipAt, clipLen, fmtTime, frameAspect, frameSize, layout, localAt, newProject, srcAt, subRamp, uid,
-  framingAt, GRADIENTS, BG_COLORS, NO_FRAMING, RAMPS, RAMP_CUSTOM, type Framing,
+  IMAGE_SECONDS, MIN_CLIP, clipAt, clipLen, fmtTime, frameAspect, frameSize, layout, localAt, newProject, speedAt, srcAt, subRamp, uid,
+  framingAt, GRADIENTS, BG_COLORS, NO_FRAMING, RAMPS, RAMP_CUSTOM, anchorAt, followAnchors, flipClip, type Framing,
   type VAspect, type VClip, type VText, type VideoProject,
 } from './project';
 import type { VideoSample } from 'mediabunny';
 import { RampEditor } from './rampEditor';
+import { REVERSE_MAX } from './reverse';
 import { effectiveLook, lookKeyAt, lookValues, newLook, sameValues, unscopeState, upsertKey } from './looks';
 
 export interface VideoHost {
@@ -163,6 +164,25 @@ export class VideoMode {
       tick();
       this.togglePlay();
     };
+    // one frame back / forward (hold to keep going)
+    for (const [id, dir, icon] of [['tlPrev', -1, ICONS.stepBack], ['tlNext', 1, ICONS.stepFwd]] as const) {
+      const b = $(id);
+      b.innerHTML = icon;
+      let rep = 0;
+      const stop = () => clearTimeout(rep);
+      b.onpointerdown = (e) => {
+        e.preventDefault();
+        b.setPointerCapture(e.pointerId);
+        let n = 0;
+        const go = () => {
+          if (this.dead) return;
+          this.stepFrame(dir);
+          rep = window.setTimeout(go, n++ ? 70 : 380);
+        };
+        go();
+      };
+      b.onpointerup = b.onpointercancel = b.onlostpointercapture = stop;
+    }
     $('tlAdd').onclick = () => {
       tick();
       this.pickMedia();
@@ -446,11 +466,15 @@ export class VideoMode {
     return { tex: r.tex, w: r.w, h: r.h, rot, flip: false };
   }
 
+  /** frames put on screen (for the performance readout) */
+  framesShown = 0;
+
   private showFrame(f: Frame) {
     if (this.exporting || this.dead) {
       f.sample?.close();
       return;
     }
+    this.framesShown++;
     if (!this.frameT) this.ensureFrame();
     // (frames shown while a finger moves skip the extra smoothing a big source gets; the exact
     // frame that follows has it)
@@ -641,6 +665,25 @@ export class VideoMode {
   // -----------------------------------------------------------------------------------
   // playback
 
+  /** Move the playhead one frame of the clip under it (as it plays: its own frame rate and speed). */
+  stepFrame(dir: number) {
+    const p = this.project;
+    if (!p.clips.length) return;
+    if (this.player.playing) this.togglePlay();
+    const T = this.player.time, total = layout(p).total;
+    const c = this.playClip();
+    const m = c && this.lib.get(c.src);
+    const fps = m?.kind === 'video' ? m.fps || 30 : this.ex.fps || 30;
+    // one source frame, as long as it lasts on the timeline at the speed there
+    const dt = c && m?.kind === 'video' ? 1 / fps / Math.max(0.05, speedAt(c, this.sNow(c))) : 1 / fps;
+    const to = Math.max(0, Math.min(total - 1e-3, T + dir * dt));
+    if (to === T) return;
+    tick();
+    this.player.seek(to);
+    this.syncPlayButton();
+    this.onTime();
+  }
+
   togglePlay() {
     if (this.player.playing) {
       this.player.pause();
@@ -741,6 +784,8 @@ export class VideoMode {
   }
 
   private changed(commit: boolean) {
+    // titles stay on the shots they were put on
+    followAnchors(this.project, this.timeline.draggingText());
     if (this.player.playing) {
       // the timeline changed under a running playback (its frames and sound were planned
       // for the old one): stop where it is
@@ -811,6 +856,15 @@ export class VideoMode {
     const c = p.clips[at.i];
     const local = T - at.start;
     if (local < MIN_CLIP || clipLen(c) - local < MIN_CLIP) return this.h.toast('Move the playhead into the clip to split it');
+    const b = this.cutAt(at.i, local);
+    this.sel = { kind: 'clip', id: b.id };
+    tick(true);
+    this.changed(true);
+  }
+
+  /** Cut clip i in two, `local` timeline seconds into it; the new right half comes back. */
+  private cutAt(i: number, local: number) {
+    const p = this.project, c = p.clips[i];
     const cut = srcAt(c, local);
     // (its own copy of everything: the two would otherwise share their keyframes)
     const b: VClip = { ...(JSON.parse(JSON.stringify(c)) as VClip), id: uid(), in: cut };
@@ -821,10 +875,119 @@ export class VideoMode {
       c.ramp = subRamp(c.ramp, 0, u);
     }
     c.out = cut;
-    p.clips.splice(at.i + 1, 0, b);
-    this.sel = { kind: 'clip', id: b.id };
-    tick(true);
-    this.changed(true);
+    p.clips.splice(i + 1, 0, b);
+    return b;
+  }
+
+  /**
+   * Reverse: the clip plays backwards (a reversed copy of its part of the footage is made once);
+   * again: forwards from the original. The playhead stays on the same moment.
+   */
+  private async reverseClip(c: VClip) {
+    const m = this.lib.get(c.src);
+    if (!m?.video) return;
+    this.unscope();
+    const p = this.project;
+    const here = this.onClip(c) ? this.sNow(c) : null;
+    const back = (s: number) => this.player.seek(this.startOf(c) + localAt(c, s));
+    if (c.reversed) {
+      // back to the original footage
+      // (moment s of the copy is moment r.out - s of the original; a trim made meanwhile is kept)
+      const r = c.reversed;
+      delete c.reversed;
+      flipClip(c, r.src, r.out);
+      tick(true);
+      this.changed(true);
+      if (here !== null) back(r.out - here);
+      return;
+    }
+    if (c.out - c.in > REVERSE_MAX) return this.h.toast(`Clips up to ${REVERSE_MAX / 60} minutes can be reversed · split it first`, 3200);
+    this.cancelExport = false;
+    this.h.busy('Reversing 0%');
+    $('busyCancel').hidden = false;
+    try {
+      const { reverseFootage } = await import('./reverse');
+      const file = await reverseFootage(m, this.lib, c.in, c.out, (f) => this.h.busy(`Reversing ${Math.round(f * 100)}%`), () => this.cancelExport || this.dead);
+      const rm = await this.lib.add(file);
+      if (this.dead || !p.clips.includes(c)) return;
+      if (rm.kind === 'video') setTimeout(() => !this.dead && void this.player.buildKeys(rm), 1200);
+      this.audio.warm(rm);
+      const old = { src: c.src, in: c.in, out: c.out };
+      // (the copy starts at the clip's end: moment s of the original is old.out - s of the copy)
+      flipClip(c, rm.id, old.out);
+      c.out = Math.min(c.out, rm.duration);
+      c.reversed = old;
+      tick(true);
+      this.changed(true);
+      if (here !== null) back(old.out - here);
+      this.h.toast('Plays backwards · tap Reverse again to undo it', 2400);
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') this.h.toast('Reverse cancelled');
+      else {
+        console.error(e);
+        this.h.toast('Couldn’t reverse it: ' + ((e as Error).message || e), 4000);
+      }
+    } finally {
+      $('busyCancel').hidden = true;
+      this.h.busy(null);
+    }
+  }
+
+  /**
+   * Freeze frame: the picture at the playhead held still for a moment (a photo clip made from
+   * it, with the clip's framing and look), cutting the clip there if the playhead is inside it.
+   */
+  private async freezeFrame(c: VClip) {
+    if (!this.onClip(c)) return this.h.toast('Move the playhead onto the clip first');
+    const m = this.lib.get(c.src);
+    if (!m?.video) return;
+    this.unscope();
+    const s = this.sNow(c);
+    this.h.busy('Freezing the frame');
+    try {
+      const { CanvasSink } = await import('mediabunny');
+      // the frame as it's seen (turned upright), at the footage's own size
+      const long = Math.min(3840, Math.max(m.w, m.h));
+      const k = long / Math.max(m.w, m.h);
+      const sink = new CanvasSink(m.video, { width: Math.round(m.w * k), height: Math.round(m.h * k), fit: 'fill' });
+      const w = await sink.getCanvas(Math.max(c.in, Math.min(c.out - 1e-3, s)));
+      if (!w || this.dead) throw new Error('No frame there');
+      const cv = w.canvas as HTMLCanvasElement | OffscreenCanvas;
+      const blob = 'convertToBlob' in cv ? await cv.convertToBlob({ type: 'image/jpeg', quality: 0.95 }) : await new Promise<Blob | null>((r) => (cv as HTMLCanvasElement).toBlob(r, 'image/jpeg', 0.95));
+      if (!blob) throw new Error('No frame there');
+      const base = m.name.replace(/\.[^.]+$/, '');
+      const file = new File([blob], `${base} frame ${fmtTime(s).replace(':', '.')}.jpg`, { type: 'image/jpeg', lastModified: Date.now() });
+      const fm = await this.lib.add(file);
+      if (this.dead) return;
+      const p = this.project, i = p.clips.indexOf(c);
+      if (i < 0) return;
+      const local = this.player.time - this.startOf(c);
+      // inside the clip: cut it and hold the frame between the halves; at an end: before / after it
+      let at = i + 1;
+      if (local >= MIN_CLIP && clipLen(c) - local >= MIN_CLIP) this.cutAt(i, local);
+      else if (local < MIN_CLIP) at = i;
+      const still: VClip = {
+        id: uid(), src: fm.id, kind: 'image', in: 0, out: 2, speed: 1, vol: 0, frozen: true,
+        tf: { ...framingAt(c, s) },
+        ...(c.look ? { look: JSON.parse(JSON.stringify(c.look)) } : {}),
+      };
+      // (an animated look holds where it was at that moment)
+      if (still.look?.kf?.length) {
+        still.look.v = lookValues(still.look, s);
+        delete still.look.kf;
+      }
+      p.clips.splice(at, 0, still);
+      this.sel = { kind: 'clip', id: still.id };
+      tick(true);
+      this.changed(true);
+      this.player.seek(this.startOf(still) + 0.001);
+      this.h.toast('Frame held for 2 s · drag its right edge to change how long', 2600);
+    } catch (e) {
+      console.error(e);
+      this.h.toast('Couldn’t freeze that frame: ' + ((e as Error).message || e), 3500);
+    } finally {
+      this.h.busy(null);
+    }
   }
 
   private clipAction(what: 'delete' | 'copy' | 'mute') {
@@ -872,7 +1035,7 @@ export class VideoMode {
         const T = this.player.time;
         const total = Math.max(0.5, layout(p).total);
         const t0 = Math.min(T, Math.max(0, total - 0.5));
-        const t: VText = { id: uid(), text: v, t0, t1: Math.min(total, t0 + 3), x: 0.5, y: 0.5, size: 8, color: '#ffffff', font: 'pixel', box: false };
+        const t: VText = { id: uid(), text: v, t0, t1: Math.min(total, t0 + 3), x: 0.5, y: 0.5, size: 8, color: '#ffffff', font: 'pixel', box: false, anchor: anchorAt(p, t0) };
         p.texts.push(t);
         this.sel = { kind: 'text', id: t.id };
       }
@@ -1397,6 +1560,8 @@ export class VideoMode {
       if (m?.audio) this.h.tile(row, c.vol > 0 ? ICONS.sound : ICONS.mute, c.vol > 0 ? 'Mute' : 'Unmute', c.vol > 0 ? '' : 'hot', () => this.clipAction('mute'));
       this.h.tile(row, ICONS.trash, 'Delete', 'danger', () => this.clipAction('delete'));
       sep();
+      if (c.kind === 'video') this.h.tile(row, ICONS.freeze, 'Freeze', '', () => void this.freezeFrame(c));
+      if (c.kind === 'video') this.h.tile(row, ICONS.reverse, 'Reverse', c.reversed ? 'hot' : '', () => void this.reverseClip(c));
       if (c.kind === 'video') this.h.tile(row, ICONS.ramp, 'Ramp', c.ramp ? 'hot' : '', () => {
         this.rampOpen = true;
         this.h.refreshSection();
@@ -1749,6 +1914,10 @@ export class VideoMode {
     this.last = null;
     $('tlTrack').innerHTML = '';
     // handlers on elements that outlive the editor would keep all of it (and its sound) in memory
+    for (const id of ['tlPrev', 'tlNext']) {
+      const b = $(id);
+      b.onpointerdown = b.onpointerup = b.onpointercancel = b.onlostpointercapture = null;
+    }
     for (const id of ['tlPlay', 'tlAdd', 'busyCancel', 'textDone', 'textCancel', 'textSheet', 'vxCancel', 'vxGo', 'vexSheet']) $(id).onclick = null;
     for (const id of ['fileAdd', 'fileAudio', 'fileBg']) {
       const el = document.getElementById(id);

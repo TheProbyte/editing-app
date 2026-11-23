@@ -122,8 +122,29 @@ async function navigate(e, cache, req) {
   }
 }
 
+/**
+ * Shared to the installed app (Android's share sheet): the files are kept for the page, which
+ * is then opened to pick them up (see bindShared in src/ui/app.ts).
+ */
+async function takeShare(req) {
+  try {
+    const form = await req.formData();
+    await caches.delete('lumen-share');
+    const cache = await caches.open('lumen-share');
+    let n = 0;
+    for (const f of form.getAll('media')) {
+      if (!(f instanceof File)) continue;
+      await cache.put(new URL(`./shared/${n++}`, self.registration.scope).href, new Response(f, { headers: { 'content-type': f.type || '', 'x-name': encodeURIComponent(f.name) } }));
+    }
+  } catch (err) {
+    /* nothing kept: the app just opens */
+  }
+  return Response.redirect(new URL('./?shared=1', self.registration.scope).href, 303);
+}
+
 self.addEventListener('fetch', (e) => {
   const req = e.request;
+  if (req.method === 'POST' && new URL(req.url).pathname.endsWith('/share-target')) return e.respondWith(takeShare(req));
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;

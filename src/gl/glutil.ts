@@ -138,6 +138,13 @@ export class GL {
     }
   }
 
+  /** Memory held by targets waiting in the pool (for the performance readout). */
+  poolBytes() {
+    let b = 0;
+    for (const p of this.pool) b += p.w * p.h * (p.fmt === 'f16' ? 8 : 4);
+    return b;
+  }
+
   destroy(t: Target) {
     this.gl.deleteTexture(t.tex);
     this.gl.deleteFramebuffer(t.fbo);

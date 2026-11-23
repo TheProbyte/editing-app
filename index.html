@@ -28,6 +28,7 @@
           <div id="layerLayer"></div>
           <canvas id="detail"></canvas>
           <canvas id="orig"></canvas>
+          <div id="splitLine"><span class="l">BEFORE</span><span class="r">AFTER</span><i></i></div>
         </div>
         <div id="brushRing"></div>
         <canvas id="loupe"></canvas>
@@ -35,6 +36,7 @@
         <div id="menu"><div class="sel-bar"></div><div class="items"></div></div>
         <div id="curveWrap"></div>
         <button id="zoomBadge"></button>
+        <button id="splitBtn" aria-label="Before and after side by side"></button>
         <div id="badge"></div>
         <div id="flash"></div>
         <div id="toast" role="status" aria-live="polite"></div>
@@ -68,6 +70,8 @@
             <button class="round" id="tlPlay" aria-label="Play"></button>
             <span id="tlTime"></span>
             <span class="tl-sp"></span>
+            <button class="round" id="tlPrev" aria-label="Back one frame"></button>
+            <button class="round" id="tlNext" aria-label="Forward one frame"></button>
             <button class="round" id="tlAdd" aria-label="Add clips"></button>
           </div>
           <div id="tlTrack"></div>
@@ -153,11 +157,33 @@
         <button data-a="aimodel">AI fill model <span class="state" id="fillModelState">Ask</span></button>
         <button data-a="hist">Histogram <span class="state" id="histState">Off</span></button>
         <button data-a="clip">Clipping warnings <span class="state" id="clipState">Off</span></button>
+        <button data-a="perf">Performance readout <span class="state" id="perfState">Off</span></button>
+        <button data-a="storage">Storage</button>
         <button data-a="copy">Copy edits</button>
         <button data-a="paste">Paste edits</button>
         <button data-a="savePreset">Save as preset</button>
         <button data-a="resetAll" class="danger">Reset all edits</button>
         <button data-a="getApp" id="getApp">Get the Android app <span class="state on">APK</span></button>
+      </div>
+    </div>
+
+    <div id="storageSheet" class="sheet">
+      <div class="sheet-card">
+        <h2>Storage</h2>
+        <p class="hint" id="stoSummary">Measuring…</p>
+        <div id="stoBar"><i class="p"></i><i class="m"></i><i class="o"></i></div>
+        <div id="stoLegend"></div>
+        <div class="opt-label">Recent projects <span id="stoProjBytes"></span></div>
+        <div id="stoList"></div>
+        <div class="opt-label">Keep recent projects under</div>
+        <div class="seg" id="stoCap"></div>
+        <div class="opt-label">Downloaded AI models <span id="stoModelBytes"></span></div>
+        <div id="stoModels"></div>
+        <div class="sheet-actions">
+          <button class="btn-dark" id="stoClearAll">Clear projects</button>
+          <button class="btn-dark" id="stoClearModels">Clear models</button>
+          <button class="btn-accent" id="stoDone">Done</button>
+        </div>
       </div>
     </div>
 

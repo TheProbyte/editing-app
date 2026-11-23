@@ -25,6 +25,26 @@ export interface VClip {
   ramp?: Ramp;
   /** the clip's own look (instead of the whole video's), see looks.ts */
   look?: ClipLook;
+  /** a still made from a video frame (Freeze) */
+  frozen?: boolean;
+  /** playing backwards: a reversed copy of this part of the original (the original, to go back) */
+  reversed?: { src: string; in: number; out: number };
+}
+
+/**
+ * The clip pointed at footage running the other way (a reversed copy, or back to the original),
+ * where moment s of the old footage is moment X - s of the new one: its part, keyframes, look
+ * keyframes and speed ramp are turned round to match, so they stay on the same moments.
+ */
+export function flipClip(c: VClip, src: string, X: number) {
+  const map = (s: number) => X - s;
+  const o0 = c.in, o1 = c.out;
+  if (c.kf) c.kf = c.kf.map((k) => ({ ...k, s: map(k.s) })).sort((a, b) => a.s - b.s);
+  if (c.look?.kf) c.look.kf = c.look.kf.map((k) => ({ ...k, s: map(k.s) })).sort((a, b) => a.s - b.s);
+  if (c.ramp) c.ramp = { id: 'custom', pts: c.ramp.pts.map(([u, m]) => [1 - u, m] as [number, number]).reverse() };
+  c.src = src;
+  c.in = Math.max(0, map(o1));
+  c.out = map(o0);
 }
 
 /** A clip's own look: its settings, or keyframes of them at source times (eased in between). */
@@ -192,6 +212,33 @@ export interface VText {
   color: string;
   font: 'pixel' | 'sans' | 'serif';
   box: boolean;
+  /**
+   * The moment of a clip the title starts on (clip id, source seconds): trimming, deleting or
+   * moving earlier clips, or a speed change, moves the title with its shot.
+   */
+  anchor?: { clip: string; s: number };
+}
+
+/** Where a title starting at timeline time t0 is anchored (the clip under it, and its moment). */
+export function anchorAt(p: VideoProject, t0: number): VText['anchor'] {
+  const at = clipAt(p, t0);
+  if (!at) return undefined;
+  const c = p.clips[at.i];
+  return { clip: c.id, s: c.kind === 'image' ? Math.max(0, t0 - at.start) : at.src };
+}
+
+/** Put titles back on their shots after the timeline changed (keeping their length). */
+export function followAnchors(p: VideoProject, skip?: string) {
+  const { starts } = layout(p);
+  for (const t of p.texts) {
+    if (!t.anchor || t.id === skip) continue;
+    const i = p.clips.findIndex((c) => c.id === t.anchor!.clip);
+    if (i < 0) continue; // its clip is gone: it stays where it was
+    const c = p.clips[i], len = t.t1 - t.t0;
+    const local = c.kind === 'image' ? Math.min(t.anchor.s, clipLen(c)) : localAt(c, Math.min(c.out, Math.max(c.in, t.anchor.s)));
+    t.t0 = Math.max(0, starts[i] + local);
+    t.t1 = t.t0 + len;
+  }
 }
 
 export interface VMusic {

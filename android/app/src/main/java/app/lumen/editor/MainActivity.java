@@ -1,5 +1,6 @@
 package app.lumen.editor;
 
+import android.content.Intent;
 import android.os.Bundle;
 import androidx.activity.OnBackPressedCallback;
 import android.webkit.WebResourceRequest;
@@ -16,6 +17,8 @@ public class MainActivity extends BridgeActivity {
     public void onCreate(Bundle savedInstanceState) {
         registerPlugin(LumenNativePlugin.class);
         super.onCreate(savedInstanceState);
+        // opened from another app's Share / Open with: keep what was handed over for the page
+        LumenNativePlugin.offer(this, getIntent());
         // Serve the app cross-origin isolated so the multi-threaded RAW decoder
         // (WebAssembly + SharedArrayBuffer) can run.
         bridge.setWebViewClient(new BridgeWebViewClient(bridge) {
@@ -49,5 +52,13 @@ public class MainActivity extends BridgeActivity {
                 });
             }
         });
+    }
+
+    /** Shared to while already open (the activity is single-task): the page is told right away. */
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        LumenNativePlugin.offer(this, intent);
     }
 }

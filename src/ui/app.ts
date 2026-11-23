@@ -11,7 +11,7 @@ import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
 import { encodeJpegBand } from '../io/jpegEncoder';
 import { encodePngBand } from '../io/pngEncoder';
-import { dropRecent, listRecents, loadBlob, loadSession, putRecent, recentFiles, saveBlob, saveFile, saveState, sweepStorage, touchRecent, type Recent } from '../io/session';
+import { clearModels, clearRecents, recentCap, setRecentCap, storageReport, trimRecents, dropRecent, listRecents, loadBlob, loadSession, putRecent, recentFiles, saveBlob, saveFile, saveState, sweepStorage, touchRecent, type Recent } from '../io/session';
 import { TOOLS, ToolDef, Chip } from './tools';
 import { ICONS } from './icons';
 import { CurveEditor } from './curveEditor';
@@ -29,6 +29,7 @@ import { isNative, Native, fileFromPath } from '../native';
 import { Segmenter, PEOPLE_PARTS, refineMask } from '../ai/segment';
 import { NeuralFill, LAMA_MB, type NeuralKind } from '../ai/neural';
 import { DepthEstimator } from '../ai/depth';
+import { PerfReadout } from './perf';
 // the video editor (and Mediabunny) load only when a video is opened
 import type { VideoMode, VideoHost } from '../video/mode';
 import { isVideoFile, newProject } from '../video/project';
@@ -577,7 +578,16 @@ export class App {
     return JSON.stringify(st.curves) === App.DEF_CURVES;
   }
 
+  private perf!: PerfReadout;
+
   private renderNow() {
+    if (!this.perf?.shown) return this.renderFrame();
+    const t0 = performance.now();
+    this.renderFrame();
+    this.perf.rendered(performance.now() - t0);
+  }
+
+  private renderFrame() {
     if (!this.img || this.video?.exporting) return;
     const st = this.video && !this.compare ? this.video.lookState(this.viewState()) : this.viewState();
     if (!this.video && Math.round(st.v.blurType) === 3 && this.pipe.depth?.id !== this.depthKey() && this.depthFailed !== this.depthKey()) {
@@ -620,6 +630,7 @@ export class App {
     if (this.showHist || this.kind() === 'curves') this.scheduleHist();
     this.scheduleDetail(true);
     if (!this.compare && !this.video) this.scheduleOrig();
+    if (this.split) this.syncSplit();
   }
 
   // ---- pixel-level zoom: render what's visible at full resolution when the preview runs out
@@ -875,6 +886,8 @@ export class App {
       }, 280);
     }
     this.frame.style.transform = `translate(${V.cx + z.x}px, ${V.cy + z.y}px) scale(${V.base * z.s}) translate(-50%, -50%)`;
+    // (marks drawn on the photo keep their size on screen whatever the zoom)
+    this.frame.style.setProperty('--zs', String(V.base * z.s));
     this.syncRenderScale();
     const b = $('zoomBadge');
     b.classList.toggle('on', z.s > 1.01);
@@ -1313,6 +1326,8 @@ export class App {
     this.bindSlider();
     this.bindExport();
     this.bindMore();
+    this.bindSplit();
+    this.bindShared();
     this.bindPresets();
     this.bindMaskSheet();
     this.bindKeys();
@@ -1607,6 +1622,63 @@ export class App {
     this.requestRender();
   }
 
+  // ---- before / after, side by side
+
+  private split = false;
+  /** where the line is, 0…1 across the photo */
+  private splitAt = 0.5;
+
+  private setSplit(on: boolean) {
+    if (on && (!this.img || this.video)) return;
+    this.split = on;
+    $('splitBtn').classList.toggle('on', on);
+    $('splitLine').classList.toggle('on', on);
+    const orig = $('orig');
+    orig.classList.toggle('split', on);
+    if (on) {
+      this.frame.style.setProperty('--split', `${this.splitAt * 100}%`);
+      this.syncSplit();
+    }
+  }
+
+  /** The original behind the line follows the edit's size and crop (redrawn only when those change). */
+  private syncSplit() {
+    if (!this.split) return;
+    if (this.kind() === 'crop' || !this.prepareOrig()) $('orig').classList.remove('split');
+    else $('orig').classList.add('split');
+  }
+
+  private bindSplit() {
+    $('splitBtn').innerHTML = ICONS.compare;
+    $('splitBtn').onclick = () => {
+      tick();
+      this.setSplit(!this.split);
+      if (this.split) this.toast('Drag the line · left is the original', 2000);
+    };
+    const handle = $('splitLine').querySelector('i')!;
+    let dragging = false;
+    handle.addEventListener('pointerdown', (e) => {
+      // (the photo underneath doesn't see this finger: no swipe, no compare)
+      e.stopPropagation();
+      handle.setPointerCapture(e.pointerId);
+      dragging = true;
+    });
+    handle.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      e.stopPropagation();
+      const r = this.frame.getBoundingClientRect();
+      this.splitAt = Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+      this.frame.style.setProperty('--split', `${this.splitAt * 100}%`);
+    });
+    const end = (e: PointerEvent) => {
+      if (!dragging) return;
+      e.stopPropagation();
+      dragging = false;
+    };
+    handle.addEventListener('pointerup', end);
+    handle.addEventListener('pointercancel', end);
+  }
+
   /** What the original looks like at the current on-screen size (geometry only). */
   private origState(): EditState {
     const s = this.state;
@@ -1645,6 +1717,8 @@ export class App {
   private updateChrome() {
     const has = !!this.img;
     this.appEl.classList.toggle('noimg', !has);
+    this.appEl.classList.toggle('has-photo', has && !this.video && this.homeOver !== true);
+    if (this.split && (!has || this.video)) this.setSplit(false);
     ($('btnUndo') as HTMLButtonElement).disabled = !has || this.hIdx <= 0;
     ($('btnRedo') as HTMLButtonElement).disabled = !has || this.hIdx >= this.history.length - 1;
     ($('btnHistory') as HTMLButtonElement).disabled = !has || this.history.length < 2;
@@ -4730,6 +4804,140 @@ export class App {
     return p;
   }
 
+  // ---- opened from another app (Share / Open with)
+
+  private bindShared() {
+    if (isNative) {
+      void Native.addListener('shared', () => void this.openShared()).catch(() => {});
+      void this.openShared();
+      return;
+    }
+    // the installed web app: the service worker kept what was shared (see sw.js)
+    if (new URLSearchParams(location.search).has('shared')) void this.openSharedWeb();
+  }
+
+  /** Android: take what was shared and open it (several, or any video: as a video project). */
+  private async openShared() {
+    try {
+      const r = await Native.takeShared();
+      if (!r.files.length) return;
+      this.busy('Opening');
+      const files = await Promise.all(r.files.map((f) => fileFromPath(f.path, f.name, f.mime || guessType(f.name))));
+      this.busy(null);
+      if (this.homeOver) this.showHome(false);
+      this.openFiles(files);
+    } catch (e) {
+      this.busy(null);
+      console.warn('shared files', e);
+    }
+  }
+
+  private async openSharedWeb() {
+    try {
+      history.replaceState(null, '', location.pathname);
+      const cache = await caches.open('lumen-share');
+      const files: File[] = [];
+      for (const req of await cache.keys()) {
+        const res = await cache.match(req);
+        if (!res) continue;
+        const name = decodeURIComponent(res.headers.get('x-name') ?? 'shared');
+        files.push(new File([await res.blob()], name, { type: res.headers.get('content-type') ?? guessType(name) }));
+      }
+      await caches.delete('lumen-share');
+      if (files.length) this.openFiles(files);
+    } catch (e) {
+      console.warn('shared files', e);
+    }
+  }
+
+  // ---- storage
+
+  /** What the app keeps on the phone, and ways to free space. */
+  private async openStorage() {
+    const sheet = $('storageSheet');
+    sheet.classList.add('on');
+    sheet.onclick = (e) => {
+      if (e.target === sheet) sheet.classList.remove('on');
+    };
+    $('stoDone').onclick = () => sheet.classList.remove('on');
+    const mb = (b: number) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : b >= 1e7 ? `${Math.round(b / 1e6)} MB` : `${(b / 1e6).toFixed(1)} MB`);
+    const draw = async () => {
+      const r = await storageReport();
+      if (!sheet.classList.contains('on')) return;
+      const other = Math.max(0, r.usage - r.projectBytes - r.modelBytes);
+      $('stoSummary').textContent = r.quota
+        ? `Lumen keeps ${mb(r.usage)} on this phone (up to ${mb(r.quota)} allowed)${r.persisted ? ' · safe from automatic clean-up' : ''}`
+        : `Lumen keeps ${mb(r.usage)} on this phone`;
+      const total = Math.max(1, r.usage, r.projectBytes + r.modelBytes);
+      const bar = $('stoBar').children as HTMLCollectionOf<HTMLElement>;
+      bar[0].style.width = `${(r.projectBytes / total) * 100}%`;
+      bar[1].style.width = `${(r.modelBytes / total) * 100}%`;
+      bar[2].style.width = `${(other / total) * 100}%`;
+      $('stoLegend').innerHTML = `<span><b style="background:var(--accent)"></b>projects ${mb(r.projectBytes)}</span><span><b style="background:#7fe0a0"></b>AI models ${mb(r.modelBytes)}</span><span><b style="background:#6d6a63"></b>app & other ${mb(other)}</span>`;
+      $('stoProjBytes').textContent = mb(r.projectBytes);
+      $('stoModelBytes').textContent = mb(r.modelBytes);
+      const list = $('stoList');
+      list.innerHTML = r.projects.length ? '' : '<div class="sto-empty">None yet</div>';
+      for (const p of r.projects) {
+        const row = document.createElement('div');
+        row.className = 'sto-row';
+        const day = new Date(p.ts).toLocaleDateString([], { month: 'short', day: 'numeric' });
+        row.innerHTML = `<span class="n">${p.kind === 'video' ? '▶ ' : ''}${escapeHtml(p.name)}</span><span class="d">${escapeHtml(day)}</span><span class="s">${mb(p.bytes)}</span><button class="x" aria-label="Remove">×</button>`;
+        (row.querySelector('.x') as HTMLButtonElement).onclick = () => {
+          tick();
+          void dropRecent(p.id).then(() => {
+            if (p.id === this.recentId) this.recentId = null;
+            void draw();
+            void this.showRecents();
+          });
+        };
+        list.appendChild(row);
+      }
+      const models = $('stoModels');
+      models.innerHTML = r.models.length ? '' : '<div class="sto-empty">None downloaded (they download the first time a tool needs one)</div>';
+      for (const m of r.models) {
+        const row = document.createElement('div');
+        row.className = 'sto-row';
+        row.innerHTML = `<span class="n">${escapeHtml(m.name)}</span><span class="s">${mb(m.bytes)}</span>`;
+        models.appendChild(row);
+      }
+      const caps: [number, string][] = [[5e8, '500 MB'], [1e9, '1 GB'], [2e9, '2 GB'], [5e9, '5 GB'], [0, 'No limit']];
+      const seg = $('stoCap');
+      seg.innerHTML = '';
+      for (const [v, label] of caps) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.classList.toggle('on', recentCap() === v);
+        b.onclick = () => {
+          tick();
+          setRecentCap(v);
+          void trimRecents().then(() => {
+            void draw();
+            void this.showRecents();
+          });
+        };
+        seg.appendChild(b);
+      }
+    };
+    $('stoClearAll').onclick = () =>
+      this.confirm('Clear recent projects?', 'They disappear from the home screen and their stored copies are deleted. Your original photos and videos are not touched.', () => {
+        void clearRecents().then(() => {
+          this.recentId = null;
+          void this.showRecents();
+          sheet.classList.add('on');
+          void draw();
+        });
+      }, { yes: 'Clear' });
+    $('stoClearModels').onclick = () =>
+      this.confirm('Clear AI models?', 'They download again the next time a tool needs one (lens blur, the best AI fill, subject masks).', () => {
+        void clearModels().then(() => {
+          sheet.classList.add('on');
+          void draw();
+        });
+      }, { yes: 'Clear' });
+    await draw();
+  }
+
   private askFillModel() {
     if (this.fillModel()) return;
     this.confirm(
@@ -4752,6 +4960,17 @@ export class App {
     };
     if (isNative || !/Android/i.test(navigator.userAgent)) $('getApp').style.display = 'none';
     this.renderFillModel();
+    this.perf = new PerfReadout({
+      video: () => this.video && { playing: this.video.player.playing, shown: this.video.player.shown, drops: this.video.player.drops, cap: this.video.renderCap(), frames: this.video.framesShown },
+      poolBytes: () => this.g.poolBytes(),
+      canvas: () => ({ w: this.canvas.width, h: this.canvas.height, rs: this.rs }),
+      gpu: () => {
+        const gl = this.g.gl, ext = gl.getExtension('WEBGL_debug_renderer_info');
+        const r = ext ? String(gl.getParameter(ext.UNMASKED_RENDERER_WEBGL)) : String(gl.getParameter(gl.RENDERER));
+        return `${r.replace(/^ANGLE \((.*)\)$/, '$1').replace(/, OpenGL.*|, Vulkan.*/, '').slice(0, 44)} · ${navigator.hardwareConcurrency || '?'} cores${self.crossOriginIsolated ? ' · threads' : ''}`;
+      },
+    });
+    setState('perfState', this.perf.shown);
     $('btnMore').onclick = () => sheet.classList.add('on');
     sheet.onclick = (e) => {
       if (e.target === sheet) sheet.classList.remove('on');
@@ -4785,6 +5004,13 @@ export class App {
           if (this.showHist) this.scheduleHist();
           return;
         }
+        if (a === 'perf') {
+          this.perf.show(!this.perf.shown);
+          setState('perfState', this.perf.shown);
+          if (this.perf.shown) this.toast('Screenshot this while playing or scrubbing to share how it runs', 3000);
+          return;
+        }
+        if (a === 'storage') return void this.openStorage();
         if (a === 'clip') {
           this.pipe.clip = !this.pipe.clip;
           setState('clipState', this.pipe.clip);
@@ -5117,6 +5343,7 @@ function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditStat
   const j = (x: unknown) => JSON.stringify(x);
   if (b.clips.length > a.clips.length) {
     const fresh = b.clips.filter((c) => !a.clips.some((x) => x.id === c.id));
+    if (fresh.some((c) => c.frozen)) return 'Freeze frame';
     if (fresh.length === 1) {
       const n = fresh[0];
       // a split: the new clip starts where an existing clip of the same source now ends
@@ -5128,11 +5355,12 @@ function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditStat
   if (b.clips.length < a.clips.length) {
     // undoing a split or copy reads as that, not as a deletion
     const r = videoChange(b, a);
-    return r === 'Split' || r === 'Copy' ? r : 'Clip deleted';
+    return r === 'Split' || r === 'Copy' || r === 'Freeze frame' ? r : 'Clip deleted';
   }
   if (j(a.clips.map((c) => c.id)) !== j(b.clips.map((c) => c.id))) return 'Clips moved';
   for (let i = 0; i < b.clips.length; i++) {
     const x = a.clips[i], y = b.clips[i];
+    if (!!x.reversed !== !!y.reversed) return y.reversed ? 'Reverse' : 'Forwards again';
     if (x.speed !== y.speed) return 'Speed';
     if (JSON.stringify(x.ramp) !== JSON.stringify(y.ramp)) return 'Speed ramp';
     if (j(x.look) !== j(y.look)) {
@@ -5210,4 +5438,11 @@ function escapeHtml(t: string) {
 
 function rgbCss(c: number[]) {
   return `rgb(${c.map((x) => Math.round(Math.min(1, Math.max(0, x)) * 255)).join(',')})`;
+}
+
+/** A file's type from its name, for files handed over without one. */
+function guessType(name: string) {
+  const ext = name.toLowerCase().split('.').pop() ?? '';
+  const t: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', dng: 'image/x-adobe-dng', mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', '3gp': 'video/3gpp' };
+  return t[ext] ?? '';
 }

@@ -120,6 +120,19 @@ export const TOOLS: ToolDef[] = [
       { id: 'air:sunset', label: 'Warm sky' },
     ],
   },
+  {
+    id: 'frame', label: 'Frame', icon: ICONS.frame, kind: 'params',
+    params: list('frameStyle', 'frameSize', 'stamp'),
+    actions: [
+      { id: 'frame:0', label: 'None' },
+      { id: 'frame:1', label: 'Super 16' },
+      { id: 'frame:2', label: '35mm' },
+      { id: 'frame:3', label: 'Super 8' },
+      { id: 'frame:4', label: 'VHS' },
+      { id: 'frame:5', label: 'Instant' },
+      { id: 'frame:stamp', label: 'Date stamp' },
+    ],
+  },
   { id: 'film', label: 'Film', icon: ICONS.film, kind: 'params', params: list('fade', 'fadeWarmth', 'ca', 'distortion') },
   {
     id: 'crop', label: 'Crop', icon: ICONS.crop, kind: 'crop',

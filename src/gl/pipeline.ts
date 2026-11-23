@@ -165,6 +165,15 @@ export class Pipeline {
     return [out, dF] as const;
   }
 
+  /** The date the stamp shows (the photo's own, when it's known). */
+  stampDate = new Date();
+  /** 'YY MM DD, or MM.DD.YYYY for tape, as character codes for the shader. */
+  private stampChars(tape: boolean) {
+    const d = this.stampDate, two = (n: number) => String(n).padStart(2, '0');
+    const s = tape ? `${two(d.getMonth() + 1)}.${two(d.getDate())}.${d.getFullYear()}` : `'${two(d.getFullYear() % 100)} ${two(d.getMonth() + 1)} ${two(d.getDate())}`;
+    return [...s].map((ch) => (ch === "'" ? 10 : ch === '.' ? 11 : ch === ' ' ? 12 : +ch));
+  }
+
   /** The depth map put through the photo's crop / turn / perspective, at up to 1024 px. */
   private frameDepth(B: Target, state: EditState) {
     const g = this.g, D = this.depth!;
@@ -706,6 +715,12 @@ export class Pipeline {
       u1('uDust', (v.filmDust ?? 0) / 100);
       u1('uDustSeed', this.filmFrame.dust);
       u1('uClip', flipY && this.clip ? 1 : 0);
+      gl.uniform1i(p.loc('uFrame'), Math.round(v.frameStyle || 0));
+      u1('uFrameK', 0.5 + (v.frameSize ?? 50) / 100);
+      const st = this.stampChars(Math.round(v.frameStyle || 0) === 4);
+      u1('uStamp', (v.stamp || 0) / 100);
+      gl.uniform1i(p.loc('uStampN'), st.length);
+      gl.uniform1iv(p.loc('uStampC'), Int32Array.from({ length: 12 }, (_, i) => st[i] ?? 12));
       this.g.bindTex(p, 'uAtmo', fx.atmo ? fx.atmo.tex : this.black);
       gl.uniform1i(p.loc('uAtmoOn'), fx.atmo ? 1 : 0);
       // density, and from how far it starts (0 … 3: the map's nearest thing is 0, a thing 4× as far is 3)

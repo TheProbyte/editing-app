@@ -26,6 +26,8 @@ const p = (id: string, label: string, min = -100, max = 100, def = 0, extra: Par
   id, label, min, max, def, fmt: min < 0 ? signed : plain, ...extra,
 });
 
+export const FRAME_STYLES = ['None', 'Super 16', '35mm', 'Super 8', 'VHS', 'Instant'];
+
 export const HSL_BANDS = ['red', 'orange', 'yellow', 'green', 'aqua', 'blue', 'purple', 'magenta'] as const;
 export const BAND_COLORS: Record<string, string> = {
   red: '#ff3b30', orange: '#ff9500', yellow: '#ffd60a', green: '#34c759',
@@ -104,6 +106,10 @@ export const PARAMS: ParamDef[] = [
   p('skyExp', 'Sky brightness'),
   p('skySat', 'Sky color'),
   p('skyWarm', 'Sky warmth'),
+  // Film frame: the gate and perforations of a film scan (or a tape / instant print look) and a date stamp
+  p('frameStyle', 'Frame', 0, 5, 0, { fmt: (v) => FRAME_STYLES[Math.round(v)] ?? '' }),
+  p('frameSize', 'Border', 0, 100, 50),
+  p('stamp', 'Date stamp', 0, 100, 0),
   // Perspective (Crop): + widens the top / the right side, to stand converging lines up straight
   p('perspV', 'Vertical'),
   p('perspH', 'Horizontal'),

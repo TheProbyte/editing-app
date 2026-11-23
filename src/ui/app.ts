@@ -8,6 +8,7 @@ import {
 import { makeSpline } from '../curves';
 import { LOOKS, Look, ImgStats, measure } from '../presets';
 import { addCube, cubeList, loadCubes, removeCube } from '../io/cubes';
+import { photoDate } from '../io/photoDate';
 import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
 import { encodeJpegBand } from '../io/jpegEncoder';
@@ -359,7 +360,7 @@ export class App {
     this.busy('Opening');
     try {
       const maxDim = Math.min(this.g.maxTex, 8192);
-      const L = await loadFile(file, maxDim, (s) => tok === this.openTok && this.busy(s.replace('…', '')));
+      const [L, taken] = await Promise.all([loadFile(file, maxDim, (s) => tok === this.openTok && this.busy(s.replace('…', ''))), photoDate(file)]);
       if (tok === this.openTok) {
         this.busy('Preparing');
         await new Promise((r) => setTimeout(r, 0));
@@ -444,6 +445,7 @@ export class App {
         this.commit();
       }
       this.analysisCache = null;
+      this.pipe.stampDate = taken;
       this.syncAtlasSize();
       this.thumbsKey = '';
       if (this.homeOver) this.showHome(false);
@@ -1585,6 +1587,9 @@ export class App {
       return;
     }
     this.analysisCache = null;
+    // the date stamp: the first clip's file date
+    const first = restore?.files[0]?.file ?? files[0];
+    this.pipe.stampDate = new Date(first?.lastModified || Date.now());
     this.syncAtlasSize();
     this.thumbsKey = '';
     if (this.homeOver) this.showHome(false);
@@ -4570,6 +4575,14 @@ export class App {
           cine: { halation: 70, halThreshold: 55, halRadius: 40, halHue: 2, halSat: 95 },
           dream: { halation: 55, halThreshold: 45, halRadius: 70, halHue: 18, halSat: 70, glow: 20 },
         }[arg]!);
+        break;
+      case 'frame':
+        if (arg === 'stamp') v.stamp = v.stamp > 0 ? 0 : 90;
+        else {
+          v.frameStyle = +arg;
+          // a tape look comes with its date in the corner
+          if (arg === '4' && !v.stamp) v.stamp = 90;
+        }
         break;
       case 'air':
         setMany({

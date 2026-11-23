@@ -662,6 +662,11 @@ uniform float uClip;
 uniform float uFlick;   // this film frame's flicker (exposure multiplier - 1)
 uniform float uDust;    // dust & scratches amount (video)
 uniform float uDustSeed; // changes every film frame, even with still grain
+uniform int uFrame;        // film frame: 0 none, 1 Super 16, 2 35mm, 3 Super 8, 4 VHS, 5 instant print
+uniform float uFrameK;     // its border scale (0.5 … 1.5)
+uniform float uStamp;      // date stamp brightness (0 = off)
+uniform int uStampN;       // characters: 0-9 digits, 10 apostrophe, 11 dot, 12 space
+uniform int uStampC[12];
 uniform sampler2D uAtmo;  // depth in frame space (0 far … 1 near) for Air
 uniform int uAtmoOn;
 uniform vec4 uHaze;       // density, distance it starts at, unused, unused
@@ -690,6 +695,36 @@ float grainField(vec2 q, uint seed) {
   // rougher grain gets a harder, clumpier distribution
   n = sign(n) * pow(abs(n), mix(1.0, 0.65, r));
   return n;
+}
+
+// ---- film frame helpers (sizes in units of the picture's short edge)
+float sdRound(vec2 p, vec2 hs, float r) {
+  vec2 q = abs(p) - hs + r;
+  return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
+}
+float sdSeg(vec2 p, vec2 a, vec2 b) {
+  vec2 pa = p - a, ba = b - a;
+  return length(pa - ba * clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0));
+}
+/** Distance to a seven-segment character in a 0.6 × 1 box (y up). */
+float sd7(vec2 q, int ch) {
+  if (ch == 10) return sdSeg(q, vec2(0.3, 0.95), vec2(0.22, 0.75)); // '
+  if (ch == 11) return length(q - vec2(0.3, 0.04)) - 0.02;          // .
+  if (ch < 0 || ch > 9) return 1e3;
+  int m = ch == 0 ? 63 : ch == 1 ? 6 : ch == 2 ? 91 : ch == 3 ? 79 : ch == 4 ? 102 : ch == 5 ? 109 : ch == 6 ? 125 : ch == 7 ? 7 : ch == 8 ? 127 : 111;
+  // a slight italic, like the LCDs in old cameras
+  q.x -= (q.y - 0.5) * 0.12;
+  float d = 1e3;
+  vec2 A = vec2(0.08, 1.0), B = vec2(0.52, 1.0), C = vec2(0.08, 0.5), D = vec2(0.52, 0.5), E = vec2(0.08, 0.0), F = vec2(0.52, 0.0);
+  float g = 0.07; // gaps at the joints
+  if ((m & 1) != 0) d = min(d, sdSeg(q, A + vec2(g, 0.0), B - vec2(g, 0.0)));
+  if ((m & 2) != 0) d = min(d, sdSeg(q, B - vec2(0.0, g), D + vec2(0.0, g)));
+  if ((m & 4) != 0) d = min(d, sdSeg(q, D - vec2(0.0, g), F + vec2(0.0, g)));
+  if ((m & 8) != 0) d = min(d, sdSeg(q, E + vec2(g, 0.0), F - vec2(g, 0.0)));
+  if ((m & 16) != 0) d = min(d, sdSeg(q, C - vec2(0.0, g), E + vec2(0.0, g)));
+  if ((m & 32) != 0) d = min(d, sdSeg(q, A - vec2(0.0, g), C + vec2(0.0, g)));
+  if ((m & 64) != 0) d = min(d, sdSeg(q, C + vec2(g, 0.0), D - vec2(g, 0.0)));
+  return d;
 }
 
 void main() {
@@ -828,6 +863,87 @@ void main() {
       float dx = abs(gUv.x - xs - 0.0012 * sin(gUv.y * 6.0 + float(seed % 97u)));
       float m = 1.0 - smoothstep(0.0, 0.0011 * (1500.0 / shortEdge) + 0.0007, dx);
       p = mix(p, vec3(0.9), m * 0.55 * smoothstep(0.0, 0.2, uDust));
+    }
+  }
+
+  if (uFrame == 4) {
+    // VHS: soft, smeared color, scanlines and a tracking band that wanders
+    vec2 sh = vec2(3.5 * (shortEdge / 1080.0), 0.0) / uFull;
+    vec3 l = toPerc(texture(uB, uBRect.xy + (uv - sh * 2.0) * uBRect.zw).rgb), r = toPerc(texture(uB, uBRect.xy + (uv + sh) * uBRect.zw).rgb);
+    float yv = luma(p);
+    vec3 chroma = (l + r) * 0.5 - luma((l + r) * 0.5);
+    p = yv + chroma * 0.8 + vec3(0.02, -0.01, 0.03) * (1.0 - yv);
+    float lineY = gUv.y * uFull.y * (480.0 / uFull.y);
+    p *= 0.93 + 0.07 * sin(lineY * 3.14159);
+    float band = fract(0.83 + float(uint(uDustSeed) % 61u) * 0.0021);
+    float inBand = smoothstep(0.025, 0.0, abs(gUv.y - band));
+    if (inBand > 0.0) p = mix(p, vec3(rnd(ivec2(px.x / 3.0, px.y), uint(uDustSeed))), inBand * 0.35);
+    p = max(p, 0.0);
+  } else if (uFrame > 0) {
+    // the gate (the picture's opening) and the film around it, in short-edge units from the centre
+    vec2 P = (gUv - 0.5) * uFull / shortEdge;
+    vec2 H = 0.5 * uFull / shortEdge;
+    bool tall = H.y > H.x;
+    if (tall) P = vec2(-P.y, P.x), H = H.yx; // the film runs along the long side either way
+    float k = uFrameK;
+    // margins: left, right, top, bottom; corner radius; film color
+    vec4 m; float rad; vec3 base = vec3(0.025);
+    if (uFrame == 1) { m = vec4(0.17, 0.035, 0.045, 0.045) * k; rad = 0.025; }
+    else if (uFrame == 2) { m = vec4(0.03, 0.03, 0.13, 0.13) * k; rad = 0.012; }
+    else if (uFrame == 3) { m = vec4(0.14, 0.05, 0.05, 0.05) * k; rad = 0.07; }
+    else { m = vec4(0.06, 0.06, 0.06, 0.24) * k; rad = 0.004; base = vec3(0.93, 0.92, 0.88); }
+    vec2 gc = vec2((m.x - m.y) * 0.5, (m.z - m.w) * 0.5); // (y runs down the picture)
+    vec2 gh = H - vec2(m.x + m.y, m.z + m.w) * 0.5;
+    float aa = 1.5 / shortEdge;
+    float soft = uFrame == 3 ? 0.012 : aa;
+    float gate = 1.0 - smoothstep(-soft, soft, sdRound(P - gc, gh, rad));
+    // light spilling over the gate's edge (scans of film glow a little there)
+    float edge = uFrame == 5 ? 0.0 : exp(-max(sdRound(P - gc, gh, rad), 0.0) * 90.0) * 0.12;
+    vec3 film = base + vec3(1.0, 0.55, 0.3) * edge;
+    if (uFrame == 5) film *= 1.0 - 0.06 * exp(-max(sdRound(P - gc, gh, rad), 0.0) * 160.0); // a faint inner shadow
+    // perforations: bright where the scanner's light comes straight through
+    float hole = 0.0;
+    if (uFrame == 1 || uFrame == 3) {
+      float pitch = uFrame == 1 ? 0.5 : 1.0;
+      float cy = P.y - (floor(P.y / pitch + 0.5)) * pitch;
+      vec2 hs = (uFrame == 1 ? vec2(0.05, 0.035) : vec2(0.035, 0.05)) * k;
+      hole = 1.0 - smoothstep(-aa, aa, sdRound(vec2(P.x + H.x - m.x * 0.5, cy), hs, 0.012 * k));
+    } else if (uFrame == 2) {
+      float pitch = 0.198 * 0.55 * k;
+      float cx = P.x - (floor(P.x / pitch) + 0.5) * pitch;
+      float cy = abs(P.y) - (H.y - m.z * 0.5);
+      hole = 1.0 - smoothstep(-aa, aa, sdRound(vec2(cx, cy), vec2(0.023, 0.032) * k, 0.008 * k));
+    }
+    film = mix(film, vec3(0.97, 0.93, 0.85), hole);
+    p = mix(film, p, gate);
+  }
+
+  if (uStamp > 0.0) {
+    // date stamp: glowing seven-segment digits near a bottom corner of the picture
+    vec2 P = gUv * uFull / shortEdge;
+    vec2 F = uFull / shortEdge;
+    float hgt = 0.045;
+    float adv = hgt * 0.78;
+    bool vhs = uFrame == 4;
+    vec2 at = vhs ? vec2(0.07, F.y - 0.07) : vec2(F.x - 0.07 - adv * float(uStampN), F.y - 0.07);
+    // inside the gate when there's a border (its right and bottom margins)
+    if (uFrame == 1) at -= vec2(0.035, 0.045) * uFrameK;
+    else if (uFrame == 2) at -= vec2(0.03, 0.13) * uFrameK;
+    else if (uFrame == 3) at -= vec2(0.05, 0.05) * uFrameK;
+    else if (uFrame == 5) at -= vec2(0.06, 0.24) * uFrameK;
+    vec2 q = (P - at) / hgt;
+    q.y = -q.y; // y up, from the baseline
+    int i = int(floor(q.x / 0.78));
+    if (i >= 0 && i < uStampN && q.y > -0.3 && q.y < 1.3) {
+      int ch = uStampC[i];
+      float d = sd7(vec2(q.x - float(i) * 0.78, q.y), ch) * hgt;
+      float stroke = hgt * 0.075, aa = 1.2 / shortEdge;
+      float cov = 1.0 - smoothstep(stroke - aa, stroke + aa, d);
+      float glow = exp(-max(d - stroke, 0.0) / (hgt * 0.12)) * 0.35;
+      vec3 col = vhs ? vec3(0.95) : vec3(1.0, 0.55, 0.16);
+      if (vhs) p = mix(p, vec3(0.0), (1.0 - smoothstep(stroke, stroke + hgt * 0.06, sd7(vec2(q.x - float(i) * 0.78 - 0.05, q.y + 0.05), ch) * hgt)) * 0.5 * uStamp);
+      p = mix(p, col, cov * uStamp);
+      if (!vhs) p += col * glow * uStamp * (1.0 - cov);
     }
   }
 

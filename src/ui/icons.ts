@@ -574,6 +574,17 @@ const A = {
     ###......###/
     ####....####/
     ############`,
+  // a film frame with a perforation beside it
+  frame: `
+    ############/
+    #..#.......#/
+    #..#.......#/
+    ####.......#/
+    #..#.......#/
+    #..#.......#/
+    ####.......#/
+    #..#.......#/
+    ############`,
   // far hills fading into haze, a near hill solid
   air: `
     ............/
@@ -870,6 +881,49 @@ const A = {
     ###......#./
     .##.....#../
     ...#####...`,
+  transition: `
+    #........#/
+    ##......##/
+    ###....###/
+    ####..####/
+    ##########/
+    ##########/
+    ####..####/
+    ###....###/
+    ##......##/
+    #........#`,
+  mic: `
+    ...####.../
+    ..######../
+    ..######../
+    ..######../
+    ..######../
+    #.######.#/
+    #..####..#/
+    .##....##./
+    ...####.../
+    ....##..../
+    ..######..`,
+  record: `
+    ...####.../
+    .########./
+    .########./
+    ##########/
+    ##########/
+    ##########/
+    ##########/
+    .########./
+    .########./
+    ...####...`,
+  stop: `
+    ########/
+    ########/
+    ########/
+    ########/
+    ########/
+    ########/
+    ########/
+    ########`,
   pin: `
     ...####.../
     ..######../
@@ -921,6 +975,7 @@ export const ICONS = {
   vignette: pix(A.vignette),
   film: pix(A.film),
   air: pix(A.air),
+  frame: pix(A.frame),
   crop: pix(A.crop),
   double: pix(A.double),
   // masks
@@ -970,6 +1025,10 @@ export const ICONS = {
   fade: pix(A.fade),
   key: pix(A.key),
   kenburns: pix(A.kenburns),
+  transition: pix(A.transition),
+  mic: pix(A.mic),
+  record: pix(A.record),
+  stop: pix(A.stop),
 };
 
 export type IconName = keyof typeof ICONS;

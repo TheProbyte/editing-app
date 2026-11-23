@@ -40,6 +40,7 @@
         <div id="badge"></div>
         <div id="flash"></div>
         <div id="toast" role="status" aria-live="polite"></div>
+        <div id="hint" role="note"><p></p><small>Tap to close</small></div>
 
         <section id="empty" class="boot">
           <img class="logo" src="icon.svg" alt="" />
@@ -158,6 +159,7 @@
         <button data-a="hist">Histogram <span class="state" id="histState">Off</span></button>
         <button data-a="clip">Clipping warnings <span class="state" id="clipState">Off</span></button>
         <button data-a="perf">Performance readout <span class="state" id="perfState">Off</span></button>
+        <button data-a="settings">Settings</button>
         <button data-a="storage">Storage</button>
         <button data-a="copy">Copy edits</button>
         <button data-a="paste">Paste edits</button>
@@ -183,6 +185,41 @@
           <button class="btn-dark" id="stoClearAll">Clear projects</button>
           <button class="btn-dark" id="stoClearModels">Clear models</button>
           <button class="btn-accent" id="stoDone">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="settingsSheet" class="sheet">
+      <div class="sheet-card">
+        <h2>Settings</h2>
+        <div class="opt-label">Photo export format</div>
+        <div class="seg" id="setFormat"></div>
+        <div id="setQualityRow">
+          <div class="opt-label">JPEG quality</div>
+          <div class="seg" id="setQuality"></div>
+        </div>
+        <p class="hint">Video exports remember the size, frame rate and quality you last picked for each kind of footage.</p>
+        <div class="opt-label">AI remove</div>
+        <div class="seg" id="setFill"></div>
+        <div class="opt-label">Haptic ticks</div>
+        <div class="seg" id="setHaptics"></div>
+        <div class="sheet-actions">
+          <button class="btn-dark" id="setHints">Show tips again</button>
+          <button class="btn-dark" id="setStorage">Storage</button>
+          <button class="btn-accent" id="setDone">Done</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="recentSheet" class="sheet">
+      <div class="sheet-card">
+        <h2>Project</h2>
+        <div class="opt-label">Name</div>
+        <input id="recentName" type="text" maxlength="40" />
+        <div class="sheet-actions">
+          <button class="btn-dark" id="recentDelete">Delete</button>
+          <button class="btn-dark" id="recentPin">Pin to the front</button>
+          <button class="btn-accent" id="recentDone">Done</button>
         </div>
       </div>
     </div>
@@ -241,6 +278,7 @@
     <input type="file" id="fileAudio" accept="audio/*" hidden />
     <input type="file" id="fileBg" accept="image/*" hidden />
     <input type="file" id="fileOverlay" accept="image/*" hidden />
+    <input type="file" id="fileCube" multiple hidden />
     <script type="module" src="/src/main.ts"></script>
   </body>
 </html>

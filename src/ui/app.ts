@@ -7,11 +7,12 @@ import {
 } from '../params';
 import { makeSpline } from '../curves';
 import { LOOKS, Look, ImgStats, measure } from '../presets';
+import { addCube, cubeList, loadCubes, removeCube } from '../io/cubes';
 import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
 import { encodeJpegBand } from '../io/jpegEncoder';
 import { encodePngBand } from '../io/pngEncoder';
-import { clearModels, clearRecents, recentCap, setRecentCap, storageReport, trimRecents, dropRecent, listRecents, loadBlob, loadSession, putRecent, recentFiles, saveBlob, saveFile, saveState, sweepStorage, touchRecent, type Recent } from '../io/session';
+import { clearModels, clearRecents, recentCap, setRecentCap, storageReport, trimRecents, dropRecent, listRecents, loadBlob, loadSession, putRecent, recentFiles, saveBlob, saveFile, saveState, sweepStorage, touchRecent, markRecent, PIN_MAX, type Recent } from '../io/session';
 import { TOOLS, ToolDef, Chip } from './tools';
 import { ICONS } from './icons';
 import { CurveEditor } from './curveEditor';
@@ -23,7 +24,7 @@ import { LayerOverlay } from './layerOverlay';
 import { LEAKS, LEAK_W, LEAK_H, leakCanvas, leakThumb } from '../leaks';
 import { Loupe } from './loupe';
 import { drawHistogram } from './histogram';
-import { tick } from './haptics';
+import { hapticsOn, setHaptics, tick } from './haptics';
 import { Camera } from './camera';
 import { isNative, Native, fileFromPath } from '../native';
 import { Segmenter, PEOPLE_PARTS, refineMask, isAbortError } from '../ai/segment';
@@ -32,7 +33,7 @@ import { DepthEstimator } from '../ai/depth';
 import { PerfReadout } from './perf';
 // the video editor (and Mediabunny) load only when a video is opened
 import type { VideoMode, VideoHost } from '../video/mode';
-import { isVideoFile, newProject } from '../video/project';
+import { isVideoFile, newProject, totalLength } from '../video/project';
 import { canonical } from '../video/looks';
 
 /** photo tools that don't apply to video */
@@ -453,7 +454,8 @@ export class App {
       this.setMode(null);
       this.layout();
       this.requestRender();
-      this.toast(L.note ?? L.info, L.note ? 5000 : 1800);
+      if (L.note || this.seenHint('photo')) this.toast(L.note ?? L.info, L.note ? 5000 : 1800);
+      else this.hint('photo', 'Pick a tool below, then swipe ↔ on the photo to change it and ↕ to choose another setting. Hold the photo to see the original · double-tap to reset · pinch to zoom.');
     } catch (e) {
       console.error(e);
       if (tok === this.openTok) this.toast((e as Error).message || 'Could not open that file.', 5000);
@@ -995,7 +997,10 @@ export class App {
     const thumb = await this.thumbBlob();
     // (another project was opened meanwhile: this one's entry is left as it was)
     if (id !== this.recentId) return;
-    if (this.video) await putRecent({ id, kind: 'video', name: this.video.info, ts: Date.now(), thumb, state }, this.video.mediaFiles());
+    if (this.video) {
+      const dur = this.state.video ? totalLength(this.state.video) : undefined;
+      await putRecent({ id, kind: 'video', name: this.video.info, ts: Date.now(), thumb, state, dur }, this.video.mediaFiles());
+    }
     else if (this.recentFresh && this.file) {
       this.recentFresh = false;
       await putRecent({ id, kind: 'photo', name: this.file.name, ts: Date.now(), thumb, state }, [{ id: 'photo', file: this.file }]);
@@ -1024,13 +1029,30 @@ export class App {
     row.querySelectorAll('img').forEach((i) => URL.revokeObjectURL(i.src));
     row.innerHTML = '';
     box.hidden = !list.length;
+    if (list.length && !$('empty').classList.contains('hidden')) this.hint('recents', 'Hold a recent project to name it, pin it to the front or delete it.');
     for (const r of list) {
       const b = document.createElement('button');
-      b.className = 'rcard' + (r.id === this.recentId && this.img ? ' cur' : '');
+      b.className = 'rcard' + (r.id === this.recentId && this.img ? ' cur' : '') + (r.pinned ? ' pin' : '');
       const when = new Date(r.ts);
       const day = when.toDateString() === new Date().toDateString() ? when.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : when.toLocaleDateString([], { month: 'short', day: 'numeric' });
-      b.innerHTML = `<span class="th">${r.thumb ? `<img src="${URL.createObjectURL(r.thumb)}" alt="">` : ''}${r.kind === 'video' ? `<i class="vid">${ICONS.play}</i>` : ''}</span><small>${escapeHtml(day)}</small>`;
+      const len = r.kind === 'video' ? (r.dur ? fmtLen(r.dur) : '') : '';
+      b.innerHTML = `<span class="th">${r.thumb ? `<img src="${URL.createObjectURL(r.thumb)}" alt="">` : ''}${r.kind === 'video' ? `<i class="vid">${ICONS.play}${len ? `<b>${len}</b>` : ''}</i>` : ''}${r.pinned ? '<i class="rpin" aria-label="Pinned"></i>' : ''}</span><small class="rname">${escapeHtml(recentName(r))}</small><small>${escapeHtml(day)}</small>`;
+      b.setAttribute('aria-label', `${recentName(r)}, ${day}. Hold for options`);
+      // hold: name, pin or delete it
+      let press = 0, held = false;
+      b.onpointerdown = () => {
+        held = false;
+        clearTimeout(press);
+        press = window.setTimeout(() => {
+          held = true;
+          tick(true);
+          this.recentOptions(r);
+        }, 520);
+      };
+      b.onpointerup = b.onpointerleave = b.onpointercancel = () => clearTimeout(press);
+      b.oncontextmenu = (e) => e.preventDefault();
       b.onclick = () => {
+        if (held) return;
         tick();
         void this.openRecent(r);
       };
@@ -1057,8 +1079,151 @@ export class App {
         });
       };
       b.appendChild(x);
+      b.dataset.id = r.id;
       row.appendChild(b);
     }
+  }
+
+  // ---- first-run hints: each shows once, the first time it's useful
+
+  private seenHint(id: string) {
+    try {
+      return (JSON.parse(localStorage.getItem('lumen.hints') || '[]') as string[]).includes(id);
+    } catch {
+      return true;
+    }
+  }
+
+  private hintTimer = 0;
+  private hint(id: string, text: string) {
+    if (this.seenHint(id)) return;
+    try {
+      const seen = JSON.parse(localStorage.getItem('lumen.hints') || '[]') as string[];
+      localStorage.setItem('lumen.hints', JSON.stringify([...seen, id]));
+    } catch {
+      return;
+    }
+    const el = $('hint');
+    el.querySelector('p')!.textContent = text;
+    el.classList.add('on');
+    const close = () => {
+      clearTimeout(this.hintTimer);
+      el.classList.remove('on');
+    };
+    clearTimeout(this.hintTimer);
+    this.hintTimer = window.setTimeout(close, 12000);
+    // (the tip sits over the photo: a tap on it is not a tap on the photo, which hides the controls)
+    el.onpointerdown = (e) => e.stopPropagation();
+    el.onclick = close;
+  }
+
+  // ---- settings
+
+  private photoExDefaults() {
+    try {
+      const s = JSON.parse(localStorage.getItem('lumen.photoEx') || 'null');
+      if (s && (s.format === 'jpeg' || s.format === 'png') && s.quality >= 60 && s.quality <= 100) return { format: s.format as 'jpeg' | 'png', quality: Math.round(s.quality) };
+    } catch {
+      /* none saved */
+    }
+    return { format: 'jpeg' as const, quality: 100 };
+  }
+  private savePhotoEx() {
+    try {
+      localStorage.setItem('lumen.photoEx', JSON.stringify({ format: this.exportOpts.format, quality: this.exportOpts.quality }));
+    } catch {
+      /* private mode */
+    }
+  }
+
+  private openSettings() {
+    const sheet = $('settingsSheet');
+    const seg = (id: string, opts: [string, string][], cur: string, pick: (v: string) => void) => {
+      const box = $(id);
+      box.innerHTML = '';
+      for (const [v, label] of opts) {
+        const b = document.createElement('button');
+        b.textContent = label;
+        b.classList.toggle('on', v === cur);
+        b.onclick = () => {
+          tick();
+          pick(v);
+          box.querySelectorAll('button').forEach((x) => x.classList.toggle('on', x === b));
+        };
+        box.appendChild(b);
+      }
+    };
+    const draw = () => {
+      seg('setFormat', [['jpeg', 'JPEG'], ['png', 'PNG']], this.exportOpts.format, (v) => {
+        this.exportOpts.format = v as 'jpeg' | 'png';
+        this.savePhotoEx();
+        draw();
+      });
+      $('setQualityRow').hidden = this.exportOpts.format === 'png';
+      const qs = [90, 95, 100];
+      const q = qs.includes(this.exportOpts.quality) ? this.exportOpts.quality : 100;
+      seg('setQuality', qs.map((x) => [String(x), x === 100 ? '100 (best)' : String(x)]), String(q), (v) => {
+        this.exportOpts.quality = +v;
+        this.savePhotoEx();
+      });
+      seg('setFill', [['migan', 'Quick (built in)'], ['lama', `Best (${LAMA_MB} MB)`]], this.fillModel() ?? 'migan', (v) => this.setFillModel(v as NeuralKind));
+      seg('setHaptics', [['1', 'On'], ['0', 'Off']], hapticsOn() ? '1' : '0', (v) => {
+        setHaptics(v === '1');
+        tick(true);
+      });
+    };
+    draw();
+    $('setHints').onclick = () => {
+      try {
+        localStorage.removeItem('lumen.hints');
+      } catch {
+        /* private mode */
+      }
+      tick();
+      this.toast('Tips will show again as you go', 2000);
+    };
+    $('setStorage').onclick = () => {
+      sheet.classList.remove('on');
+      void this.openStorage();
+    };
+    $('setDone').onclick = () => sheet.classList.remove('on');
+    sheet.onclick = (e) => {
+      if (e.target === sheet) sheet.classList.remove('on');
+    };
+    sheet.classList.add('on');
+  }
+
+  /** Name, pin or delete a recent project (held on the home screen). */
+  private recentOptions(r: Recent) {
+    const sheet = $('recentSheet');
+    const input = $<HTMLInputElement>('recentName');
+    const pin = $<HTMLButtonElement>('recentPin');
+    input.value = r.title ?? '';
+    input.placeholder = recentName({ ...r, title: undefined });
+    pin.textContent = r.pinned ? 'Unpin' : 'Pin to the front';
+    sheet.classList.add('on');
+    const close = async (patch?: Partial<Pick<Recent, 'title' | 'pinned'>>) => {
+      sheet.classList.remove('on');
+      const title = input.value.trim().slice(0, 40);
+      if (title !== (r.title ?? '') || patch) await markRecent(r.id, { title, ...patch });
+      void this.showRecents();
+    };
+    pin.onclick = async () => {
+      tick();
+      if (!r.pinned && (await listRecents()).filter((x) => x.pinned).length >= PIN_MAX) return this.toast(`Up to ${PIN_MAX} pinned projects`);
+      void close({ pinned: !r.pinned });
+    };
+    $('recentDone').onclick = () => void close();
+    $('recentDelete').onclick = () => {
+      sheet.classList.remove('on');
+      (document.querySelector(`#recents .rcard[data-id="${CSS.escape(r.id)}"] .rdel`) as HTMLElement | null)?.click();
+    };
+    input.onkeydown = (e) => {
+      if (e.key === 'Enter') void close();
+    };
+    sheet.onclick = (e) => {
+      if (e.target === sheet) void close();
+    };
   }
 
   private async openRecent(r: Recent) {
@@ -1307,6 +1472,7 @@ export class App {
     $('secDone').onclick = () => {
       tick();
       this.closeSection();
+      if (!this.video) this.hint('allTools', 'Swipe up on the tool bar (or tap the little handle) to see every tool at once. Tools you’ve changed get a yellow dot.');
     };
     $('secReset').onclick = () => {
       tick(true);
@@ -1329,6 +1495,16 @@ export class App {
     this.bindSplit();
     this.bindShared();
     this.bindPresets();
+    const cubeIn = $<HTMLInputElement>('fileCube');
+    cubeIn.onchange = () => {
+      const files = [...(cubeIn.files ?? [])];
+      if (files.length) this.importCubes(files);
+    };
+    // imported LUTs: read once; an edit that uses one is drawn again when they're here
+    void loadCubes().then(() => {
+      this.thumbsKey = '';
+      if (this.img && this.state.v.cube) this.requestRender();
+    });
     this.bindMaskSheet();
     this.bindKeys();
   }
@@ -1419,7 +1595,7 @@ export class App {
     this.layout();
     this.requestRender();
     this.updateChrome();
-    this.toast('Drag the timeline to scrub · tap a clip to edit it · tap the video to play', 3200);
+    this.hint('video', 'Drag the timeline to scrub and pinch it to zoom. Tap a clip to select it (yellow handles trim it), hold one to move it, tap the video to play.');
   }
 
   /** Leave video mode (back to photos). */
@@ -1572,6 +1748,9 @@ export class App {
     if (on === this.homeOver) return;
     this.homeOver = on;
     this.homeFromButton = on && fromButton;
+    // a tip about the editor doesn't belong over the home screen (or the other way round)
+    clearTimeout(this.hintTimer);
+    $('hint').classList.remove('on');
     const resume = $<HTMLButtonElement>('btnResume');
     if (on) {
       this.setMode(null);
@@ -1982,7 +2161,13 @@ export class App {
         };
         row.appendChild(b);
       } else {
-        this.chip(row, s, on, () => this.pickSub(s.id));
+        const b = this.chip(row, s, on, () => this.pickSub(s.id));
+        // (a section of this tool that has changes gets the same dot as the tool)
+        // (settings every section shares, like Grade's blending, don't mark one section)
+        if (t.kind === 'params') {
+          const own = t.params(s.id).filter((p) => !t.subs!.every((o) => t.params(o.id).includes(p)));
+          if (this.isModified(own)) b.classList.add('mod');
+        }
       }
     }
   }
@@ -4541,8 +4726,32 @@ export class App {
   // -----------------------------------------------------------------------------------
   // Looks + presets
 
-  private allLooks(): (Look & { user?: boolean })[] {
-    return [...LOOKS, ...this.userLooks().map((l) => ({ ...l, user: true }))];
+  private allLooks(): (Look & { user?: boolean; cube?: number })[] {
+    return [
+      ...LOOKS,
+      ...this.userLooks().map((l) => ({ ...l, user: true })),
+      // imported LUTs: the table at full strength (the look's strength slider fades it)
+      ...cubeList().map((c) => ({ name: c.name, v: { cube: c.id, cubeAmt: 100 }, cube: c.id })),
+    ];
+  }
+
+  /** Import .cube LUTs from the phone as looks. */
+  private importCubes(files: File[]) {
+    void (async () => {
+      let added = 0, last = '';
+      for (const f of files) {
+        try {
+          await addCube(f);
+          added++;
+        } catch (e) {
+          last = `${f.name}: ${(e as Error).message || 'couldn’t be read'}`;
+        }
+      }
+      if (last) this.toast(last, 4500);
+      else if (added) this.toast(added > 1 ? `${added} LUTs added to Looks` : 'LUT added to Looks · hold it to delete', 2600);
+      this.thumbsKey = '';
+      if (this.kind() === 'looks') this.refreshSection();
+    })();
   }
   private userLooks(): Look[] {
     try {
@@ -4584,7 +4793,9 @@ export class App {
     const s: EditState = { ...base, v: { ...base.v }, curves: { ...base.curves } };
     for (const [k, val] of Object.entries(L.v)) {
       if (!(k in s.v)) continue;
-      s.v[k] = base.v[k] + (val - base.v[k]) * t;
+      // which LUT is a choice, not an amount: its strength fades it instead
+      if (k === 'cube') s.v[k] = t > 0 ? val : base.v[k];
+      else s.v[k] = base.v[k] + (val - base.v[k]) * t;
     }
     for (const [ch, pts] of Object.entries(L.curves ?? {}) as [keyof Curves, CurvePoint[]][]) {
       const f = makeSpline(base.curves[ch]);
@@ -4617,10 +4828,21 @@ export class App {
       this.openPresetSheet();
     };
     row.appendChild(save);
+    const lut = document.createElement('button');
+    lut.className = 'look save';
+    lut.innerHTML = `<span class="th">${ICONS.plus}</span><small>LUT</small>`;
+    lut.setAttribute('aria-label', 'Import a .cube LUT');
+    lut.onclick = () => {
+      tick();
+      const inp = $<HTMLInputElement>('fileCube');
+      inp.value = '';
+      inp.click();
+    };
+    row.appendChild(lut);
     const canvases: HTMLCanvasElement[] = [];
     looks.forEach((L, i) => {
       const b = document.createElement('button');
-      b.className = 'look' + (i === this.look.idx ? ' on' : '') + (L.user ? ' user' : '');
+      b.className = 'look' + (i === this.look.idx ? ' on' : '') + (L.user || L.cube ? ' user' : '');
       const c = document.createElement('canvas');
       c.className = 'th';
       canvases.push(c);
@@ -4632,15 +4854,19 @@ export class App {
       let long = false;
       b.onpointerdown = () => {
         long = false;
-        if (L.user) {
+        if (L.user || L.cube) {
           press = window.setTimeout(() => {
             long = true;
             tick(true);
-            this.confirm(`Delete “${L.name}”?`, 'This removes the preset from this device.', () => {
-              const u = this.userLooks();
-              u.splice(i - LOOKS.length, 1);
-              this.setUserLooks(u);
+            this.confirm(`Delete “${L.name}”?`, L.cube ? 'This removes the LUT from this device (edits using it lose its colors).' : 'This removes the preset from this device.', () => {
+              if (L.cube) void removeCube(L.cube).then(() => this.requestRender());
+              else {
+                const u = this.userLooks();
+                u.splice(i - LOOKS.length, 1);
+                this.setUserLooks(u);
+              }
               if (this.look.idx === i) this.look.idx = 0;
+              else if (this.look.idx > i) this.look.idx--;
               this.thumbsKey = '';
               this.refreshSection();
             });
@@ -5049,6 +5275,7 @@ export class App {
           return;
         }
         if (a === 'storage') return void this.openStorage();
+        if (a === 'settings') return this.openSettings();
         if (a === 'clip') {
           this.pipe.clip = !this.pipe.clip;
           setState('clipState', this.pipe.clip);
@@ -5137,13 +5364,17 @@ export class App {
   // -----------------------------------------------------------------------------------
   // Export
 
-  private exportOpts = { size: 'full', format: 'jpeg' as 'jpeg' | 'png', quality: 100 };
+  private exportOpts = { size: 'full', ...this.photoExDefaults() };
 
   private bindExport() {
     const sheet = $('sheet');
     $('btnExport').onclick = () => {
       if (!this.img) return;
       if (this.video) return this.video.openExport();
+      // the remembered format and quality (Settings, or the last export)
+      $('exFormat').querySelectorAll<HTMLButtonElement>('button').forEach((x) => x.classList.toggle('on', x.dataset.v === this.exportOpts.format));
+      $<HTMLInputElement>('exQuality').value = String(this.exportOpts.quality);
+      $('exQVal').textContent = String(this.exportOpts.quality);
       this.buildExportSizes();
       sheet.classList.add('on');
     };
@@ -5164,7 +5395,10 @@ export class App {
       $('exQVal').textContent = q.value;
       this.scheduleEstimate();
     };
-    $('exGo').onclick = () => this.doExport();
+    $('exGo').onclick = () => {
+      this.savePhotoEx();
+      this.doExport();
+    };
     $('resultDone').onclick = () => this.closeResult();
   }
 
@@ -5483,4 +5717,19 @@ function guessType(name: string) {
   const ext = name.toLowerCase().split('.').pop() ?? '';
   const t: Record<string, string> = { jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', heic: 'image/heic', heif: 'image/heif', avif: 'image/avif', dng: 'image/x-adobe-dng', mp4: 'video/mp4', mov: 'video/quicktime', m4v: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska', '3gp': 'video/3gpp' };
   return t[ext] ?? '';
+}
+
+/** What a recent project is called on the home screen. */
+function recentName(r: Pick<Recent, 'title' | 'name' | 'kind' | 'files'>) {
+  if (r.title) return r.title;
+  if (r.kind === 'photo') return (r.files[0]?.name ?? r.name).replace(/\.[^.]+$/, '');
+  const n = r.files.length;
+  return n > 1 ? `${n} clips` : (r.files[0]?.name ?? 'Video').replace(/\.[^.]+$/, '');
+}
+
+/** 0:42, 12:05, 1:02:10 */
+function fmtLen(s: number) {
+  const t = Math.round(s), h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
+  const ss = String(sec).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
 }

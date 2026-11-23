@@ -5,6 +5,24 @@ import { isNative, Native } from '../native';
 
 let label: HTMLLabelElement | null = null;
 let last = 0;
+let on = (() => {
+  try {
+    return localStorage.getItem('lumen.haptics') !== '0';
+  } catch {
+    return true;
+  }
+})();
+
+export const hapticsOn = () => on;
+/** Switch the ticks on or off (Settings); remembered. */
+export function setHaptics(v: boolean) {
+  on = v;
+  try {
+    localStorage.setItem('lumen.haptics', v ? '1' : '0');
+  } catch {
+    /* private mode */
+  }
+}
 
 function iosSwitch() {
   if (!label) {
@@ -23,6 +41,7 @@ function iosSwitch() {
 
 /** A light tick. Rate-limited so fast drags don't turn into a buzz. */
 export function tick(strong = false) {
+  if (!on) return;
   const now = performance.now();
   if (now - last < (strong ? 20 : 34)) return;
   last = now;

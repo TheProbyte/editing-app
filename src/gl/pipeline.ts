@@ -1,4 +1,5 @@
 import { GL, Program, Target } from './glutil';
+import { cubeById, type Cube } from '../io/cubes';
 import { BLUR, BRIGHT, DEVELOP, DOWNSAMPLE, FINISH, GEOMETRY, LENS } from './shaders';
 import { buildCurveLut, isIdentity, LUT_SIZE } from '../curves';
 import { EditState, GRADE_ZONES, HSL_BANDS, Geometry, MAX_MASKS, MAX_SPOTS, MAX_SPOT_CIRCLES, spotCircles } from '../params';
@@ -61,6 +62,10 @@ export class Pipeline {
   private lensP: Program;
   private lut: WebGLTexture;
   private lutKey = '';
+  /** the imported LUT in use (a 1-point stand-in when there's none: the sampler needs a texture) */
+  private cube: WebGLTexture;
+  private cubeId = -1;
+  private cubeN = 1;
   private globals: Globals | null = null;
   private smallCache = new Map<string, Target>();
   private smallCacheKey = '';
@@ -173,6 +178,8 @@ export class Pipeline {
     this.lensP = new Program(gl, LENS, 'lens');
     // all were started above; now wait for them together
     for (const p of [this.geo, this.down, this.blurP, this.bright, this.dev, this.fin, this.lensP]) p.check();
+    this.cube = gl.createTexture()!;
+    this.uploadCube(null);
     this.lut = gl.createTexture()!;
     gl.bindTexture(gl.TEXTURE_2D, this.lut);
     gl.texStorage2D(gl.TEXTURE_2D, 1, gl.RGBA16F, LUT_SIZE, 1);
@@ -413,6 +420,30 @@ export class Pipeline {
     for (const t of [glb.A, glb.texB, glb.clarB, glb.largeB]) this.g.release(t);
   }
 
+  private uploadCube(c: Cube | null) {
+    const gl = this.g.gl;
+    gl.deleteTexture(this.cube);
+    this.cube = gl.createTexture()!;
+    gl.bindTexture(gl.TEXTURE_3D, this.cube);
+    const n = c?.size ?? 1;
+    gl.texStorage3D(gl.TEXTURE_3D, 1, gl.RGB16F, n, n, n);
+    gl.texSubImage3D(gl.TEXTURE_3D, 0, 0, 0, 0, n, n, n, gl.RGB, gl.FLOAT, c?.data ?? new Float32Array(3));
+    for (const [k, v] of [[gl.TEXTURE_MIN_FILTER, gl.LINEAR], [gl.TEXTURE_MAG_FILTER, gl.LINEAR], [gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE], [gl.TEXTURE_WRAP_R, gl.CLAMP_TO_EDGE]]) gl.texParameteri(gl.TEXTURE_3D, k, v);
+    this.cubeN = n;
+  }
+
+  /** The LUT the settings ask for, on the GPU; how much of it to use (0 when it isn't here). */
+  private updateCube(v: EditState['v']) {
+    const id = Math.round(v.cube || 0), amt = (v.cubeAmt || 0) / 100;
+    const c = id > 0 && amt > 0 ? cubeById(id) : undefined;
+    if (!c) return 0;
+    if (this.cubeId !== id) {
+      this.uploadCube(c);
+      this.cubeId = id;
+    }
+    return amt;
+  }
+
   private updateLut(state: EditState) {
     const key = JSON.stringify(state.curves);
     if (key === this.lutKey) return;
@@ -465,6 +496,7 @@ export class Pipeline {
     const gl = this.g.gl;
     const v = state.v;
     this.updateLut(state);
+    const cubeAmt = this.updateCube(v);
     const ex = 2 ** v.exposure;
     const wb = wbMul(v.temp / 100, v.tint / 100).map((x) => x * ex);
 
@@ -486,6 +518,9 @@ export class Pipeline {
       this.g.bindTex(p, 'uClarB', (glb.clarB ?? A).tex);
       this.g.bindTex(p, 'uLargeB', (glb.largeB ?? A).tex);
       this.g.bindTex(p, 'uLut', this.lut);
+      this.g.bindTex(p, 'uCube', this.cube, gl.TEXTURE_3D);
+      u1('uCubeAmt', cubeAmt);
+      u1('uCubeN', this.cubeN);
       gl.uniform2f(p.loc('uFull'), full.w, full.h);
       gl.uniform4f(p.loc('uTile'), tile.x, tile.y, tile.w, tile.h);
       gl.uniform3f(p.loc('uWB'), wb[0], wb[1], wb[2]);

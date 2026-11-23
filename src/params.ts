@@ -99,6 +99,9 @@ export const PARAMS: ParamDef[] = [
   p('distortion', 'Distortion'),
   p('diffuse', 'Diffusion', 0, 100),
   // Blur (tilt-shift / radial focus)
+  // Imported LUT (a .cube file, by its id on the device; 0 = none) and how much of it
+  p('cube', 'LUT', 0, 1000, 0),
+  p('cubeAmt', 'LUT strength', 0, 100, 0),
   p('blurType', 'Blur type', 0, 3, 0),
   p('blurAmt', 'Blur strength', 0, 100, 60),
   p('blurSize', 'Focus size', 0, 100, 22),

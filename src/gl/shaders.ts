@@ -290,6 +290,9 @@ uniform sampler2D uTexB;     // global blurs, sampled with global uv
 uniform sampler2D uClarB;
 uniform sampler2D uLargeB;
 uniform sampler2D uLut;
+uniform highp sampler3D uCube; // imported LUT (sRGB in, sRGB out)
+uniform float uCubeAmt;
+uniform float uCubeN;
 uniform vec2 uFull;
 uniform vec4 uTile;
 
@@ -596,6 +599,13 @@ void main() {
       toned = g * mix(vec3(1.0), tc, m * 0.6);
     }
     p = mix(p, toned, uBw);
+  }
+
+  // --- imported LUT (made for ordinary sRGB pictures) --------------------------------
+  if (uCubeAmt > 0.0) {
+    vec3 s = linToSrgb(toLin(p));
+    vec3 q = texture(uCube, s * ((uCubeN - 1.0) / uCubeN) + 0.5 / uCubeN).rgb;
+    p = mix(p, toPerc(srgbToLin(clamp(q, 0.0, 1.0))), uCubeAmt);
   }
 
   // --- diffusion (soft, glowing midtones like a mist filter) ------------------------

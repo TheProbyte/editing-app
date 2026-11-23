@@ -174,11 +174,11 @@ export class GL {
   }
 
   private unit = 0;
-  bindTex(prog: Program, name: string, tex: WebGLTexture) {
+  bindTex(prog: Program, name: string, tex: WebGLTexture, target: GLenum = this.gl.TEXTURE_2D) {
     const gl = this.gl;
     const u = this.unit++;
     gl.activeTexture(gl.TEXTURE0 + u);
-    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.bindTexture(target, tex);
     gl.uniform1i(prog.loc(name), u);
   }
 }

@@ -10,7 +10,7 @@ import type { Curves, EditState, Values } from '../params';
 import type { ClipLook, LookKey, VClip, VideoProject } from './project';
 
 /** settings that switch between choices: they jump at a keyframe instead of easing */
-const STEPPED = new Set(['blurType', 'grainMotion', 'dxBlend', 'lkBlend']);
+const STEPPED = new Set(['blurType', 'grainMotion', 'dxBlend', 'lkBlend', 'cube']);
 /** settings that aren't part of the look (brushes, positions of things being placed) */
 const NOT_LOOK = /^((dx|lk)(Brush|Hard)|healSize)$/;
 

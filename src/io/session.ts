@@ -57,6 +57,11 @@ async function tx<T>(mode: IDBTransactionMode, fn: (s: IDBObjectStore) => IDBReq
   });
 }
 
+/** Small key/value helpers for other modules' own records (they throw on failure). */
+export const kvGet = <T>(key: string) => tx<T | undefined>('readonly', (st) => st.get(key));
+export const kvPut = (key: string, value: unknown) => tx('readwrite', (st) => st.put(value, key)).then(() => {});
+export const kvDel = (key: string) => tx('readwrite', (st) => st.delete(key)).then(() => {});
+
 // The photo and its edit are kept under separate keys: the edit is saved after every change, and
 // writing it must not write the (large) photo again each time.
 const STATE_KEY = 'session:state';
@@ -132,6 +137,36 @@ export interface Recent {
   /** the edit (JSON), as history stores it */
   state: string;
   files: RecentFile[];
+  /** a video's length (seconds) */
+  dur?: number;
+  /** a name given on the home screen */
+  title?: string;
+  /** kept at the front, and never dropped to make room */
+  pinned?: boolean;
+}
+
+/** How many pinned projects there can be. */
+export const PIN_MAX = 6;
+
+/**
+ * Make room: past RECENT_MAX projects (pinned ones not counted), or over the size limit, the
+ * oldest unpinned ones go. `keep` (the one being saved) always stays.
+ */
+async function shrink(list: Recent[], keep = '') {
+  let next = list.slice();
+  const dropOldest = () => {
+    for (let i = next.length - 1; i >= 0; i--) {
+      if (!next[i].pinned && next[i].id !== keep) {
+        next.splice(i, 1);
+        return true;
+      }
+    }
+    return false;
+  };
+  while (next.filter((x) => !x.pinned).length > RECENT_MAX && dropOldest());
+  const cap = recentCap();
+  if (cap) while ((await bytesOf(next)) > cap && dropOldest());
+  return next;
 }
 
 const RECENT_MAX = 8;
@@ -168,7 +203,8 @@ function keepStorage() {
 
 export async function listRecents(): Promise<Recent[]> {
   try {
-    return ((await tx<Recent[] | undefined>('readonly', (st) => st.get('recent:list'))) ?? []).sort((a, b) => b.ts - a.ts);
+    // pinned first, then the latest
+    return ((await tx<Recent[] | undefined>('readonly', (st) => st.get('recent:list'))) ?? []).sort((a, b) => +!!b.pinned - +!!a.pinned || b.ts - a.ts);
   } catch {
     return [];
   }
@@ -202,12 +238,10 @@ export async function putRecent(r: Omit<Recent, 'files'>, files: { id: string; f
         metas.push({ id, key, name: file.name, type: file.type, size: file.size });
       }
     }
-    let next = [{ ...r, files: metas }, ...list.filter((x) => x.id !== r.id)].slice(0, RECENT_MAX);
-    // over the size limit set in Storage: the oldest projects go first (never this one)
-    const cap = recentCap();
-    if (cap) {
-      while (next.length > 1 && (await bytesOf(next)) > cap) next = next.slice(0, -1);
-    }
+    // (a name and pin given on the home screen stay)
+    const entry: Recent = { ...r, files: metas, title: old?.title, pinned: old?.pinned };
+    // over the count or the size limit set in Storage: the oldest unpinned projects go
+    const next = await shrink([entry, ...list.filter((x) => x.id !== r.id)], r.id);
     await tx('readwrite', (st) => st.put(next, 'recent:list'));
     keepStorage();
     // files no project uses any more
@@ -341,16 +375,28 @@ export async function clearRecents() {
 
 /** Apply the size limit now (after it's lowered): the oldest projects go. */
 export async function trimRecents() {
-  const cap = recentCap();
-  if (!cap) return;
+  if (!recentCap()) return;
   const list = await listRecents();
-  let next = list;
-  while (next.length > 1 && (await bytesOf(next)) > cap) next = next.slice(0, -1);
-  for (const r of list.slice(next.length)) await dropRecent(r.id);
+  const next = new Set((await shrink(list)).map((r) => r.id));
+  for (const r of list) if (!next.has(r.id)) await dropRecent(r.id);
 }
 
 /** Only the edit / thumbnail changed (cheap: files untouched). */
-export async function touchRecent(id: string, patch: Partial<Pick<Recent, 'state' | 'thumb' | 'name'>>) {
+/** A name or pin from the home screen (the project's place by date doesn't change). */
+export async function markRecent(id: string, patch: Partial<Pick<Recent, 'title' | 'pinned'>>) {
+  try {
+    const list = await listRecents();
+    const r = list.find((x) => x.id === id);
+    if (!r) return;
+    Object.assign(r, patch);
+    if (!r.title) delete r.title;
+    await tx('readwrite', (st) => st.put(list, 'recent:list'));
+  } catch {
+    /* best effort */
+  }
+}
+
+export async function touchRecent(id: string, patch: Partial<Pick<Recent, 'state' | 'thumb' | 'name' | 'dur'>>) {
   try {
     const list = await listRecents();
     const r = list.find((x) => x.id === id);

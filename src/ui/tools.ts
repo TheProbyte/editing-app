@@ -110,10 +110,20 @@ export const TOOLS: ToolDef[] = [
   },
   { id: 'glow', label: 'Glow', icon: ICONS.glow, kind: 'params', params: list('glow', 'glowThreshold', 'glowRadius', 'glowWarmth', 'diffuse') },
   { id: 'vignette', label: 'Vignette', icon: ICONS.vignette, kind: 'params', params: list('vignette', 'vigMidpoint', 'vigFeather', 'vigRound', 'vigHighlights') },
+  {
+    id: 'air', label: 'Air', icon: ICONS.air, kind: 'params',
+    params: list('haze', 'hazeStart', 'hazeWarmth', 'skyExp', 'skySat', 'skyWarm'),
+    actions: [
+      { id: 'air:mist', label: 'Morning mist' },
+      { id: 'air:far', label: 'Far hills' },
+      { id: 'air:blue', label: 'Bluer sky' },
+      { id: 'air:sunset', label: 'Warm sky' },
+    ],
+  },
   { id: 'film', label: 'Film', icon: ICONS.film, kind: 'params', params: list('fade', 'fadeWarmth', 'ca', 'distortion') },
   {
     id: 'crop', label: 'Crop', icon: ICONS.crop, kind: 'crop',
-    params: list('straighten'),
+    params: list('straighten', 'perspV', 'perspH'),
     subs: [
       { id: 'free', label: 'Free' },
       { id: 'orig', label: 'Original' },

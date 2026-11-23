@@ -97,6 +97,16 @@ export const PARAMS: ParamDef[] = [
   p('fadeWarmth', 'Fade warmth'),
   p('ca', 'Color fringe', 0, 100),
   p('distortion', 'Distortion'),
+  // Air (from the depth map): haze that builds with distance, and the sky
+  p('haze', 'Haze', 0, 100),
+  p('hazeStart', 'Haze from', 0, 100, 40),
+  p('hazeWarmth', 'Haze warmth'),
+  p('skyExp', 'Sky brightness'),
+  p('skySat', 'Sky color'),
+  p('skyWarm', 'Sky warmth'),
+  // Perspective (Crop): + widens the top / the right side, to stand converging lines up straight
+  p('perspV', 'Vertical'),
+  p('perspH', 'Horizontal'),
   p('diffuse', 'Diffusion', 0, 100),
   // Blur (tilt-shift / radial focus)
   // Imported LUT (a .cube file, by its id on the device; 0 = none) and how much of it

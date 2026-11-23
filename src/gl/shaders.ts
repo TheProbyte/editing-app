@@ -58,6 +58,8 @@ uniform float uCover;     // zoom so straightened image covers the frame
 uniform int uQuarter;
 uniform vec2 uFlip;
 uniform float uDistort;
+uniform vec2 uPersp;      // keystone: x widens the right side, y the top (a projective tilt)
+uniform float uPerspZoom; // zoom so the tilted picture still covers the frame
 uniform vec2 uFull;       // output (cropped) image size in px
 uniform vec4 uTile;       // tile offset.xy, size.zw in output px
 // Remove: painted patches as rows of circles (sorted by patch)
@@ -117,6 +119,12 @@ vec3 applyLayer(vec3 col, vec2 fr, sampler2D tex, int i) {
 /** Frame coordinates (0..1 over the turned, uncropped frame) -> linear source color. */
 vec3 srcAt(vec2 fr) {
   vec2 q = fr * uFrameSize - 0.5 * uFrameSize;
+  if (uPersp != vec2(0.0)) {
+    // perspective: lines that converge in the photo come out parallel
+    vec2 u = q / (0.5 * uFrameSize) * uPerspZoom;
+    u /= 1.0 + uPersp.x * u.x - uPersp.y * u.y;
+    q = u * 0.5 * uFrameSize;
+  }
   float c = cos(-uAngle), s = sin(-uAngle);
   q = mat2(c, s, -s, c) * q / uCover;
   q *= uFlip;
@@ -654,6 +662,11 @@ uniform float uClip;
 uniform float uFlick;   // this film frame's flicker (exposure multiplier - 1)
 uniform float uDust;    // dust & scratches amount (video)
 uniform float uDustSeed; // changes every film frame, even with still grain
+uniform sampler2D uAtmo;  // depth in frame space (0 far … 1 near) for Air
+uniform int uAtmoOn;
+uniform vec4 uHaze;       // density, distance it starts at, unused, unused
+uniform vec3 uHazeColor;  // linear
+uniform vec3 uSky;        // brightness (stops), saturation, warmth
 
 vec2 gradDir(ivec2 c, uint seed) {
   float a = rnd(c, seed) * 6.2831853;
@@ -715,6 +728,31 @@ void main() {
     if (w > 0.0) {
       c = mix(c, texture(uBlur1, gUv).rgb, smoothstep(0.0, 0.55, w));
       c = mix(c, texture(uBlur2, gUv).rgb, smoothstep(0.45, 1.0, w));
+    }
+  }
+
+  if (uAtmoOn == 1) {
+    // Air: the depth map (blurred a little, it's a quarter of the size) says how far each pixel is
+    float near = texture(uAtmo, gUv).r, far = 1.0 - near;
+    if (uHaze.x > 0.0) {
+      // aerial perspective: light crossing more air is replaced by more of the air's own color.
+      // The map is closeness (like 1 / distance), so it's turned back into a distance first,
+      // and the haze builds up with it exponentially (the sky, far away, gets the most)
+      float dist = 1.0 / max(near, 0.02) - 1.0;
+      float h = 1.0 - exp(-uHaze.x * max(0.0, dist - uHaze.y));
+      c = mix(c, uHazeColor, h * 0.85);
+    }
+    if (uSky != vec3(0.0)) {
+      // the sky: the farthest, fairly bright parts of the picture
+      float y = luma(c);
+      float m = smoothstep(0.86, 0.97, far) * smoothstep(0.02, 0.12, y);
+      if (m > 0.0) {
+        vec3 s = c * exp2(uSky.x * 1.6);
+        float ys = luma(s);
+        s = max(ys + (s - ys) * (1.0 + uSky.y), 0.0);
+        s *= vec3(1.0 + 0.16 * uSky.z, 1.0 + 0.02 * uSky.z, 1.0 - 0.24 * uSky.z);
+        c = mix(c, s, m);
+      }
     }
   }
 

@@ -37,7 +37,7 @@ import { isVideoFile, newProject, totalLength } from '../video/project';
 import { canonical } from '../video/looks';
 
 /** photo tools that don't apply to video */
-const VIDEO_HIDDEN = new Set(['heal', 'masks', 'double']);
+const VIDEO_HIDDEN = new Set(['heal', 'masks', 'double', 'air']);
 /** Grain for video: the same grain, moving, plus flicker, gate weave, dust and film presets. */
 const VIDEO_GRAIN = (t: ToolDef): ToolDef => ({
   ...t,
@@ -592,7 +592,7 @@ export class App {
   private renderFrame() {
     if (!this.img || this.video?.exporting) return;
     const st = this.video && !this.compare ? this.video.lookState(this.viewState()) : this.viewState();
-    if (!this.video && Math.round(st.v.blurType) === 3 && this.pipe.depth?.id !== this.depthKey() && this.depthFailed !== this.depthKey()) {
+    if (!this.video && (Math.round(st.v.blurType) === 3 || airOn(st.v)) && this.pipe.depth?.id !== this.depthKey() && this.depthFailed !== this.depthKey()) {
       if (this.pipe.depth) this.pipe.setDepth(null, '', 0, 0);
       void this.ensureDepth();
     }
@@ -1420,7 +1420,7 @@ export class App {
         return JSON.stringify(this.state.curves) !== JSON.stringify(defaultState().curves);
       case 'crop': {
         const g = this.state.geo;
-        return g.quarter !== 0 || g.flipH || g.flipV || g.crop.w < 0.999 || g.crop.h < 0.999 || v.straighten !== 0;
+        return g.quarter !== 0 || g.flipH || g.flipV || g.crop.w < 0.999 || g.crop.h < 0.999 || v.straighten !== 0 || !!v.perspV || !!v.perspH;
       }
       case 'blur':
         return v.blurType > 0;
@@ -1862,12 +1862,12 @@ export class App {
   private origState(): EditState {
     const s = this.state;
     // (straighten and lens distortion move the picture: the original keeps them, so it lines up with the edit)
-    return { v: { ...defaultValues(), straighten: s.v.straighten, distortion: s.v.distortion }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null, leak: null, fills: [] };
+    return { v: { ...defaultValues(), straighten: s.v.straighten, distortion: s.v.distortion, perspV: s.v.perspV, perspH: s.v.perspH }, curves: defaultState().curves, geo: s.geo, masks: [], spots: [], overlay: null, leak: null, fills: [] };
   }
   private prepareOrig() {
     if (!this.img) return false;
     const w = this.canvas.width, h = this.canvas.height;
-    const key = JSON.stringify([this.img.name, this.img.preview.w, this.state.geo, this.state.v.straighten, this.state.v.distortion, w, h]);
+    const key = JSON.stringify([this.img.name, this.img.preview.w, this.state.geo, this.state.v.straighten, this.state.v.distortion, this.state.v.perspV, this.state.v.perspH, w, h]);
     if (key === this.origKey) return true;
     try {
       const px = this.pipe.renderPixels(this.img.preview, this.origState(), w, h);
@@ -1937,7 +1937,7 @@ export class App {
       ...(this.video ? { video: this.video.tools.map((t) => t.id) } : {}),
       tone: ['light', 'color', 'curves', 'hsl', 'grade', 'bw'],
       fix: ['heal', 'crop', 'detail', 'masks'],
-      style: ['looks', 'double', 'leak', 'blur', 'grain', 'halation', 'glow', 'vignette', 'film'],
+      style: ['looks', 'double', 'leak', 'blur', 'air', 'grain', 'halation', 'glow', 'vignette', 'film'],
     };
     tabs.innerHTML = '';
     for (const k of Object.keys(groups)) {
@@ -2036,6 +2036,8 @@ export class App {
     queueMicrotask(() => this.syncGuard());
     if (t && !prev) this.sectionStart = JSON.stringify(this.state);
     this.tool = t;
+    // Air works from the depth map: opening it tries again after a cancel or a failure
+    if (t?.id === 'air' && !this.video) this.depthFailed = '';
     this.showMenu(false);
     this.loupe.hide();
     this.appEl.dataset.mode = t ? 'section' : 'tools';
@@ -3013,7 +3015,7 @@ export class App {
   /** What the photo frame looks like to the models: identifies the image + geometry. */
   private frameKey() {
     const g = this.state.geo, v = this.state.v;
-    return JSON.stringify([this.img?.name, this.img?.full.w, this.img?.full.h, g.quarter, g.flipH, g.flipV, v.straighten, v.distortion]);
+    return JSON.stringify([this.img?.name, this.img?.full.w, this.img?.full.h, g.quarter, g.flipH, g.flipV, v.straighten, v.distortion, v.perspV, v.perspH]);
   }
 
   /** The uncropped, turned frame at ~1024px, in sRGB, for the segmenters and the edge refine. */
@@ -3024,6 +3026,8 @@ export class App {
     const st = { ...defaultState(), geo: { ...this.state.geo, crop: { x: 0, y: 0, w: 1, h: 1 } }, spots: this.state.spots };
     st.v.straighten = this.state.v.straighten;
     st.v.distortion = this.state.v.distortion;
+    st.v.perspV = this.state.v.perspV;
+    st.v.perspH = this.state.v.perspH;
     const f = outputSize(st, img.preview.w, img.preview.h);
     const k = Math.min(1, 1024 / Math.max(f.w, f.h));
     const w = Math.max(1, Math.round(f.w * k)), h = Math.max(1, Math.round(f.h * k));
@@ -3339,8 +3343,10 @@ export class App {
     const img = this.img!;
     const st = { ...defaultState(), geo: this.state.geo, spots: this.state.spots };
     st.v.straighten = this.state.v.straighten;
+    st.v.perspV = this.state.v.perspV;
+    st.v.perspH = this.state.v.perspH;
     const { w, h } = outputSize(st, img.thumb.w, img.thumb.h);
-    const key = JSON.stringify([st.geo, st.v.straighten, img.name, this.state.spots.length]);
+    const key = JSON.stringify([st.geo, st.v.straighten, st.v.perspV, st.v.perspH, img.name, this.state.spots.length]);
     if (this.analysisCache?.key !== key) {
       this.analysisCache = { key, px: this.pipe.analysisPixels(img.thumb, st, w, h), w, h };
     }
@@ -3738,6 +3744,8 @@ export class App {
     const st = { ...defaultState(), geo: this.state.geo, spots: this.state.spots.filter((_, j) => j !== exclude) };
     st.v.straighten = this.state.v.straighten;
     st.v.distortion = this.state.v.distortion;
+    st.v.perspV = this.state.v.perspV;
+    st.v.perspH = this.state.v.perspH;
     const { w: W, h: H } = outputSize(st, img.preview.w, img.preview.h);
     return { st, W, H };
   }
@@ -4339,6 +4347,8 @@ export class App {
       // the photo in frame space (turned, straightened, uncropped, no heals) in sRGB
       const st = { ...defaultState(), geo: { ...this.state.geo, crop: { x: 0, y: 0, w: 1, h: 1 } } };
       st.v.straighten = this.state.v.straighten;
+      st.v.perspV = this.state.v.perspV;
+      st.v.perspH = this.state.v.perspH;
       const { w: W, h: H } = outputSize(st, img.preview.w, img.preview.h);
       const rgba = new Uint8ClampedArray(this.pipe.renderPixels(img.preview, st, W, H).buffer);
       for (let i = 3; i < rgba.length; i += 4) rgba[i] = 255;
@@ -4561,6 +4571,14 @@ export class App {
           dream: { halation: 55, halThreshold: 45, halRadius: 70, halHue: 18, halSat: 70, glow: 20 },
         }[arg]!);
         break;
+      case 'air':
+        setMany({
+          mist: { haze: 55, hazeStart: 15, hazeWarmth: 10 },
+          far: { haze: 40, hazeStart: 55, hazeWarmth: -25 },
+          blue: { skyExp: -18, skySat: 35, skyWarm: -20 },
+          sunset: { skyExp: -10, skySat: 30, skyWarm: 55, haze: 15, hazeStart: 50, hazeWarmth: 45 },
+        }[arg]!);
+        break;
       case 'curve': {
         const presets: Record<string, CurvePoint[]> = {
           linear: LINEAR,
@@ -4642,7 +4660,7 @@ export class App {
         while (g.quarter % 4) this.turnGeo('rot');
         this.recrop(g.crop, { x: 0, y: 0, w: 1, h: 1 });
         this.state.geo = defaultState().geo;
-        v.straighten = 0;
+        v.straighten = v.perspV = v.perspH = 0;
         this.aspectId = 'free';
         this.syncAtlasSize();
         break;
@@ -4677,11 +4695,15 @@ export class App {
       g.quarter = (g.quarter + 1) % 4;
       [g.flipH, g.flipV] = [g.flipV, g.flipH];
       g.crop = { x: 1 - c.y - c.h, y: c.x, w: c.h, h: c.w };
+      // perspective is set on the frame: the side it widened turns with the picture
+      [v.perspH, v.perspV] = [v.perspV || 0, -(v.perspH || 0)];
     } else {
       if (kind === 'flipH') g.flipH = !g.flipH;
       else g.flipV = !g.flipV;
       g.crop = kind === 'flipH' ? { ...c, x: 1 - c.x - c.w } : { ...c, y: 1 - c.y - c.h };
       v.straighten = -v.straighten;
+      if (kind === 'flipH') v.perspH = -(v.perspH || 0);
+      else v.perspV = -(v.perspV || 0);
     }
     // the crop went with the picture, so what's placed on the cropped picture moves the same way within it
     this.movePlaced((x, y) => (kind === 'rot' ? [1 - y, x] : kind === 'flipH' ? [1 - x, y] : [x, 1 - y]));
@@ -4812,6 +4834,8 @@ export class App {
     // timeline too), and nothing is shared with the saved starting point
     this.state = { ...cur, ...this.lookState({ ...cur, v: this.look.base.v, curves: this.look.base.curves }, L, this.look.amt / 100) };
     this.state.v.straighten = cur.v.straighten;
+    this.state.v.perspV = cur.v.perspV;
+    this.state.v.perspH = cur.v.perspH;
   }
 
   private buildLooks() {
@@ -4929,7 +4953,7 @@ export class App {
       const d = defaultValues();
       const v: Record<string, number> = {};
       for (const [k, x] of Object.entries(this.state.v)) {
-        if (!['straighten', 'distortion', 'blurX', 'blurY', 'vigX', 'vigY'].includes(k) && !k.startsWith('dx') && x !== d[k]) v[k] = x;
+        if (!['straighten', 'distortion', 'perspV', 'perspH', 'blurX', 'blurY', 'vigX', 'vigY'].includes(k) && !k.startsWith('dx') && x !== d[k]) v[k] = x;
       }
       const looks = this.userLooks();
       looks.push({ name, v, curves: this.state.curves });
@@ -5036,9 +5060,10 @@ export class App {
     })()
       .catch((e) => {
         this.depthFailed = key;
-        if (isAbortError(e)) return this.toast('Lens blur stopped · pick Lens again to carry on', 2600);
+        const what = this.tool?.id === 'air' ? 'Air' : 'Lens blur';
+        if (isAbortError(e)) return this.toast(`${what} stopped · ${what === 'Air' ? 'open Air' : 'pick Lens'} again to carry on`, 2600);
         console.error(e);
-        this.toast('Lens blur needs the depth model: ' + ((e as Error).message || e), 4500);
+        this.toast(`${what} needs the depth model: ` + ((e as Error).message || e), 4500);
       })
       .finally(() => {
         job.done();
@@ -5291,8 +5316,8 @@ export class App {
           const raw = localStorage.getItem('lumen.clipboard');
           if (!raw) return this.toast('Nothing copied yet');
           const c = JSON.parse(raw);
-          const straighten = this.state.v.straighten;
-          this.state.v = { ...defaultValues(), ...c.v, straighten };
+          const { straighten, perspV, perspH } = this.state.v;
+          this.state.v = { ...defaultValues(), ...c.v, straighten, perspV, perspH };
           this.state.curves = c.curves;
           this.commit();
           this.requestRender();
@@ -5732,4 +5757,9 @@ function fmtLen(s: number) {
   const t = Math.round(s), h = Math.floor(t / 3600), m = Math.floor((t % 3600) / 60), sec = t % 60;
   const ss = String(sec).padStart(2, '0');
   return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+}
+
+/** Does the edit use the Air tool (which needs the depth map)? */
+function airOn(v: EditState['v']) {
+  return (v.haze || 0) > 0 || !!v.skyExp || !!v.skySat || !!v.skyWarm;
 }

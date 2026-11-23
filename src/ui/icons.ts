@@ -574,6 +574,17 @@ const A = {
     ###......###/
     ####....####/
     ############`,
+  // far hills fading into haze, a near hill solid
+  air: `
+    ............/
+    .++++.++++++/
+    ............/
+    ......+...../
+    .....+++..../
+    ...#+++++.../
+    ..###+++++../
+    .#####+++++./
+    ############`,
   film: `
     ############/
     #.##.##.##.#/
@@ -909,6 +920,7 @@ export const ICONS = {
   blur: pix(A.blur),
   vignette: pix(A.vignette),
   film: pix(A.film),
+  air: pix(A.air),
   crop: pix(A.crop),
   double: pix(A.double),
   // masks

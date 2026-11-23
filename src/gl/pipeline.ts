@@ -38,6 +38,12 @@ export function coverScale(angleRad: number, fw: number, fh: number) {
   const s = Math.abs(Math.sin(angleRad));
   return Math.max((fw * c + fh * s) / fw, (fw * s + fh * c) / fh);
 }
+/** Keystone strengths for the perspective sliders, and the zoom that keeps the frame covered. */
+export function perspective(v: EditState['v']) {
+  const kh = ((v.perspH || 0) / 100) * 0.45, kv = ((v.perspV || 0) / 100) * 0.45;
+  // the frame's corners map inside the picture once they're pulled in by 1 / (1 + |kh| + |kv|)
+  return { kh, kv, zoom: 1 / (1 + Math.abs(kh) + Math.abs(kv)) };
+}
 export function outputSize(state: EditState, w: number, h: number) {
   const f = frameSize(state.geo, w, h);
   return {
@@ -157,6 +163,17 @@ export class Pipeline {
     });
     if (scaled) g.release(small);
     return [out, dF] as const;
+  }
+
+  /** The depth map put through the photo's crop / turn / perspective, at up to 1024 px. */
+  private frameDepth(B: Target, state: EditState) {
+    const g = this.g, D = this.depth!;
+    const dk = Math.min(1, 1024 / Math.max(B.w, B.h));
+    const dw = Math.max(8, Math.round(B.w * dk)), dh = Math.max(8, Math.round(B.h * dk));
+    const dF = g.acquire(dw, dh);
+    const bare: EditState = { ...state, spots: [], overlay: null, leak: null, fills: [] };
+    this.geometryPass({ tex: D.tex, w: D.w, h: D.h, linear: true }, bare, { w: dw, h: dh }, { x: 0, y: 0, w: dw, h: dh }, dF);
+    return dF;
   }
 
   static lensRange(v: EditState['v']) {
@@ -302,6 +319,9 @@ export class Pipeline {
       gl.uniform1i(p.loc('uQuarter'), ((geo.quarter % 4) + 4) % 4);
       gl.uniform2f(p.loc('uFlip'), geo.flipH ? -1 : 1, geo.flipV ? -1 : 1);
       gl.uniform1f(p.loc('uDistort'), (state.v.distortion / 100) * 0.3);
+      const ps = perspective(state.v);
+      gl.uniform2f(p.loc('uPersp'), ps.kh, ps.kv);
+      gl.uniform1f(p.loc('uPerspZoom'), ps.zoom);
       gl.uniform2f(p.loc('uFull'), full.w, full.h);
       gl.uniform4f(p.loc('uTile'), tile.x, tile.y, tile.w, tile.h);
       const spots = (state.spots ?? []).slice(0, MAX_SPOTS);
@@ -376,7 +396,7 @@ export class Pipeline {
       st && t?.id === st.id ? [st, v[pre + 'Opacity'], v[pre + 'Scale'], v[pre + 'Rot'], v[pre + 'Blend'], v[pre + 'X'], v[pre + 'Y']] : null;
     const ov = [lay(state.overlay, this.overlay, 'dx'), lay(state.leak, this.leak, 'lk')];
     const fill = state.fills?.length && this.fill ? this.fill.key : null;
-    return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, state.spots, ov, fill, this.overlayMaskVer]);
+    return JSON.stringify([src.w, src.h, w, h, state.geo, v.straighten, v.distortion, v.perspV, v.perspH, state.spots, ov, fill, this.overlayMaskVer]);
   }
 
   /** The full-frame analysis image and its large blurs, at (w, h). Cached by geometry. */
@@ -413,7 +433,7 @@ export class Pipeline {
   }
 
   private releaseFx(fx: ReturnType<Pipeline['effects']>) {
-    for (const t of [fx.hal, fx.hal2, fx.glow, fx.glow2, fx.blur1, fx.blur2]) this.g.release(t);
+    for (const t of [fx.hal, fx.hal2, fx.glow, fx.glow2, fx.blur1, fx.blur2, fx.atmo]) this.g.release(t);
   }
 
   private releaseGlobals(glb: Globals) {
@@ -617,19 +637,22 @@ export class Pipeline {
     const gT = 0.25 + (v.glowThreshold / 100) * 0.65, gS = S * (0.008 + (v.glowRadius / 100) ** 1.4 * 0.06);
     const [hal, hal2] = slot('hal', v.halation > 0 ? `${hT}|${hS}` : null, () => make(v.halation, hT, hS, 3.5));
     const [glow, glow2] = slot('glow', v.glow > 0 ? `${gT}|${gS}` : null, () => make(v.glow, gT, gS, 3));
+    // Air: the depth in frame space, made once per photo and geometry
+    const airOn = (v.haze || 0) > 0 || !!v.skyExp || !!v.skySat || !!v.skyWarm;
+    const [atmo] = slot('atmo', airOn && this.depth ? `air|${this.depth.id}` : null, () => [this.frameDepth(B, state), null] as const);
     // lens blur in linear light, so bright points bloom like real bokeh
     if (Math.round(v.blurType) === 3) {
       // lens blur: needs the depth map (until it's ready, the photo shows unblurred)
       const on = v.blurAmt > 0 && this.depth;
       const key = on ? `lens|${this.depth!.id}|${v.blurAmt}|${v.lensRange}|${v.lensBokeh}|${v.blurX}|${v.blurY}` : null;
       const [blur1, blur2] = slot('blur', key, () => this.lensBlur(B, state, devKey ? 14 : 22));
-      return { hal, hal2, glow, glow2, blur1, blur2 };
+      return { hal, hal2, glow, glow2, blur1, blur2, atmo };
     }
     const [blur1, blur2] = slot('blur', v.blurType > 0 && v.blurAmt > 0 ? `${v.blurAmt}` : null, () => {
       const a = v.blurAmt / 100;
       return [this.blur(B, Math.max(1, S * 0.008 * a)), this.blur(B, Math.max(2, S * 0.03 * a))] as const;
     });
-    return { hal, hal2, glow, glow2, blur1, blur2 };
+    return { hal, hal2, glow, glow2, blur1, blur2, atmo };
   }
 
   private finishPass(
@@ -683,6 +706,14 @@ export class Pipeline {
       u1('uDust', (v.filmDust ?? 0) / 100);
       u1('uDustSeed', this.filmFrame.dust);
       u1('uClip', flipY && this.clip ? 1 : 0);
+      this.g.bindTex(p, 'uAtmo', fx.atmo ? fx.atmo.tex : this.black);
+      gl.uniform1i(p.loc('uAtmoOn'), fx.atmo ? 1 : 0);
+      // density, and from how far it starts (0 … 3: the map's nearest thing is 0, a thing 4× as far is 3)
+      gl.uniform4f(p.loc('uHaze'), ((v.haze || 0) / 100) * 0.9, ((v.hazeStart ?? 40) / 100) * 3, 0, 0);
+      // the air's color: a pale grey, warmer or bluer (linear light)
+      const hw = (v.hazeWarmth || 0) / 100;
+      gl.uniform3f(p.loc('uHazeColor'), 0.62 * (1 + 0.12 * hw), 0.64 * (1 + 0.02 * hw), 0.68 * (1 - 0.2 * hw));
+      gl.uniform3f(p.loc('uSky'), (v.skyExp || 0) / 100, (v.skySat || 0) / 100, (v.skyWarm || 0) / 100);
     });
   }
 

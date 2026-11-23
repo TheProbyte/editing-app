@@ -4,11 +4,15 @@
 // against a smooth clock read from the audio output. The sound is one premixed track (see
 // audio.ts), so there's nothing to schedule while playing. Paused, seeking fetches the exact
 // frame (latest request wins).
+//
+// Each run of clips decodes in its own lane. The next lane starts a little before its clip is
+// due (so its first frames are decoded and on the GPU by the cut), and across a transition the
+// two lanes run side by side: the display loop hands both clips' frames over together.
 import { CanvasSink, EncodedPacketSink, type VideoSample, type VideoSampleSink } from 'mediabunny';
 import type { Media, MediaLib } from './media';
 import type { AudioEngine } from './audio';
 import type { GpuFrame } from './compose';
-import { clipAt, clipLen, layout, localAt, srcAt, type VClip, type VideoProject } from './project';
+import { clipAt, clipLen, layout, localAt, mixAt, srcAt, type VClip, type VideoProject } from './project';
 
 export interface Frame {
   clip: VClip;
@@ -27,6 +31,10 @@ export interface Frame {
   upright?: boolean;
   /** shown while a finger is moving (the exact frame follows): draw it the quick way */
   fast?: boolean;
+  /** across a transition: the other clip's frame at the same moment */
+  other?: Frame;
+  /** just this clip, even inside a transition (the edge being trimmed) */
+  solo?: boolean;
 }
 
 /** a decoded frame waiting for its moment */
@@ -36,8 +44,32 @@ interface Queued {
   tl: number;
   pre: GpuFrame | null;
 }
-/** frames decoded ahead (a few: hardware decoders only have so many buffers) */
+/** frames decoded ahead per lane (a few: hardware decoders only have so many buffers) */
 const QMAX = 4;
+/** a lane starts decoding this long before its first clip is due */
+const LEAD = 1;
+
+/** Clips that play one after another through one decoder (the halves of a split…). */
+interface Run {
+  parts: { clip: VClip; start: number }[];
+  /** source time to start decoding at */
+  from: number;
+  /** timeline time it starts and ends */
+  start: number;
+  end: number;
+}
+
+/** A run being played: its decoder's frames waiting for their moment, and the one on screen. */
+interface Lane {
+  run: Run;
+  /** which texture ring its frames go into (neighbouring lanes never share one) */
+  ring: number;
+  queue: Queued[];
+  cur: Queued | null;
+  /** nothing more will be decoded */
+  done: boolean;
+  space: (() => void) | null;
+}
 
 /** Memory for frames kept for scrubbing backwards (small bitmaps), and the fewest kept. */
 const REV_BYTES = 240e6;
@@ -62,19 +94,19 @@ export class Player {
   private startT = 0;
   private nodes: AudioScheduledSourceNode[] = [];
   private vSinks = new Map<string, VideoSampleSink>();
-  private queue: Queued[] = [];
-  private cur: Queued | null = null;
+  private lanes: Lane[] = [];
+  private runs: Run[] = [];
+  private nextRun = 0;
   private imgT = 0;
-  private space: (() => void) | null = null;
   private lastTime = 0;
   /** true when stills need redrawing while playing (moving grain, flicker…) */
   stillMoves: () => boolean = () => false;
-  /** copies a decoded frame to the GPU (set by the video editor) */
-  upload: (vf: VideoFrame) => GpuFrame = () => {
+  /** copies a decoded frame to the GPU, into a lane's ring (set by the video editor) */
+  upload: (vf: VideoFrame, ring: number) => GpuFrame = () => {
     throw new Error('no uploader');
   };
   private seekBusy = false;
-  private seekWant: { T: number; fast: boolean } | null = null;
+  private seekWant: { T: number; fast: boolean; solo?: string } | null = null;
   private master: GainNode | null = null;
 
   /** a frame to show (the receiver closes the sample) */
@@ -95,6 +127,12 @@ export class Player {
     const t = Math.max(this.startT, this.startT + (this.audioNow() - this.ctxStart));
     if (t > this.lastTime) this.lastTime = t;
     return this.lastTime;
+  }
+
+  /** How far the sound being made runs ahead of the sound being heard (the output's delay), seconds. */
+  outputDelay() {
+    if (!this.ctx) return 0;
+    return Math.max(0, Math.min(0.5, this.ctx.currentTime - this.audioNow()));
   }
 
   private audioNow() {
@@ -128,6 +166,7 @@ export class Player {
     clearTimeout(this.settle);
     this.seekWant = null;
     this.closeScrub();
+    this.closeOther();
     this.clearRev();
     this.scrubClip = '';
   }
@@ -137,8 +176,11 @@ export class Player {
     if (!this.playing) this.T = Math.max(0, T);
   }
 
-  /** Show the frame at T without moving the playhead (e.g. the edge being trimmed). */
-  peek(T: number, fast = false) {
+  /**
+   * Show the frame at T without moving the playhead (e.g. the edge being trimmed: `solo`, that
+   * clip's own frame even where a transition shows two).
+   */
+  peek(T: number, fast = false, solo?: string) {
     // how fast the finger is going, in timeline seconds per second
     const now = performance.now(), dt = now - this.lastReq.at;
     if (fast && dt > 0) {
@@ -151,10 +193,10 @@ export class Player {
     const d = T - this.hist[0][1];
     this.dragDir = fast && Math.abs(d) > 0.06 ? Math.sign(d) : 0;
     this.lastReq = { T, at: now };
-    this.seekWant = { T: Math.max(0, T), fast };
+    this.seekWant = { T: Math.max(0, T), fast, solo };
     clearTimeout(this.settle);
     // the exact frame once requests stop coming
-    if (fast) this.settle = window.setTimeout(() => this.peek(T, false), 110);
+    if (fast) this.settle = window.setTimeout(() => this.peek(T, false, solo), 110);
     if (!this.seekBusy) void this.seekLoop();
   }
   private settle = 0;
@@ -286,6 +328,62 @@ export class Player {
     this.scrub = null;
     sc.peek?.close();
     void sc.it.return().catch(() => {});
+  }
+
+  // ---- paused inside a transition, the other clip's frame comes from a second decoder of its
+  // own (kept going forwards like the first one), or from the key frame cache while dragging
+
+  private other: { media: string; it: AsyncGenerator<VideoSample, void, unknown>; ts: number; peek: VideoSample | null } | null = null;
+
+  private closeOther() {
+    const o = this.other;
+    if (!o) return;
+    this.other = null;
+    o.peek?.close();
+    void o.it.return().catch(() => {});
+  }
+
+  /** The other clip's frame for a transition at timeline time T (the receiver closes its sample). */
+  private async otherFrame(clip: VClip, start: number, T: number, fast: boolean): Promise<Frame | null> {
+    const m = this.lib.get(clip.src);
+    if (!m) return null;
+    if (m.kind === 'image') return { clip, media: m, sample: null, t: T };
+    const sink = this.vSink(m);
+    if (!sink) return null;
+    const t = Math.min(clip.out - 1e-4, Math.max(clip.in, srcAt(clip, T - start)), m.duration - 1e-3);
+    if (fast && this.speed > 1.5) {
+      // dragging quickly: the nearest cached key frame will do
+      let best: { ts: number; bmp: ImageBitmap } | null = null;
+      for (const k of this.keys.get(m.id) ?? []) if (!best || Math.abs(k.ts - t) < Math.abs(best.ts - t)) best = k;
+      if (best && Math.abs(best.ts - t) < 1.2) return { clip, media: m, sample: null, bitmap: best.bmp, ts: best.ts, t: T, upright: true };
+    }
+    let o = this.other?.media === m.id ? this.other : null;
+    if (!o || t < o.ts - 1e-4 || t - o.ts > 1.5) {
+      this.closeOther();
+      const it = sink.samples(await this.keyTime(m, t));
+      const r = await it.next();
+      if (r.done) {
+        void it.return();
+        return null;
+      }
+      o = this.other = { media: m.id, it, ts: r.value.timestamp, peek: r.value };
+    }
+    let cur = o.peek;
+    o.peek = null;
+    for (;;) {
+      if (cur && cur.timestamp + (cur.duration || 1 / 60) > t + 1e-4) break;
+      const r = await o.it.next();
+      if (r.done) break;
+      if (r.value.timestamp > t + 1e-4) {
+        o.peek = r.value;
+        break;
+      }
+      cur?.close();
+      cur = r.value;
+    }
+    if (!cur) return null;
+    o.ts = cur.timestamp;
+    return { clip, media: m, sample: cur, t: T };
   }
 
   private async keyTime(m: Media, t: number) {
@@ -514,17 +612,33 @@ export class Player {
     this.seekBusy = true;
     try {
       while (this.seekWant !== null && !this.disposed) {
-        const { T, fast } = this.seekWant;
+        const { T, fast, solo } = this.seekWant;
         this.seekWant = null;
         const p = this.project();
-        const at = clipAt(p, T);
+        const L = layout(p);
+        let at = clipAt(p, T, L);
+        const si = solo ? p.clips.findIndex((c) => c.id === solo) : -1;
+        if (si >= 0) {
+          const c = p.clips[si];
+          at = { i: si, start: L.starts[si], src: Math.min(c.out - 1e-4, Math.max(c.in, srcAt(c, T - L.starts[si]))) };
+        }
         if (!at) continue;
         const clip = p.clips[at.i];
         const m = this.lib.get(clip.src);
         if (!m) continue;
+        // inside a transition: the other clip's frame goes along with this one's
+        const mix = si >= 0 ? null : mixAt(p, T, L);
+        const oi = mix ? (mix.a === at.i ? mix.b : mix.a) : -1;
+        const show = async (f: Frame) => {
+          if (oi >= 0) {
+            const o = await this.otherFrame(p.clips[oi], L.starts[oi], T, fast).catch(() => null);
+            if (o) f.other = o;
+          } else if (si >= 0) f.solo = true;
+          this.onFrame(f);
+        };
         if (m.kind === 'image') {
           this.scrubClip = clip.id;
-          this.onFrame({ clip, media: m, sample: null, t: T });
+          await show({ clip, media: m, sample: null, t: T });
           continue;
         }
         const sink = this.vSink(m);
@@ -552,7 +666,7 @@ export class Player {
           if (k) {
             // the decoder is behind it: start it again from this key frame (t's own, going forward)
             if (dir > 0) this.closeScrub();
-            this.onFrame({ clip, media: m, sample: null, bitmap: k.bmp, ts: k.ts, t: T, upright: true, fast: true });
+            await show({ clip, media: m, sample: null, bitmap: k.bmp, ts: k.ts, t: T, upright: true, fast: true });
             this.shownTs = { media: m.id, ts: k.ts, end: k.ts + 1 / (m.fps || 30) };
             this.lastT = { media: m.id, t };
             continue;
@@ -566,9 +680,10 @@ export class Player {
             this.probeAt = now;
           }
         }
-        // still on the frame that's showing (slow drags, wobbles): nothing to do
+        // still on the frame that's showing (slow drags, wobbles): nothing to do (unless a
+        // transition moves on meanwhile)
         const sh = this.shownTs;
-        if (fast && sh.media === m.id && t >= sh.ts - 1e-4 && t < sh.end - 1e-4) {
+        if (fast && oi < 0 && sh.media === m.id && t >= sh.ts - 1e-4 && t < sh.end - 1e-4) {
           this.lastT = { media: m.id, t };
           continue;
         }
@@ -583,7 +698,7 @@ export class Player {
             continue;
           }
           if (b) {
-            this.onFrame({ clip, media: m, sample: null, bitmap: b.bmp, ts: b.ts, t: T, fast: true });
+            await show({ clip, media: m, sample: null, bitmap: b.bmp, ts: b.ts, t: T, fast: true });
             this.shownTs = { media: m.id, ts: b.ts, end: b.end };
             this.lastT = { media: m.id, t };
             this.prefetchBack(m, sink, t);
@@ -598,7 +713,7 @@ export class Player {
         }
         if (s) {
           this.shownTs = { media: m.id, ts: s.timestamp, end: s.timestamp + (s.duration || 1 / (m.fps || 30)) };
-          this.onFrame({ clip, media: m, sample: s, t: T, fast });
+          await show({ clip, media: m, sample: s, t: T, fast });
           // stopped on a frame: have the second before it ready in case the finger goes back
           if (!fast && !this.seekWant) this.prefetchBack(m, sink, t);
         }
@@ -607,6 +722,7 @@ export class Player {
     } catch (e) {
       console.warn('seek failed', e);
       this.closeScrub();
+      this.closeOther();
     } finally {
       this.seekBusy = false;
     }
@@ -614,19 +730,33 @@ export class Player {
 
   // ---- playback
 
+  /** The sound output (made on first use; resumed, as it rests after a pause). */
+  async audioCtx() {
+    this.ctx ??= new AudioContext({ latencyHint: 'playback', sampleRate: 48000 });
+    if (this.ctx.state !== 'running') await this.ctx.resume();
+    clearTimeout(this.idle);
+    return this.ctx;
+  }
+
+  /** How the clock started: timeline time `startT` was heard at context time `ctxStart` (playing only). */
+  clock() {
+    return this.playing ? { startT: this.startT, ctxStart: this.ctxStart } : null;
+  }
+
   async play() {
     const p = this.project();
     const { total } = layout(p);
     if (!p.clips.length) return;
     if (this.T >= total - 0.05) this.T = 0;
-    this.ctx ??= new AudioContext({ latencyHint: 'playback', sampleRate: 48000 });
-    if (this.ctx.state !== 'running') await this.ctx.resume();
+    await this.audioCtx();
+    const ctx = this.ctx!;
     if (!this.master) {
-      this.master = this.ctx.createGain();
-      this.master.connect(this.ctx.destination);
+      this.master = ctx.createGain();
+      this.master.connect(ctx.destination);
     }
-    // the scrub decoder isn't needed while playing (phones have only a few decoders)
+    // the scrub decoders aren't needed while playing (phones have only a few decoders)
     this.closeScrub();
+    this.closeOther();
     clearTimeout(this.settle);
     clearTimeout(this.idle);
     this.seekWant = null;
@@ -641,23 +771,25 @@ export class Player {
     const token = ++this.token;
     this.startT = this.T;
     this.lastTime = this.T;
-    this.ctxStart = this.ctx.currentTime + 3600; // the clock holds at startT until it really starts
-    this.queue = [];
-    this.cur = null;
+    this.ctxStart = ctx.currentTime + 3600; // the clock holds at startT until it really starts
+    this.lanes = [];
+    this.runs = this.plan(this.startT);
+    this.nextRun = 0;
+    this.shownKey = '';
     // the soundtrack (normally mixed already, in the background after each edit) and the
     // first frame, both ready before the clock starts
     const mixP = this.audio.mix(p);
-    void this.produce(token, this.plan(this.startT));
+    this.feed(token);
     const firstFrame = new Promise<void>((r) => {
       const t0 = performance.now();
-      const wait = () => (this.queue.length || !this.alive(token) || performance.now() - t0 > 1500 ? r() : setTimeout(wait, 4));
+      const wait = () => (this.lanes.some((l) => l.queue.length) || !this.alive(token) || performance.now() - t0 > 1500 ? r() : setTimeout(wait, 4));
       wait();
     });
     const [mix] = await Promise.all([mixP.catch(() => null), firstFrame]);
     if (!this.alive(token)) return;
-    this.ctxStart = this.ctx.currentTime + 0.05;
+    this.ctxStart = ctx.currentTime + 0.05;
     if (mix && this.startT < mix.duration) {
-      const src = this.ctx.createBufferSource();
+      const src = ctx.createBufferSource();
       src.buffer = mix;
       src.connect(this.master);
       src.start(this.ctxStart, this.startT);
@@ -679,8 +811,11 @@ export class Player {
       }
     }
     this.nodes = [];
-    this.queue = [];
-    this.space?.();
+    for (const l of this.lanes) {
+      l.queue = [];
+      l.space?.();
+    }
+    this.lanes = [];
     // the sound output rests after a few quiet seconds (it wakes on the next play)
     clearTimeout(this.idle);
     this.idle = window.setTimeout(() => !this.playing && void this.ctx?.suspend().catch(() => {}), 4000);
@@ -693,41 +828,65 @@ export class Player {
     return this.playing && token === this.token;
   }
 
-  /** Clips from the one under T onward: their timeline start and where in the source to begin. */
-  private plan(T: number) {
+  /**
+   * The runs to play from T on: from the first clip still playing at T (inside a transition,
+   * the outgoing one: the incoming one's lane starts straight away). Each starts decoding where
+   * T falls in it, or at its beginning.
+   */
+  private plan(T: number): Run[] {
     const p = this.project();
-    const { starts } = layout(p);
-    const at = clipAt(p, T);
-    if (!at) return [];
-    const items = p.clips.slice(at.i).map((c, k) => ({ clip: c, start: starts[at.i + k], from: k === 0 ? at.src : c.in }));
-    // clips that carry straight on in the same file (the halves of a split) play as one run,
-    // through one decoder: no restart at the cut
-    const runs: { parts: { clip: VClip; start: number }[]; from: number }[] = [];
-    for (const it of items) {
+    const L = layout(p);
+    let i0 = p.clips.findIndex((c, i) => T < L.starts[i] + clipLen(c));
+    if (i0 < 0) i0 = p.clips.length - 1;
+    if (i0 < 0) return [];
+    const runs: Run[] = [];
+    for (let i = i0; i < p.clips.length; i++) {
+      const c = p.clips[i], start = L.starts[i], end = start + clipLen(c);
       const last = runs[runs.length - 1], prev = last?.parts[last.parts.length - 1].clip;
-      if (prev && prev.kind === 'video' && it.clip.kind === 'video' && prev.src === it.clip.src && Math.abs(it.clip.in - prev.out) < 1e-3) last.parts.push({ clip: it.clip, start: it.start });
-      else runs.push({ parts: [{ clip: it.clip, start: it.start }], from: it.from });
+      // clips that carry straight on in the same file (the halves of a split) play as one run,
+      // through one decoder: no restart at the cut (unless a transition overlaps them there)
+      if (prev && !L.ov[i] && prev.kind === 'video' && c.kind === 'video' && prev.src === c.src && Math.abs(c.in - prev.out) < 1e-3) {
+        last.parts.push({ clip: c, start });
+        last.end = end;
+      } else {
+        const from = T > start ? Math.min(c.out, Math.max(c.in, srcAt(c, T - start))) : c.in;
+        runs.push({ parts: [{ clip: c, start }], from, start, end });
+      }
     }
     return runs;
   }
 
-  /** Decode ahead, clip after clip, copying frames to the GPU as they come. */
-  private async produce(token: number, plan: ReturnType<Player['plan']>) {
+  /**
+   * Start lanes as they're needed: at most two at once (two decoders), the next one as soon as
+   * the one before it has decoded everything, or a moment before its clip is due.
+   */
+  private feed(token: number) {
+    while (this.alive(token) && this.nextRun < this.runs.length && this.lanes.length < 2) {
+      const r = this.runs[this.nextRun];
+      const prev = this.lanes[this.lanes.length - 1];
+      if (prev && !prev.done && this.time < r.start - LEAD) break;
+      const lane: Lane = { run: r, ring: this.nextRun & 1, queue: [], cur: null, done: false, space: null };
+      this.lanes.push(lane);
+      this.nextRun++;
+      void this.produce(token, lane);
+    }
+  }
+
+  /** Decode a run ahead, copying frames to the GPU as they come. */
+  private async produce(token: number, lane: Lane) {
     const room = async () => {
-      while (this.alive(token) && this.queue.length >= QMAX) await new Promise<void>((r) => (this.space = r));
+      while (this.alive(token) && lane.queue.length >= QMAX) await new Promise<void>((r) => (lane.space = r));
     };
-    for (const { parts, from } of plan) {
-      if (!this.alive(token)) return;
+    const { parts, from } = lane.run;
+    try {
       const m = this.lib.get(parts[0].clip.src);
-      if (!m) continue;
+      if (!m) return;
       if (m.kind === 'image') {
-        await room();
-        if (!this.alive(token)) return;
-        this.queue.push({ clip: parts[0].clip, media: m, tl: parts[0].start, pre: null });
-        continue;
+        lane.queue.push({ clip: parts[0].clip, media: m, tl: parts[0].start, pre: null });
+        return;
       }
       const sink = this.vSink(m);
-      if (!sink) continue;
+      if (!sink) return;
       let it = sink.samples(from, parts[parts.length - 1].clip.out);
       let lastTl = -Infinity, pi = 0, first = true;
       try {
@@ -769,53 +928,96 @@ export class Player {
           const vf = s.toVideoFrame();
           let pre: GpuFrame;
           try {
-            pre = this.upload(vf);
+            pre = this.upload(vf, lane.ring);
           } finally {
             vf.close();
             s.close();
           }
-          this.queue.push({ clip, media: m, tl, pre });
+          lane.queue.push({ clip, media: m, tl, pre });
           await room();
         }
-      } catch (e) {
-        console.warn('playback decode failed', e);
       } finally {
         void it.return().catch(() => {});
       }
+    } catch (e) {
+      console.warn('playback decode failed', e);
+    } finally {
+      lane.done = true;
+      // the next lane can start now
+      this.feed(token);
     }
   }
+
+  /** what was handed over last (to tell when there's something new to show) */
+  private shownKey = '';
 
   /** One loop, once per screen refresh: show the frame that's due, move the playhead. */
   private present(token: number) {
     let prev = 0;
+    const ids = new WeakMap<Queued, number>();
+    let nid = 0;
+    const id = (q: Queued | null) => {
+      if (!q) return 0;
+      let n = ids.get(q);
+      if (!n) ids.set(q, (n = ++nid));
+      return n;
+    };
     const step = (now: number) => {
       if (!this.alive(token)) return;
       if (prev && now - prev > 3 && now - prev < 40) this.refresh += ((now - prev) / 1000 - this.refresh) * 0.1;
       prev = now;
       const t = this.time;
-      const total = layout(this.project()).total;
-      if (t >= total) {
+      const p = this.project();
+      const L = layout(p);
+      if (t >= L.total) {
         this.pause();
-        this.T = total;
-        this.onTime(total);
+        this.T = L.total;
+        this.onTime(L.total);
         this.onEnd();
         return;
       }
-      let due: Queued | null = null;
-      while (this.queue.length && this.queue[0].tl <= t + 0.002) {
-        const q = this.queue.shift()!;
-        if (due) this.drops++; // a later frame is due too: this one never got its moment
-        due = q;
+      // each lane: the latest of its frames that's due
+      for (const lane of this.lanes) {
+        let due: Queued | null = null;
+        while (lane.queue.length && lane.queue[0].tl <= t + 0.002) {
+          const q = lane.queue.shift()!;
+          if (due) this.drops++; // a later frame is due too: this one never got its moment
+          due = q;
+        }
+        if (due) {
+          this.shown++;
+          lane.cur = due;
+          lane.space?.();
+        }
       }
-      if (due) {
-        this.shown++;
-        this.cur = due;
-        this.onFrame({ clip: due.clip, media: due.media, sample: null, pre: due.pre ?? undefined, t: due.tl });
-        this.space?.();
-      } else if (this.cur && this.cur.media.kind === 'image' && ((this.cur.clip.kf?.length ?? 0) > 1 || this.stillMoves()) && t - this.imgT >= 1 / 60) {
-        // a photo with keyframes (or moving grain) moves on its own (it has no frames): 60 updates a second
+      // lanes whose clips are over (and the next ones, now there's room)
+      const before = this.lanes.length;
+      this.lanes = this.lanes.filter((l) => !(l.done && !l.queue.length && t >= l.run.end));
+      if (this.lanes.length !== before || this.nextRun < this.runs.length) this.feed(token);
+      // the frame of a clip at T: from the lane playing it
+      const laneOf = (i: number) => this.lanes.find((l) => l.run.parts.some((x) => x.clip === p.clips[i])) ?? null;
+      const at = clipAt(p, t, L);
+      const mix = mixAt(p, t, L);
+      let main: Queued | null = null, other: Queued | null = null;
+      if (at) {
+        main = laneOf(at.i)?.cur ?? null;
+        if (mix) other = laneOf(mix.a === at.i ? mix.b : mix.a)?.cur ?? null;
+        // (the incoming clip's lane hasn't got a frame yet: keep showing what there is)
+        if (!main) [main, other] = [other, null];
+      }
+      main ??= this.lanes[0]?.cur ?? null;
+      const key = `${id(main)}:${id(other)}`;
+      const still = main && main.media.kind === 'image' && ((main.clip.kf?.length ?? 0) > 1 || this.stillMoves()) && t - this.imgT >= 1 / 60;
+      if (main && (key !== this.shownKey || (mix && other) || still)) {
+        // (a transition moves on every refresh, like a photo with keyframes or moving grain)
+        this.shownKey = key;
         this.imgT = t;
-        this.onFrame({ clip: this.cur.clip, media: this.cur.media, sample: null, t });
+        const fr = (q: Queued): Frame => ({ clip: q.clip, media: q.media, sample: null, pre: q.pre ?? undefined, t: q.media.kind === 'image' ? t : q.tl });
+        const f = fr(main);
+        if (other) f.other = fr(other);
+        // the timeline time the picture is for: the frame's own, or now for a transition / still
+        if (mix && other) f.t = t;
+        this.onFrame(f);
       }
       this.onTime(t);
       requestAnimationFrame(step);
@@ -831,6 +1033,7 @@ export class Player {
     clearTimeout(this.settle);
     this.seekWant = null;
     this.closeScrub();
+    this.closeOther();
     this.clearRev();
     for (const K of this.keys.values()) for (const k of K) k.bmp.close();
     this.keys.clear();

@@ -5763,10 +5763,17 @@ function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditStat
     if (x.in !== y.in || x.out !== y.out) return 'Trim';
     if (j(x.kf) !== j(y.kf)) return (y.kf?.length ?? 0) !== (x.kf?.length ?? 0) ? 'Keyframe' : 'Framing';
     if (j(x.tf) !== j(y.tf)) return 'Framing';
+    if (j(x.tr) !== j(y.tr)) return !y.tr ? 'Transition removed' : 'Transition';
+    if (x.fin !== y.fin || x.fout !== y.fout) return 'Fade';
   }
   if (a.bg !== b.bg || a.bgColor !== b.bgColor || a.bgGrad !== b.bgGrad || a.bgImg !== b.bgImg || a.bgBlur !== b.bgBlur) return 'Background';
   if (j(a.texts) !== j(b.texts)) return b.texts.length > a.texts.length ? 'Text added' : b.texts.length < a.texts.length ? 'Text deleted' : 'Text';
   if (j(a.music) !== j(b.music)) return !a.music ? 'Music added' : !b.music ? 'Music removed' : 'Music';
+  if (j(a.voice) !== j(b.voice)) {
+    const n = a.voice?.length ?? 0, m = b.voice?.length ?? 0;
+    return m > n ? 'Voiceover' : m < n ? 'Voiceover deleted' : 'Voiceover';
+  }
+  if (a.duck !== b.duck) return 'Ducking';
   return 'Canvas';
 }
 

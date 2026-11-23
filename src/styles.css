@@ -586,3 +586,16 @@ input[type=text] { width: 100%; font: 600 16px var(--ui); color: var(--ink); bac
   background: rgba(10, 10, 10, 0.72); border-right: 2px solid var(--accent);
 }
 #perf.on { display: block; }
+
+/* ---- video: recording a voiceover (red), transitions */
+.tile.rec .b { background: var(--danger); color: #fff; }
+.tile.rec.on .b { animation: recpulse 1s steps(2) infinite; }
+.tile.rec small { color: var(--ink); }
+#tlPlay.rec { background: var(--danger); color: #fff; }
+#tlRec { display: inline-flex; align-items: center; gap: 6px; font: 600 12px var(--mono); color: var(--danger); letter-spacing: 0.04em; font-variant-numeric: tabular-nums; }
+#tlRec[hidden] { display: none; }
+#tlRec i { width: 8px; height: 8px; background: var(--danger); animation: recpulse 1s steps(2) infinite; }
+#tlRec.count { color: var(--ink); font-size: 15px; }
+#tlRec.count i { animation: none; }
+.tile.off { opacity: 0.35; pointer-events: none; }
+@keyframes recpulse { 50% { opacity: 0.35; } }

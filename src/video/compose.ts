@@ -1,7 +1,9 @@
 // GPU side of the video editor: puts a clip's frame into the project frame (rotation from
-// the file, fit or fill, a soft blurred / black / white background) and draws text titles
-// over the finished picture.
+// the file, fit or fill, a soft blurred / black / white background), joins two clips' frames
+// across a transition, and draws over the finished picture what goes over it: fades and dips to
+// black or white, a film burn's flash, then the text titles.
 import { GL, Program, type Target } from '../gl/glutil';
+import type { TransKind } from './project';
 
 const COMPOSE = `#version 300 es
 precision highp float;
@@ -63,6 +65,112 @@ void main() {
   o = texture(uTex, uFlipY == 1 ? vec2(vUv.x, 1.0 - vUv.y) : vUv);
 }`;
 
+// Two clips' frames, each already placed in the project frame, joined across a transition.
+// `uF` goes 0 → 1 through it. Dips and the film burn only switch from one clip to the other here
+// (hidden by their black / white / flash, which go over the finished picture: see OVERLAY).
+const MIX = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 o;
+uniform sampler2D uA;
+uniform sampler2D uB;
+uniform int uKind;      // 0 crossfade, 1 switch at the middle, 2 zoom, 3 whip, 4 quick crossfade at the middle
+uniform float uF;
+vec3 A(vec2 uv) { return texture(uA, uv).rgb; }
+vec3 B(vec2 uv) { return texture(uB, uv).rgb; }
+// a zoom from the centre, smeared towards it (k: how much)
+vec3 zoomA(vec2 uv, float s, float k) {
+  vec3 c = vec3(0.0);
+  for (int i = 0; i < 10; i++) c += A(0.5 + (uv - 0.5) / (s * (1.0 + k * float(i) / 9.0)));
+  return c / 10.0;
+}
+vec3 zoomB(vec2 uv, float s, float k) {
+  vec3 c = vec3(0.0);
+  for (int i = 0; i < 10; i++) c += B(0.5 + (uv - 0.5) / (s * (1.0 + k * float(i) / 9.0)));
+  return c / 10.0;
+}
+// the two frames side by side (A then B): what a whip pan slides along
+vec3 strip(float x, float y) { return x < 1.0 ? A(vec2(x, y)) : B(vec2(x - 1.0, y)); }
+void main() {
+  float f = clamp(uF, 0.0, 1.0);
+  if (uKind == 0) { o = vec4(mix(A(vUv), B(vUv), f), 1.0); return; }
+  if (uKind == 1) { o = vec4(f < 0.5 ? A(vUv) : B(vUv), 1.0); return; }
+  if (uKind == 4) { o = vec4(mix(A(vUv), B(vUv), smoothstep(0.4, 0.6, f)), 1.0); return; }
+  if (uKind == 2) {
+    // push in: the outgoing shot rushes towards you, the incoming one lands from close up
+    float u = min(1.0, f * 2.0), w = max(0.0, f * 2.0 - 1.0);
+    vec3 a = zoomA(vUv, 1.0 + 1.4 * u * u, 0.22 * u);
+    vec3 b = zoomB(vUv, 1.0 + 1.4 * (1.0 - w) * (1.0 - w), 0.22 * (1.0 - w));
+    o = vec4(mix(a, b, smoothstep(0.42, 0.58, f)), 1.0);
+    return;
+  }
+  // whip pan: the picture slides off sideways, fastest in the middle, smeared along the way
+  float e = f < 0.5 ? 4.0 * f * f * f : 1.0 - pow(-2.0 * f + 2.0, 3.0) / 2.0;
+  float v = f < 0.5 ? 12.0 * f * f : 3.0 * pow(-2.0 * f + 2.0, 2.0);   // its speed, 0 … 3
+  float L = 0.09 * v;
+  vec3 c = vec3(0.0);
+  for (int j = 0; j < 16; j++) c += strip(vUv.x + e + L * (float(j) / 15.0 - 0.5), vUv.y);
+  o = vec4(c / 16.0, 1.0);
+}`;
+
+// Over the finished picture: a flat colour (fades and dips; premultiplied, blended over), or a
+// film burn: warm light blooming out of a few drifting hot spots until, at the middle of the
+// transition, it overexposes the whole frame (screen-blended, so it only ever brightens).
+const OVERLAY = `#version 300 es
+precision highp float;
+in vec2 vUv;
+out vec4 o;
+uniform int uMode;      // 0 colour, 1 burn
+uniform vec3 uColor;
+uniform float uA;
+uniform float uF;
+uniform float uSeed;
+uniform vec2 uOut;
+float h(vec2 p) { return fract(sin(dot(p, vec2(127.1, 311.7)) + uSeed) * 43758.5453); }
+float noise(vec2 p) {
+  vec2 i = floor(p), f = fract(p);
+  f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(h(i), h(i + vec2(1.0, 0.0)), f.x), mix(h(i + vec2(0.0, 1.0)), h(i + vec2(1.0, 1.0)), f.x), f.y);
+}
+void main() {
+  if (uMode == 0) { o = vec4(uColor * uA, uA); return; }
+  float f = clamp(uF, 0.0, 1.0);
+  float env = pow(sin(3.14159265 * f), 1.8);
+  vec2 asp = vec2(uOut.x / max(1.0, uOut.y), 1.0);
+  vec2 p = vUv * asp;
+  float I = 0.0;
+  for (int k = 0; k < 4; k++) {
+    float fk = float(k);
+    vec2 c = vec2(h(vec2(fk, 1.0)), h(vec2(fk, 2.0))) * asp;
+    c += (vec2(h(vec2(fk, 3.0)), h(vec2(fk, 4.0))) - 0.5) * 0.7 * f;
+    float r = 0.14 + 0.2 * h(vec2(fk, 5.0)) + 0.4 * env;
+    float d = length(p - c) / r;
+    I += exp(-d * d * 2.0);
+  }
+  float n = noise(p * 3.0 + vec2(f * 2.0, -f * 1.3)) * 0.6 + noise(p * 9.0 - f * 4.0) * 0.4;
+  I = (I * (0.5 + 0.7 * n)) * env * 1.0 + pow(env, 6.0) * 1.1;
+  // flickers a little, like light leaking through a gate
+  I *= 0.9 + 0.2 * noise(vec2(f * 40.0, uSeed));
+  // deep red at the fringe, orange, then amber; only the very hottest part burns out to a pale yellow
+  vec3 warm = mix(vec3(0.65, 0.04, 0.0), vec3(1.0, 0.3, 0.02), smoothstep(0.05, 0.5, I));
+  warm = mix(warm, vec3(1.0, 0.58, 0.1), smoothstep(0.45, 0.95, I));
+  warm = mix(warm, vec3(1.0, 0.86, 0.55), smoothstep(1.1, 1.8, I));
+  o = vec4(clamp(warm * min(1.0, I * 1.1), 0.0, 1.0), 1.0);
+}`;
+
+/** What goes over the finished picture at one moment (see VideoMode.overlayAt). */
+export interface Overlay {
+  /** 0 … 1 */
+  black: number;
+  white: number;
+  /** a film burn: how far through it (null: none), and a number that makes each burn its own */
+  burn: number | null;
+  seed: number;
+}
+
+/** The transition kinds as the mix shader knows them. */
+const MIX_KIND: Record<TransKind, number> = { fade: 0, black: 1, white: 1, zoom: 2, whip: 3, burn: 4 };
+
 export interface FrameSource {
   tex: WebGLTexture;
   /** raw (coded) size */
@@ -111,22 +219,34 @@ export interface Placement {
 export class Compositor {
   private compose: Program;
   private over: Program;
-  /** the raw decoded frame (re-specified each frame, so not an immutable texture) */
+  private mixP: Program;
+  private overlayP: Program;
+  /**
+   * the raw decoded frame (re-specified each frame, so not an immutable texture); a second one
+   * for the other clip of a transition
+   */
   raw: WebGLTexture;
-  private rawSize = { w: 0, h: 0 };
-  private rawMip = false;
+  private raws: WebGLTexture[];
+  private rawSizes = [{ w: 0, h: 0 }, { w: 0, h: 0 }];
+  private rawMips = [false, false];
+  /** the two clips of a transition, each placed in the project frame */
+  private mixT: Target[] = [];
   private bgT: Target | null = null;
   private textTex: WebGLTexture;
   private textKey = '';
   private textOn = false;
   private textCanvas = document.createElement('canvas');
-  private ring: GpuFrame[] = [];
-  private ringNext = 0;
+  /** one ring per playback lane (two clips decode at once across a transition) */
+  private rings: GpuFrame[][] = [[], []];
+  private ringNext = [0, 0];
 
   constructor(private g: GL) {
     this.compose = new Program(g.gl, COMPOSE, 'compose');
     this.over = new Program(g.gl, OVER, 'overlay');
+    this.mixP = new Program(g.gl, MIX, 'transition');
+    this.overlayP = new Program(g.gl, OVERLAY, 'video overlay');
     this.raw = this.mutableTex();
+    this.raws = [this.raw, this.mutableTex()];
     this.textTex = this.mutableTex();
   }
 
@@ -142,27 +262,28 @@ export class Compositor {
     return t;
   }
 
-  /** Upload a decoded frame (VideoFrame, bitmap, canvas) into the raw texture. */
-  upload(img: TexImageSource, w: number, h: number, outLong: number, quality = true) {
+  /** Upload a decoded frame (VideoFrame, bitmap, canvas) into a raw texture (1: a transition's other clip). */
+  upload(img: TexImageSource, w: number, h: number, outLong: number, quality = true, slot: 0 | 1 = 0) {
     const gl = this.g.gl;
-    gl.bindTexture(gl.TEXTURE_2D, this.raw);
+    gl.bindTexture(gl.TEXTURE_2D, this.raws[slot]);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
-    this.rawSize = { w, h };
+    this.rawSizes[slot] = { w, h };
     // shrinking a lot (a 4K clip in a small preview): mipmaps keep fine detail from shimmering
     // (skipped during playback, where a frame is gone before you'd notice)
     const mip = quality && Math.max(w, h) > outLong * 1.6;
     if (mip) gl.generateMipmap(gl.TEXTURE_2D);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mip ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);
-    this.rawMip = mip;
+    this.rawMips[slot] = mip;
   }
 
-  /** Copy a decoded frame into the next ring texture (playback). */
-  uploadRing(img: TexImageSource, w: number, h: number): GpuFrame {
+  /** Copy a decoded frame into the next texture of a lane's ring (playback). */
+  uploadRing(img: TexImageSource, w: number, h: number, lane = 0): GpuFrame {
     const gl = this.g.gl;
-    if (this.ring.length < RING) this.ring.push({ tex: this.mutableTex(), w: 1, h: 1 });
-    const slot = this.ring[this.ringNext];
-    this.ringNext = (this.ringNext + 1) % RING;
+    const ring = this.rings[lane & 1];
+    if (ring.length < RING) ring.push({ tex: this.mutableTex(), w: 1, h: 1 });
+    const slot = ring[this.ringNext[lane & 1]];
+    this.ringNext[lane & 1] = (this.ringNext[lane & 1] + 1) % RING;
     gl.bindTexture(gl.TEXTURE_2D, slot.tex);
     gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
@@ -263,7 +384,8 @@ export class Compositor {
       gl.uniform3fv(p.loc('uBgColor'), bg.color);
       gl.uniform1f(p.loc('uBgDim'), bg.dim);
       // shrinking the raw frame a lot with no mipmaps (playback): supersample instead
-      const mipped = src.mip ?? (src.tex === this.raw ? this.rawMip : true);
+      const r = this.raws.indexOf(src.tex);
+      const mipped = src.mip ?? (r >= 0 ? this.rawMips[r] : true);
       gl.uniform1i(p.loc('uTaps'), !mipped && 1 / k > 1.5 ? 1 : 0);
     });
   }
@@ -287,7 +409,69 @@ export class Compositor {
   }
 
   get rawFrame() {
-    return { tex: this.raw, ...this.rawSize };
+    return this.rawOf(0);
+  }
+  rawOf(slot: 0 | 1) {
+    return { tex: this.raws[slot], ...this.rawSizes[slot] };
+  }
+
+  /**
+   * Across a transition: each clip's frame placed in the frame on its own (its framing, its own
+   * blurred background), then the two joined into `dst`, `f` of the way from a to b.
+   */
+  placeMix(a: FrameSource | null, b: FrameSource | null, dst: Target, plA: Placement, plB: Placement, kind: TransKind, f: number) {
+    const g = this.g;
+    for (let k = 0; k < 2; k++) {
+      const t = this.mixT[k];
+      if (!t || t.w !== dst.w || t.h !== dst.h) {
+        if (t) g.destroy(t);
+        this.mixT[k] = g.acquire(dst.w, dst.h, false);
+      }
+    }
+    this.place(a, this.mixT[0], plA);
+    this.place(b, this.mixT[1], plB);
+    g.draw(this.mixP, dst, dst.w, dst.h, (p) => {
+      const gl = g.gl;
+      g.bindTex(p, 'uA', this.mixT[0].tex);
+      g.bindTex(p, 'uB', this.mixT[1].tex);
+      gl.uniform1i(p.loc('uKind'), MIX_KIND[kind] ?? 0);
+      gl.uniform1f(p.loc('uF'), f);
+    });
+  }
+
+  /** Let go of the transition's working frames (none running). */
+  dropMix() {
+    for (const t of this.mixT) this.g.destroy(t);
+    this.mixT = [];
+  }
+
+  /** Lay fades, dips and a film burn over whatever was just drawn to the screen canvas (w×h). */
+  overlay(w: number, h: number, ov: Overlay) {
+    const g = this.g, gl = g.gl;
+    const flat = (color: [number, number, number], a: number) => {
+      if (a <= 1e-3) return;
+      gl.enable(gl.BLEND);
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+      g.draw(this.overlayP, null, w, h, (p) => {
+        gl.uniform1i(p.loc('uMode'), 0);
+        gl.uniform3f(p.loc('uColor'), color[0], color[1], color[2]);
+        gl.uniform1f(p.loc('uA'), Math.min(1, a));
+      });
+    };
+    if (ov.burn !== null) {
+      gl.enable(gl.BLEND);
+      // screen: 1 - (1 - picture)(1 - light)
+      gl.blendFunc(gl.ONE, gl.ONE_MINUS_SRC_COLOR);
+      g.draw(this.overlayP, null, w, h, (p) => {
+        gl.uniform1i(p.loc('uMode'), 1);
+        gl.uniform1f(p.loc('uF'), ov.burn!);
+        gl.uniform1f(p.loc('uSeed'), ov.seed);
+        gl.uniform2f(p.loc('uOut'), w, h);
+      });
+    }
+    flat([1, 1, 1], ov.white);
+    flat([0, 0, 0], ov.black);
+    gl.disable(gl.BLEND);
   }
 
   /**
@@ -336,12 +520,13 @@ export class Compositor {
 
   dispose() {
     const gl = this.g.gl;
-    gl.deleteTexture(this.raw);
+    for (const r of this.raws) gl.deleteTexture(r);
     gl.deleteTexture(this.textTex);
-    for (const r of this.ring) gl.deleteTexture(r.tex);
+    for (const ring of this.rings) for (const r of ring) gl.deleteTexture(r.tex);
     for (const t of this.canvasTex.values()) gl.deleteTexture(t.tex);
     this.canvasTex.clear();
-    this.ring = [];
+    this.rings = [[], []];
+    this.dropMix();
     if (this.bgT) this.g.destroy(this.bgT);
   }
 }

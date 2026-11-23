@@ -1,15 +1,19 @@
 // Export: every output frame is decoded exactly (Mediabunny), put through the same GPU
 // pipeline as the preview at full size and handed to the hardware encoder straight from the
-// canvas. Audio (clips at their speed and volume, plus the music) is mixed offline first. The
-// file is written to the site's private storage as it's made (a long export would not fit in
-// memory), and handed back as that file.
+// canvas. Audio (clips at their speed and volume, the voiceover and the music) is mixed offline
+// first. The file is written to the site's private storage as it's made (a long export would
+// not fit in memory), and handed back as that file.
+//
+// Frames go out in time order, clip by clip: each clip from its cut to the next (see cutTime).
+// Inside a transition a second decoder runs alongside, on the other clip, so both clips'
+// frames for that moment reach drawFrame together.
 import {
   AudioBufferSource, BufferTarget, CanvasSource, Mp4OutputFormat, Output, QUALITY_HIGH, QUALITY_VERY_HIGH,
   StreamTarget, getFirstEncodableAudioCodec, getFirstEncodableVideoCodec, type VideoSample,
 } from 'mediabunny';
 import type { Media, MediaLib } from './media';
 import { MIX_RATE, type AudioEngine } from './audio';
-import { clipLen, layout, srcAt, type VClip, type VideoProject } from './project';
+import { cutTime, layout, mixAt, srcAt, voiceLen, type VClip, type VideoProject } from './project';
 
 export interface VideoExportOptions {
   lib: MediaLib;
@@ -24,10 +28,51 @@ export interface VideoExportOptions {
   boost?: number;
   /** before a clip's frames are drawn (e.g. to read a still at full size) */
   prepare?: (clip: VClip, media: Media) => Promise<void>;
-  /** draw the finished frame for timeline time T onto the canvas (w×h) */
-  drawFrame: (clip: VClip, media: Media, sample: VideoSample | null, T: number) => void;
+  /** draw the finished frame for timeline time T onto the canvas (w×h); inside a transition, with the other clip's frame */
+  drawFrame: (clip: VClip, media: Media, sample: VideoSample | null, T: number, other?: OtherFrame) => void;
   progress: (f: number, stage: string) => void;
   cancelled: () => boolean;
+}
+
+/** The other clip of a transition, at the same moment. */
+export interface OtherFrame {
+  clip: VClip;
+  media: Media;
+  sample: VideoSample | null;
+}
+
+/**
+ * The other clip's frames across one transition, decoded as they're asked for (in order). It
+ * keeps the frame it last handed out (shown again where the file has none), and closes it when
+ * the next one comes or it's done.
+ */
+class OtherFeed {
+  private it: AsyncGenerator<VideoSample | null, void, unknown> | null = null;
+  private last: VideoSample | null = null;
+  private k = 0;
+  /** the other clip's source times, one per frame it's asked for */
+  readonly times: number[] = [];
+  constructor(readonly clip: VClip, readonly media: Media, private lib: MediaLib) {}
+
+  async next(): Promise<OtherFrame> {
+    const m = this.media;
+    if (m.kind === 'image' || !m.video) return { clip: this.clip, media: m, sample: null };
+    if (!this.it) this.it = this.lib.videoSink(m)!.samplesAtTimestamps(this.times);
+    const r = this.k++ < this.times.length ? await this.it.next() : { done: true as const, value: undefined };
+    const s = r.done ? null : r.value;
+    if (!s && !this.last) this.last = await this.lib.videoSink(m)!.getSample(await m.video.getFirstTimestamp()).catch(() => null);
+    if (s) {
+      if (this.last && this.last !== s) this.last.close();
+      this.last = s;
+    }
+    return { clip: this.clip, media: m, sample: this.last };
+  }
+
+  close() {
+    void this.it?.return().catch(() => {});
+    this.last?.close();
+    this.last = null;
+  }
 }
 
 /** the folder (in the site's private storage) exports are written into */
@@ -62,11 +107,13 @@ async function diskFile() {
 
 export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
   const p = o.project;
-  const { starts, total } = layout(p);
+  const L = layout(p);
+  const { starts, total } = L;
   if (total <= 0) throw new Error('Nothing to export');
   const vcodec = await getFirstEncodableVideoCodec(['avc', 'hevc', 'vp9', 'av1'], { width: o.w, height: o.h });
   if (!vcodec) throw new Error(`This phone can’t encode ${o.w}×${o.h} video`);
-  const hasAudio = p.clips.some((c) => c.vol > 0 && o.lib.get(c.src)?.audio) || !!(p.music && o.lib.get(p.music.src)?.audio && p.music.vol > 0);
+  const hasAudio = p.clips.some((c) => c.vol > 0 && o.lib.get(c.src)?.audio) || !!(p.music && o.lib.get(p.music.src)?.audio && p.music.vol > 0) ||
+    (p.voice ?? []).some((v) => v.vol > 0 && voiceLen(v) > 0 && o.lib.get(v.src)?.audio);
   const acodec = hasAudio ? await getFirstEncodableAudioCodec(['aac', 'opus'], { numberOfChannels: 2, sampleRate: MIX_RATE }) : null;
 
   const disk = await diskFile();
@@ -105,46 +152,65 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
       const clip = p.clips[i];
       const m = o.lib.get(clip.src);
       if (!m) continue;
-      const start = starts[i], end = start + clipLen(clip);
-      // the output frames that fall in this clip
-      const k0 = Math.ceil(start * o.fps - 1e-6), k1 = Math.min(frames, Math.ceil(end * o.fps - 1e-6));
+      const start = starts[i];
+      // the output frames this clip leads: from its cut to the next one
+      const k0 = Math.ceil(cutTime(L, i) * o.fps - 1e-6), k1 = Math.min(frames, Math.ceil(cutTime(L, i + 1) * o.fps - 1e-6));
       if (k1 <= k0) continue;
       const times = Array.from({ length: k1 - k0 }, (_, j) => (k0 + j) / o.fps);
+      // inside a transition, the other clip at each of those moments (one feed per transition)
+      const feeds = new Map<number, OtherFeed>();
+      const others = times.map((T) => {
+        const mx = mixAt(p, T, L);
+        const j = mx ? (mx.a === i ? mx.b : mx.a) : -1;
+        const c = p.clips[j], mj = c && o.lib.get(c.src);
+        if (!mj) return null;
+        let fd = feeds.get(j);
+        if (!fd) feeds.set(j, (fd = new OtherFeed(c, mj, o.lib)));
+        fd.times.push(Math.min(c.out - 1e-4, Math.max(c.in, srcAt(c, T - starts[j]))));
+        return fd;
+      });
+      const otherAt = (j: number) => others[j]?.next();
       await o.prepare?.(clip, m);
-      if (m.kind === 'image' || !m.video) {
-        for (const T of times) {
-          if (o.cancelled()) throw new DOMException('cancelled', 'AbortError');
-          o.drawFrame(clip, m, null, T);
-          await video.add(T, 1 / o.fps);
-          o.progress(++n / frames, 'Exporting');
-        }
-        continue;
-      }
-      const sink = o.lib.videoSink(m)!;
-      const srcTimes = times.map((T) => Math.min(clip.out - 1e-4, srcAt(clip, T - start)));
-      let j = 0;
-      let last: VideoSample | null = null;
       try {
-        for await (const s of sink.samplesAtTimestamps(srcTimes)) {
-          if (o.cancelled()) {
-            s?.close();
-            throw new DOMException('cancelled', 'AbortError');
+        if (m.kind === 'image' || !m.video) {
+          for (let j = 0; j < times.length; j++) {
+            if (o.cancelled()) throw new DOMException('cancelled', 'AbortError');
+            const T = times[j];
+            o.drawFrame(clip, m, null, T, await otherAt(j));
+            await video.add(T, 1 / o.fps);
+            o.progress(++n / frames, 'Exporting');
           }
-          const T = times[j++];
-          // no frame (before the file's first one): the last one again, or at the very start
-          // of a clip its first frame, rather than whatever the previous clip left
-          if (!s && !last) last = await sink.getSample(await m.video.getFirstTimestamp()).catch(() => null);
-          const use = s ?? last;
-          o.drawFrame(clip, m, use, T);
-          if (s) {
-            if (last && last !== s) last.close();
-            last = s;
+          continue;
+        }
+        const sink = o.lib.videoSink(m)!;
+        const srcTimes = times.map((T) => Math.min(clip.out - 1e-4, Math.max(clip.in, srcAt(clip, T - start))));
+        let j = 0;
+        let last: VideoSample | null = null;
+        try {
+          for await (const s of sink.samplesAtTimestamps(srcTimes)) {
+            if (o.cancelled()) {
+              s?.close();
+              throw new DOMException('cancelled', 'AbortError');
+            }
+            const T = times[j];
+            // no frame (before the file's first one): the last one again, or at the very start
+            // of a clip its first frame, rather than whatever the previous clip left
+            if (!s && !last) last = await sink.getSample(await m.video.getFirstTimestamp()).catch(() => null);
+            const use = s ?? last;
+            o.drawFrame(clip, m, use, T, await otherAt(j));
+            j++;
+            if (s) {
+              if (last && last !== s) last.close();
+              last = s;
+            }
+            await video.add(T, 1 / o.fps);
+            o.progress(++n / frames, 'Exporting');
           }
-          await video.add(T, 1 / o.fps);
-          o.progress(++n / frames, 'Exporting');
+        } finally {
+          last?.close();
         }
       } finally {
-        last?.close();
+        for (const fd of feeds.values()) fd.close();
       }
     }
     video.close();

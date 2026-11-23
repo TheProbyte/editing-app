@@ -1,9 +1,16 @@
 import type { Curves, Values } from '../params';
 
 // The video project: an ordered list of clips on one track, text titles, an optional music
-// track and how clips sit in the frame. It lives inside the edit state (EditState.video), so
-// undo, redo and the history list cover timeline edits too. The colour/look settings of the
-// edit apply to the whole video.
+// track, voiceover clips and how clips sit in the frame. It lives inside the edit state
+// (EditState.video), so undo, redo and the history list cover timeline edits too. The
+// colour/look settings of the edit apply to the whole video.
+//
+// Transitions take time by overlapping: across a transition of d seconds the outgoing clip's
+// last d seconds and the incoming clip's first d seconds play together, so the video gets d
+// seconds shorter and the incoming clip starts d seconds before the outgoing one ends. Nothing
+// is added or held: every frame shown is a real frame of one of the two clips. layout() is the
+// one place that works this out; playback, scrubbing, the timeline, titles' anchors, the sound
+// mix and export all take their times from it, so they can't disagree.
 
 export interface VClip {
   id: string;
@@ -29,6 +36,49 @@ export interface VClip {
   frozen?: boolean;
   /** playing backwards: a reversed copy of this part of the original (the original, to go back) */
   reversed?: { src: string; in: number; out: number };
+  /** the transition from this clip into the next one */
+  tr?: VTrans;
+  /** fade in / out (picture from / to black, sound up / down), timeline seconds */
+  fin?: number;
+  fout?: number;
+}
+
+export type TransKind = 'fade' | 'black' | 'white' | 'zoom' | 'whip' | 'burn';
+/** the kinds, as [id, name] */
+export const TRANSITIONS: [TransKind, string][] = [
+  ['fade', 'Crossfade'], ['black', 'Black'], ['white', 'White'], ['zoom', 'Zoom'], ['whip', 'Whip'], ['burn', 'Burn'],
+];
+/** transition lengths, seconds */
+export const TRANS_LEN = { min: 0.2, max: 2, def: 0.5 };
+/** clip fades, seconds */
+export const FADE_MAX = 5;
+
+/**
+ * A transition at the cut after a clip. It belongs to that cut, not to the clip: `to` is the
+ * clip that came next when it was made, and once another clip comes next (the clip after it
+ * was deleted or moved, or this one was) it no longer applies (see layout) and is dropped.
+ */
+export interface VTrans {
+  kind: TransKind;
+  /** the length asked for, seconds (shorter where the clips are too short for it, see transLen) */
+  d: number;
+  to: string;
+}
+
+/** A voiceover clip: a recording placed on the timeline (it plays at its own speed). */
+export interface VVoice {
+  id: string;
+  /** media id of the recording */
+  src: string;
+  /** timeline seconds it starts at */
+  t0: number;
+  /** the part of the recording used, seconds */
+  in: number;
+  out: number;
+  /** 0 … 2 */
+  vol: number;
+  /** the moment of a clip it starts on, like a title's (it moves with its shot) */
+  anchor?: { clip: string; s: number };
 }
 
 /**
@@ -227,17 +277,28 @@ export function anchorAt(p: VideoProject, t0: number): VText['anchor'] {
   return { clip: c.id, s: c.kind === 'image' ? Math.max(0, t0 - at.start) : at.src };
 }
 
-/** Put titles back on their shots after the timeline changed (keeping their length). */
+/** Put titles and voiceover clips back on their shots after the timeline changed (keeping their length). */
 export function followAnchors(p: VideoProject, skip?: string) {
   const { starts } = layout(p);
+  const at = (a: { clip: string; s: number }) => {
+    const i = p.clips.findIndex((c) => c.id === a.clip);
+    if (i < 0) return null; // its clip is gone: it stays where it was
+    const c = p.clips[i];
+    const local = c.kind === 'image' ? Math.min(a.s, clipLen(c)) : localAt(c, Math.min(c.out, Math.max(c.in, a.s)));
+    return Math.max(0, starts[i] + local);
+  };
   for (const t of p.texts) {
     if (!t.anchor || t.id === skip) continue;
-    const i = p.clips.findIndex((c) => c.id === t.anchor!.clip);
-    if (i < 0) continue; // its clip is gone: it stays where it was
-    const c = p.clips[i], len = t.t1 - t.t0;
-    const local = c.kind === 'image' ? Math.min(t.anchor.s, clipLen(c)) : localAt(c, Math.min(c.out, Math.max(c.in, t.anchor.s)));
-    t.t0 = Math.max(0, starts[i] + local);
+    const t0 = at(t.anchor);
+    if (t0 === null) continue;
+    const len = t.t1 - t.t0;
+    t.t0 = t0;
     t.t1 = t.t0 + len;
+  }
+  for (const v of p.voice ?? []) {
+    if (!v.anchor || v.id === skip) continue;
+    const t0 = at(v.anchor);
+    if (t0 !== null) v.t0 = t0;
   }
 }
 
@@ -256,6 +317,10 @@ export interface VideoProject {
   clips: VClip[];
   texts: VText[];
   music: VMusic | null;
+  /** voiceover clips (none in projects from before voiceovers) */
+  voice?: VVoice[];
+  /** the music dips while a voiceover clip plays (on unless turned off) */
+  duck?: boolean;
   aspect: VAspect;
   fit: 'fit' | 'fill';
   /** what shows around the picture ('black' / 'white' are from before colours) */
@@ -288,34 +353,132 @@ export const uid = () => Math.random().toString(36).slice(2, 10);
 /** Length of a clip on the timeline. */
 export const clipLen = (c: VClip) => localAt(c, c.out);
 
-/** Start time of every clip, plus the total length. */
-export function layout(p: VideoProject) {
-  const starts: number[] = [];
-  let t = 0;
-  for (const c of p.clips) {
-    starts.push(t);
-    t += clipLen(c);
-  }
-  return { starts, total: t };
+/**
+ * How long a transition really is between clips of these lengths: what was asked for, but at
+ * most half of either clip, so the transitions at a clip's two ends never overlap each other.
+ */
+export const transLen = (d: number, lenA: number, lenB: number) => Math.max(0, Math.min(d, lenA / 2, lenB / 2));
+
+/** The transition between clip i - 1 and clip i (if it still applies there). */
+export function transInto(p: VideoProject, i: number): VTrans | null {
+  const tr = i > 0 ? p.clips[i - 1].tr : undefined;
+  return tr && tr.to === p.clips[i]?.id ? tr : null;
 }
+
+export interface Layout {
+  /** start of every clip */
+  starts: number[];
+  /** how long clip i overlaps the clip before it (its transition in), 0 for a plain cut */
+  ov: number[];
+  total: number;
+}
+
+/**
+ * Start time of every clip, the transitions' overlaps, and the total length. Where a clip has a
+ * transition in, it starts that much before the clip before it ends (see the top of the file).
+ */
+export function layout(p: VideoProject): Layout {
+  const starts: number[] = [], ov: number[] = [];
+  let t = 0, prev = 0;
+  for (let i = 0; i < p.clips.length; i++) {
+    const len = clipLen(p.clips[i]);
+    const tr = transInto(p, i);
+    const o = tr ? transLen(tr.d, prev, len) : 0;
+    t -= o;
+    starts.push(t);
+    ov.push(o);
+    t += len;
+    prev = len;
+  }
+  return { starts, ov, total: t };
+}
+
+/**
+ * Where the picture changes from clip i - 1 to clip i: the cut, or the middle of the transition
+ * there. Each clip is "the" clip from its cut to the next (selecting, trimming, splitting and
+ * the timeline drawing go by this), although around a transition both play.
+ */
+export const cutTime = (L: Layout, i: number) => (i <= 0 ? 0 : i >= L.starts.length ? L.total : L.starts[i] + L.ov[i] / 2);
 
 export function totalLength(p: VideoProject) {
   return layout(p).total;
 }
 
-/** The clip playing at timeline time T, and the source time within it. */
-export function clipAt(p: VideoProject, T: number): { i: number; start: number; src: number } | null {
-  const { starts, total } = layout(p);
+/** The clip playing at timeline time T (in a transition, the one it's nearer), and the source time within it. */
+export function clipAt(p: VideoProject, T: number, L = layout(p)): { i: number; start: number; src: number } | null {
+  const { starts, total } = L;
   if (!p.clips.length) return null;
   T = Math.max(0, Math.min(total - 1e-6, T));
   for (let i = 0; i < p.clips.length; i++) {
     const c = p.clips[i];
-    const end = starts[i] + clipLen(c);
-    if (T < end || i === p.clips.length - 1) {
-      return { i, start: starts[i], src: Math.min(c.out - 1e-4, srcAt(c, T - starts[i])) };
+    if (T < cutTime(L, i + 1) || i === p.clips.length - 1) {
+      return { i, start: starts[i], src: Math.min(c.out - 1e-4, srcAt(c, Math.max(0, T - starts[i]))) };
     }
   }
   return null;
+}
+
+/** A transition going on at some moment: from clip a to clip b (= a + 1), `f` of the way through it (0…1). */
+export interface Mix {
+  a: number;
+  b: number;
+  f: number;
+  kind: TransKind;
+  /** where it starts and how long it is (timeline seconds) */
+  t0: number;
+  d: number;
+}
+
+/** The transition playing at timeline time T, if any. */
+export function mixAt(p: VideoProject, T: number, L = layout(p)): Mix | null {
+  for (let i = 1; i < p.clips.length; i++) {
+    const d = L.ov[i];
+    if (d <= 0 || T < L.starts[i] || T >= L.starts[i] + d) continue;
+    return { a: i - 1, b: i, f: Math.min(1, Math.max(0, (T - L.starts[i]) / d)), kind: p.clips[i - 1].tr!.kind, t0: L.starts[i], d };
+  }
+  return null;
+}
+
+/** Drop transitions that no longer apply (their next clip moved or went), so they can't come back by surprise. */
+export function cleanTransitions(p: VideoProject) {
+  p.clips.forEach((c, i) => {
+    if (c.tr && c.tr.to !== p.clips[i + 1]?.id) delete c.tr;
+  });
+}
+
+/**
+ * How far a clip's own fades let it through, `local` timeline seconds into it: 0 (black and
+ * silent) … 1. Each fade is at most half the clip.
+ */
+export function fadeAt(c: VClip, local: number) {
+  if (!c.fin && !c.fout) return 1;
+  const len = clipLen(c);
+  const fi = Math.min(c.fin ?? 0, len / 2), fo = Math.min(c.fout ?? 0, len / 2);
+  let k = 1;
+  if (fi > 0) k = Math.min(k, local / fi);
+  if (fo > 0) k = Math.min(k, (len - local) / fo);
+  return Math.max(0, Math.min(1, k));
+}
+
+/** Length of a voiceover clip on the timeline. */
+export const voiceLen = (v: VVoice) => Math.max(0, v.out - v.in);
+
+/**
+ * Where the voiceover is speaking: the voice clips' spans (within the video), with gaps
+ * shorter than `join` seconds closed, in order.
+ */
+export function voiceSpans(p: VideoProject, total: number, join = 0.6): [number, number][] {
+  const spans = (p.voice ?? []).filter((v) => v.vol > 0 && voiceLen(v) > 0)
+    .map((v) => [Math.max(0, v.t0), Math.min(total, v.t0 + voiceLen(v))] as [number, number])
+    .filter(([a, b]) => b > a)
+    .sort((x, y) => x[0] - y[0]);
+  const out: [number, number][] = [];
+  for (const s of spans) {
+    const last = out[out.length - 1];
+    if (last && s[0] <= last[1] + join) last[1] = Math.max(last[1], s[1]);
+    else out.push([s[0], s[1]]);
+  }
+  return out;
 }
 
 /** Frame size of the project (preview or export), from the aspect setting and the first clip. */

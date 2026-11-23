@@ -1,15 +1,18 @@
 // Sound for the video editor. Only the parts of each file the timeline uses are decoded (a
 // long recording trimmed to a few seconds holds just those seconds), and the whole timeline
-// (clips at their speed and volume, the music with its fades) is mixed offline into a single
-// track. Playback then plays that one track (nothing to schedule while playing, so nothing can
-// drop out), and export uses the very same mix.
+// (clips at their speed and volume with their fades, crossfading across transitions, the
+// voiceover, the music with its fades, dipping under the voiceover) is mixed offline into a
+// single track. Playback then plays that one track (nothing to schedule while playing, so
+// nothing can drop out), and export uses the very same mix.
 import { AudioBufferSink } from 'mediabunny';
 import type { Media, MediaLib } from './media';
-import { clipLen, layout, speedAt, srcAt, type VideoProject } from './project';
+import { clipLen, layout, speedAt, srcAt, voiceLen, voiceSpans, type VideoProject } from './project';
 
 export const MIX_RATE = 48000;
 /** a short ramp at every cut, so clips don't click against each other */
 const EDGE = 0.004;
+/** how far the music dips under the voiceover (-12 dB), how quickly, and how quickly it comes back */
+export const DUCK = { gain: Math.pow(10, -12 / 20), attack: 0.15, release: 0.45 };
 /** decoded either side of the part a clip uses (a decoder takes up to ~0.5 s to settle after a jump) */
 const PAD = 1;
 /** and a few seconds more around a new piece, so a small trim doesn't decode it again */
@@ -128,7 +131,7 @@ export class AudioEngine {
 
   /** What the mix depends on. */
   private key(p: VideoProject) {
-    return JSON.stringify([p.clips.map((c) => [c.src, c.in, c.out, c.speed, c.vol, c.ramp]), p.music]);
+    return JSON.stringify([p.clips.map((c) => [c.src, c.in, c.out, c.speed, c.vol, c.ramp, c.tr, c.fin, c.fout]), p.music, p.voice ?? [], p.duck]);
   }
 
   /** The mixed soundtrack for the project as it is now (cached; rebuilt after edits). */
@@ -163,8 +166,9 @@ export class AudioEngine {
   }
 
   private async render(p: VideoProject): Promise<AudioBuffer | null> {
-    const { starts, total } = layout(p);
-    const hasSound = p.clips.some((c) => c.vol > 0 && this.lib.get(c.src)?.audio) || (p.music && p.music.vol > 0);
+    const { starts, ov, total } = layout(p);
+    const voice = (p.voice ?? []).filter((v) => v.vol > 0 && voiceLen(v) > 0 && v.t0 < total && this.lib.get(v.src)?.audio);
+    const hasSound = p.clips.some((c) => c.vol > 0 && this.lib.get(c.src)?.audio) || (p.music && p.music.vol > 0) || voice.length > 0;
     if (total <= 0 || !hasSound) {
       this.parts.clear();
       return null;
@@ -174,6 +178,7 @@ export class AudioEngine {
     const want = new Map<string, number[][]>();
     const need = (id: string, a: number, b: number) => want.set(id, [...(want.get(id) ?? []), span(a, b)]);
     for (const c of p.clips) if (c.vol > 0 && this.lib.get(c.src)?.audio) need(c.src, c.in, c.out);
+    for (const v of voice) need(v.src, v.in, v.out);
     const mu = p.music;
     const mm = mu && this.lib.get(mu.src);
     if (mu && mm?.audio && mu.vol > 0) need(mm.id, mu.in, mu.in + total);
@@ -213,7 +218,35 @@ export class AudioEngine {
       g.gain.linearRampToValueAtTime(c.vol, t0 + Math.min(EDGE, len / 4));
       g.gain.setValueAtTime(c.vol, Math.max(t0, t0 + len - Math.min(EDGE, len / 4)));
       g.gain.linearRampToValueAtTime(0, t0 + len);
-      g.connect(out);
+      // then (each on its own gain, so their curves never clash) the clip's fades and the
+      // crossfades of its transitions
+      let tail: AudioNode = g;
+      const chain = () => {
+        const n = ctx.createGain();
+        tail.connect(n);
+        tail = n;
+        return n.gain;
+      };
+      const fi = Math.min(c.fin ?? 0, len / 2), fo = Math.min(c.fout ?? 0, len / 2);
+      if (fi > 0 || fo > 0) {
+        const k = chain();
+        k.setValueAtTime(fi > 0 ? 0 : 1, t0);
+        if (fi > 0) k.linearRampToValueAtTime(1, t0 + fi);
+        if (fo > 0) {
+          k.setValueAtTime(1, t0 + len - fo);
+          k.linearRampToValueAtTime(0, t0 + len);
+        }
+      }
+      // across a transition both clips sound: the outgoing one fades down as the incoming one
+      // comes up (equal power, so the level holds through the middle)
+      const dIn = ov[i], dOut = i + 1 < p.clips.length ? ov[i + 1] : 0;
+      if (dIn > 0 || dOut > 0) {
+        const k = chain();
+        k.setValueAtTime(dIn > 0 ? 0 : 1, t0);
+        if (dIn > 0) k.setValueCurveAtTime(powerCurve(true), t0, dIn * 0.999);
+        if (dOut > 0) k.setValueCurveAtTime(powerCurve(false), t0 + len - dOut, dOut * 0.999);
+      }
+      tail.connect(out);
       const s = ctx.createBufferSource();
       s.buffer = pc.buf;
       if (c.ramp) {
@@ -225,6 +258,26 @@ export class AudioEngine {
       } else s.playbackRate.value = c.speed;
       s.connect(g);
       s.start(t0, Math.max(0, Math.min(c.in, end) - at), Math.max(0, Math.min(c.out, end) - c.in));
+    }
+    // the voiceover: each recording at its place, at its own speed
+    for (const v of voice) {
+      const pc = await piece(v.src, v.in, v.out);
+      if (!pc) continue;
+      const at = pc.at, end = pc.at + pc.len;
+      const len = Math.min(voiceLen(v), total - v.t0);
+      if (len <= 0) continue;
+      const t0 = Math.max(0, v.t0), skip = t0 - v.t0;
+      const g = ctx.createGain();
+      const e = Math.min(EDGE * 2, len / 4);
+      g.gain.setValueAtTime(0, t0);
+      g.gain.linearRampToValueAtTime(v.vol, t0 + e);
+      g.gain.setValueAtTime(v.vol, t0 + len - skip - e);
+      g.gain.linearRampToValueAtTime(0, t0 + len - skip);
+      g.connect(out);
+      const s = ctx.createBufferSource();
+      s.buffer = pc.buf;
+      s.connect(g);
+      s.start(t0, Math.max(0, Math.min(v.in + skip, end) - at), Math.max(0, Math.min(v.in + len, end) - v.in - skip));
     }
     if (mu && mm?.audio && mu.vol > 0) {
       const pc = await piece(mm.id, mu.in, mu.in + total);
@@ -241,7 +294,23 @@ export class AudioEngine {
           g.gain.setValueAtTime(mu.vol, fo);
           g.gain.linearRampToValueAtTime(0, fend);
         } else g.gain.value = mu.vol;
-        g.connect(out);
+        // ducking: the music dips while the voiceover speaks (starting a moment before it, so the
+        // first word isn't lost under it, and coming back up after)
+        const spans = p.duck === false ? [] : voiceSpans(p, total, DUCK.attack + DUCK.release);
+        if (spans.length) {
+          const d = ctx.createGain();
+          const k = d.gain;
+          k.setValueAtTime(1, 0);
+          for (const [a, b] of spans) {
+            const a0 = Math.max(0, a - DUCK.attack);
+            k.setValueAtTime(1, a0);
+            k.linearRampToValueAtTime(DUCK.gain, Math.max(a0 + 1e-3, a));
+            k.setValueAtTime(DUCK.gain, Math.max(a, b));
+            k.linearRampToValueAtTime(1, b + DUCK.release);
+          }
+          g.connect(d);
+          d.connect(out);
+        } else g.connect(out);
         const s = ctx.createBufferSource();
         s.buffer = pc.buf;
         s.connect(g);
@@ -256,6 +325,16 @@ export class AudioEngine {
   forget(id: string) {
     this.parts.delete(id);
   }
+}
+
+/** A quarter sine (up) or cosine (down): an equal-power crossfade's gain. */
+function powerCurve(up: boolean) {
+  const n = 64, c = new Float32Array(n);
+  for (let k = 0; k < n; k++) {
+    const x = k / (n - 1);
+    c[k] = up ? Math.sin((x * Math.PI) / 2) : Math.cos((x * Math.PI) / 2);
+  }
+  return c;
 }
 
 /**

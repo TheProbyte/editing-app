@@ -1,7 +1,12 @@
 // The video editor. It reuses the photo editor whole: each frame of the timeline is placed
 // into a "project frame" texture that the app treats as its photo, so every look and
-// adjustment applies to the video. This adds the timeline, playback, the Edit / Canvas /
-// Text / Music sections and video export.
+// adjustment applies to the video. This adds the timeline, playback, the Edit / Transition /
+// Canvas / Text / Music / Voice sections and video export.
+//
+// Across a transition both clips' frames are placed and joined into the project frame (each
+// with its own framing; the look eases from one clip's to the other's). What has to end up
+// truly black or white whatever the look does, fades and dips and a film burn's flash, is laid
+// over the finished picture afterwards (afterRender, and the same in export).
 import type { GL, Target } from '../gl/glutil';
 import type { Pipeline, Source } from '../gl/pipeline';
 import type { EditState, ParamDef } from '../params';
@@ -10,19 +15,21 @@ import { ICONS } from '../ui/icons';
 import { tick } from '../ui/haptics';
 import { MediaLib, STILL_LONG, isAudioFile, isVideoFile, type Media } from './media';
 import { Player, type Frame } from './player';
-import { Compositor, type FrameSource, type GpuFrame, type Placement } from './compose';
-import { Timeline, TIMELINE_H, type Sel } from './timeline';
-import { exportVideo } from './exporter';
+import { Compositor, type FrameSource, type GpuFrame, type Overlay, type Placement } from './compose';
+import { Timeline, timelineHeight, type Sel } from './timeline';
+import { exportVideo, type OtherFrame } from './exporter';
 import { AudioEngine } from './audio';
 import {
   IMAGE_SECONDS, MIN_CLIP, clipAt, clipLen, fmtTime, frameAspect, frameSize, layout, localAt, newProject, speedAt, srcAt, subRamp, uid,
   framingAt, GRADIENTS, BG_COLORS, NO_FRAMING, RAMPS, RAMP_CUSTOM, anchorAt, followAnchors, flipClip, type Framing,
   type VAspect, type VClip, type VText, type VideoProject,
+  TRANSITIONS, TRANS_LEN, FADE_MAX, cleanTransitions, cutTime, fadeAt, mixAt, transInto, type TransKind, type VVoice,
 } from './project';
 import type { VideoSample } from 'mediabunny';
 import { RampEditor } from './rampEditor';
 import { REVERSE_MAX } from './reverse';
 import { effectiveLook, lookKeyAt, lookValues, newLook, sameValues, unscopeState, upsertKey } from './looks';
+import { VoiceRecorder, assemble, speechSpan, wavFile } from './voice';
 
 export interface VideoHost {
   g: GL;
@@ -74,7 +81,25 @@ const DEFS: Record<string, ParamDef> = {
   'vd.py': { id: 'vd.py', label: 'Position Y', min: -100, max: 100, def: 0, fmt: (v) => String(Math.round(v)) },
   'vd.rot': { id: 'vd.rot', label: 'Rotate', min: -180, max: 180, def: 0, swipe: 90, fmt: (v) => `${Math.round(v)}°` },
   'vd.bgblur': { id: 'vd.bgblur', label: 'Blur', min: 0, max: 100, def: 70, fmt: (v) => String(Math.round(v)) },
+  'vd.trd': { id: 'vd.trd', label: 'Duration', min: TRANS_LEN.min, max: TRANS_LEN.max, def: TRANS_LEN.def, fmt: (v) => `${v.toFixed(1)} s` },
+  'vd.fin': { id: 'vd.fin', label: 'Fade in', min: 0, max: FADE_MAX, def: 0, fmt: (v) => `${v.toFixed(1)} s` },
+  'vd.fout': { id: 'vd.fout', label: 'Fade out', min: 0, max: FADE_MAX, def: 0, fmt: (v) => `${v.toFixed(1)} s` },
+  'vd.vvol': { id: 'vd.vvol', label: 'Volume', min: 0, max: 200, def: 100, fmt: (v) => `${Math.round(v)}%` },
 };
+
+/** How much of the incoming clip's look (and fades) show, f of the way through a transition. */
+function mixWeight(kind: TransKind, f: number) {
+  const ss = (a: number, b: number) => {
+    const x = Math.min(1, Math.max(0, (f - a) / (b - a)));
+    return x * x * (3 - 2 * x);
+  };
+  if (kind === 'black' || kind === 'white') return f < 0.5 ? 0 : 1;
+  if (kind === 'zoom') return ss(0.42, 0.58);
+  if (kind === 'burn') return ss(0.4, 0.6);
+  return f;
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 export class VideoMode {
   lib = new MediaLib();
@@ -85,14 +110,24 @@ export class VideoMode {
   private frameT: Target | null = null;
   private exportT: Target | null = null;
   private imgTex = new Map<string, WebGLTexture>();
-  /** what's in the frame now, to re-place it when the canvas settings change */
-  private last: { src: FrameSource; media: string; clip: string; s: number } | null = null;
+  /**
+   * what's in the frame now, to re-place it when the canvas settings change: the clip's frame,
+   * the timeline time it's for, and across a transition the other clip's frame too
+   */
+  private last: { src: FrameSource; media: string; clip: string; s: number; T?: number; solo?: boolean; other?: { src: FrameSource; clip: string; s: number } } | null = null;
   private lastClip() {
     return this.last ? this.project.clips.find((c) => c.id === this.last!.clip) ?? null : null;
   }
   private sel: Sel = null;
   /** the clip's speed-ramp choices are showing (in Edit) */
   private rampOpen = false;
+  /** the clip's fades are showing (in Edit), and which one the slider sets first */
+  private fadeOpen = false;
+  private fadeEnd: 'in' | 'out' = 'in';
+  /** a voiceover being recorded (counting in, then recording) */
+  private rec: { r: VoiceRecorder; startT: number; ctxStart: number; delay: number; phase: 'count' | 'rec'; n: number } | null = null;
+  /** a transition's preview plays until this timeline time (0: no preview) */
+  private previewUntil = 0;
   private rampEd: RampEditor;
   private toolId: string | null = null;
   exporting = false;
@@ -105,7 +140,7 @@ export class VideoMode {
     this.audio.onPeaks = () => this.timeline?.thumbsChanged();
     this.player = new Player(this.lib, () => this.project, this.audio);
     // playback copies each decoded frame to the GPU the moment it arrives
-    this.player.upload = (vf) => this.comp.uploadRing(vf, vf.displayWidth, vf.displayHeight);
+    this.player.upload = (vf, ring) => this.comp.uploadRing(vf, vf.displayWidth, vf.displayHeight, ring);
     this.player.stillMoves = () => this.stillMoves();
     this.player.onFrame = (f) => this.showFrame(f);
     this.player.onTime = () => this.onTime();
@@ -114,6 +149,8 @@ export class VideoMode {
       if (c) this.setRamp(c, { id: 'custom', pts }, commit);
     });
     this.player.onEnd = () => {
+      this.previewUntil = 0;
+      if (this.rec) void this.stopVoice();
       this.syncPlayButton();
       this.rescope();
     };
@@ -130,9 +167,9 @@ export class VideoMode {
         this.syncPlayButton();
         this.onTime();
       },
-      peek: (T) => {
+      peek: (T, clip) => {
         this.interactive();
-        this.player.peek(T, true);
+        this.player.peek(T, true, clip);
       },
       setTime: (T) => {
         this.player.setTime(T);
@@ -141,11 +178,15 @@ export class VideoMode {
       changed: (commit) => this.changed(commit),
       select: (s) => this.select(s),
       selection: () => this.sel,
+      recording: () => (this.rec?.phase === 'rec' ? { t0: this.rec.startT, t1: Math.max(this.rec.startT, this.player.time) } : null),
     }, this.lib);
-    $('tlTrack').style.height = TIMELINE_H + 'px';
+    this.syncTrackHeight();
     this.lib.onThumbs = () => this.timeline.thumbsChanged();
     const vt = (id: string, label: string, icon: string): ToolDef => ({ id, label, icon, kind: 'video', params: () => this.params(id) });
-    this.tools = [vt('vclip', 'Edit', ICONS.clip), vt('vcanvas', 'Canvas', ICONS.canvas), vt('vtext', 'Text', ICONS.text), vt('vmusic', 'Music', ICONS.music)];
+    this.tools = [
+      vt('vclip', 'Edit', ICONS.clip), vt('vtrans', 'Transition', ICONS.transition), vt('vcanvas', 'Canvas', ICONS.canvas),
+      vt('vtext', 'Text', ICONS.text), vt('vmusic', 'Music', ICONS.music), vt('vvoice', 'Voice', ICONS.mic),
+    ];
     this.bindUI();
   }
 
@@ -162,6 +203,8 @@ export class VideoMode {
     $('tlAdd').innerHTML = ICONS.plus;
     $('tlPlay').onclick = () => {
       tick();
+      // (recording: the play button is the stop button)
+      if (this.rec) return void this.stopVoice();
       this.togglePlay();
     };
     // one frame back / forward (hold to keep going)
@@ -250,6 +293,8 @@ export class VideoMode {
     this.h.busy(null);
     if (!added.length) return;
     p.clips.splice(at, 0, ...added);
+    // (a transition where they went in no longer has its clips)
+    cleanTransitions(p);
     this.h.commit();
     this.remix();
     this.ensureFrame();
@@ -296,7 +341,7 @@ export class VideoMode {
   /** Every file the project uses, with its id (for saving it as a recent project). */
   mediaFiles() {
     const p = this.project;
-    const ids = new Set([...p.clips.map((c) => c.src), p.music?.src, p.bgImg].filter(Boolean) as string[]);
+    const ids = new Set([...p.clips.map((c) => c.src), p.music?.src, p.bgImg, ...(p.voice ?? []).map((v) => v.src)].filter(Boolean) as string[]);
     return [...ids].map((id) => this.lib.get(id)).filter((m) => m?.file).map((m) => ({ id: m!.id, file: m!.file as File }));
   }
 
@@ -444,26 +489,49 @@ export class VideoMode {
     if (resized) {
       if (this.frameT) this.h.g.destroy(this.frameT);
       this.frameT = this.h.g.acquire(w, h, false);
-      this.comp.place(this.last?.src ?? null, this.frameT, this.placement(this.lastClip(), this.last?.s ?? 0, w, h));
+      this.placeLast(this.frameT);
     }
     this.h.frameChanged({ tex: this.frameT!.tex, w, h, linear: false }, this.frameT!, resized);
   }
 
-  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true, bitmap?: ImageBitmap, pre?: GpuFrame, upright = false): FrameSource {
+  /** A frame ready to place (slot 1: the other clip of a transition, uploaded beside the first). */
+  private srcFor(m: Media, sample: VideoSample | null, outLong: number, quality = true, bitmap?: ImageBitmap, pre?: GpuFrame, upright = false, slot: 0 | 1 = 0): FrameSource {
     if (m.kind === 'image' && m.bitmap) {
       const g = this.imageGpu(m)!;
       return { tex: g.tex, w: g.w, h: g.h, rot: 0, flip: false };
     }
     const rot = upright ? 0 : ROT[(m.video?.rotation ?? 0) as 0 | 90 | 180 | 270] ?? 0;
     if (pre) return { tex: pre.tex, w: pre.w, h: pre.h, rot, flip: false, mip: false };
-    if (bitmap) this.comp.upload(bitmap, bitmap.width, bitmap.height, outLong, false);
+    if (bitmap) this.comp.upload(bitmap, bitmap.width, bitmap.height, outLong, false, slot);
     else if (sample) {
       const vf = sample.toVideoFrame();
-      this.comp.upload(vf, vf.displayWidth, vf.displayHeight, outLong, quality);
+      this.comp.upload(vf, vf.displayWidth, vf.displayHeight, outLong, quality, slot);
       vf.close();
     }
-    const r = this.comp.rawFrame;
+    const r = this.comp.rawOf(slot);
     return { tex: r.tex, w: r.w, h: r.h, rot, flip: false };
+  }
+
+  /** The transition the last frame was for, with its two clips' frames in order (null: none). */
+  private lastMix() {
+    const L = this.last, p = this.project;
+    if (!L?.other || L.T === undefined) return null;
+    const mix = mixAt(p, L.T);
+    if (!mix) return null;
+    const A = p.clips[mix.a], B = p.clips[mix.b];
+    const fa = A.id === L.clip ? L : L.other.clip === A.id ? L.other : null;
+    const fb = B.id === L.clip ? L : L.other.clip === B.id ? L.other : null;
+    return fa && fb ? { mix, A, B, fa, fb } : null;
+  }
+
+  /** Place the last frame (both clips' across a transition) into `dst`. */
+  private placeLast(dst: Target) {
+    const m = this.lastMix();
+    if (m) {
+      this.comp.placeMix(m.fa.src, m.fb.src, dst, this.placement(m.A, m.fa.s, dst.w, dst.h), this.placement(m.B, m.fb.s, dst.w, dst.h), m.mix.kind, m.mix.f);
+      return;
+    }
+    this.comp.place(this.last?.src ?? null, dst, this.placement(this.lastClip(), this.last?.s ?? 0, dst.w, dst.h));
   }
 
   /** frames put on screen (for the performance readout) */
@@ -478,11 +546,18 @@ export class VideoMode {
     if (!this.frameT) this.ensureFrame();
     // (frames shown while a finger moves skip the extra smoothing a big source gets; the exact
     // frame that follows has it)
-    const src = this.srcFor(f.media, f.sample, this.previewLong(), !this.player.playing && !f.fast, f.bitmap, f.pre, f.upright);
+    const quality = !this.player.playing && !f.fast;
+    const src = this.srcFor(f.media, f.sample, this.previewLong(), quality, f.bitmap, f.pre, f.upright);
     const s = f.sample?.timestamp ?? f.ts ?? (f.t !== undefined ? this.srcTime(f.clip, f.t) : f.clip.in);
     f.sample?.close();
-    this.last = { src, media: f.media.id, clip: f.clip.id, s };
-    this.comp.place(src, this.frameT!, this.placement(f.clip, s, this.frameT!.w, this.frameT!.h));
+    this.last = { src, media: f.media.id, clip: f.clip.id, s, T: f.t, solo: f.solo };
+    const o = f.other;
+    if (o) {
+      const so = o.sample?.timestamp ?? o.ts ?? (f.t !== undefined ? this.srcTime(o.clip, f.t) : o.clip.in);
+      this.last.other = { src: this.srcFor(o.media, o.sample, this.previewLong(), quality, o.bitmap, o.pre, o.upright, 1), clip: o.clip.id, s: so };
+      o.sample?.close();
+    }
+    this.placeLast(this.frameT!);
     this.h.pipe.invalidate();
     if (this.player.playing) this.h.renderSync();
     else {
@@ -551,9 +626,41 @@ export class VideoMode {
   /** Canvas settings changed: place the current frame again. */
   private replace() {
     this.ensureFrame();
-    if (this.frameT) this.comp.place(this.last?.src ?? null, this.frameT, this.placement(this.lastClip(), this.last?.s ?? 0, this.frameT.w, this.frameT.h));
+    if (this.frameT) this.placeLast(this.frameT);
     this.h.pipe.invalidate();
     this.h.requestRender();
+  }
+
+  // ---- over the finished picture: clip fades, dips to black / white, a film burn
+
+  /** What goes over the picture at timeline time T (null: nothing). */
+  overlayAt(T: number): Overlay | null {
+    const p = this.project;
+    if (!p.clips.length) return null;
+    const L = layout(p);
+    const mix = mixAt(p, T, L);
+    const fadeOf = (i: number) => fadeAt(p.clips[i], T - L.starts[i]);
+    let vis = 1, black = 0, white = 0, burn: number | null = null, seed = 0;
+    if (mix) {
+      // (each clip's own fade, in proportion to how much of it shows)
+      const w = mixWeight(mix.kind, mix.f);
+      vis = fadeOf(mix.a) * (1 - w) + fadeOf(mix.b) * w;
+      // a dip is all colour through the middle, where the picture switches clips
+      const x = Math.min(1, (1 - Math.abs(2 * mix.f - 1)) / 0.85);
+      const dip = x * x * (3 - 2 * x);
+      if (mix.kind === 'black') black = dip;
+      else if (mix.kind === 'white') white = dip;
+      else if (mix.kind === 'burn') {
+        burn = mix.f;
+        seed = (mix.b * 7.31) % 10;
+      }
+    } else {
+      const at = clipAt(p, T, L);
+      if (at) vis = fadeOf(at.i);
+    }
+    black = 1 - (1 - black) * vis;
+    if (black < 1e-3 && white < 1e-3 && burn === null) return null;
+    return { black, white, burn, seed };
   }
 
   // ---- text titles, laid over the finished picture
@@ -658,7 +765,13 @@ export class VideoMode {
 
   /** Called by the app around its render of the preview. */
   afterRender(w: number, h: number) {
-    this.textLayer(this.player.time, w, h);
+    const T = this.player.time;
+    // (paused, it's for the moment of the frame showing, which is not the playhead's while an
+    // edge is being trimmed: then just the clip, as it is)
+    const L = this.last;
+    const ov = this.player.playing ? this.overlayAt(T) : L?.solo ? null : this.overlayAt(L?.T ?? T);
+    if (ov) this.comp.overlay(w, h, ov);
+    this.textLayer(T, w, h);
     this.comp.drawText(w, h);
   }
 
@@ -685,32 +798,44 @@ export class VideoMode {
   }
 
   togglePlay() {
+    // (pausing while recording a voiceover ends the recording)
+    if (this.rec) return void this.stopVoice();
+    this.previewUntil = 0;
     if (this.player.playing) {
       this.player.pause();
       this.player.seek(this.player.time);
     } else {
       if (!this.project.clips.length) return this.pickMedia();
-      // (a flick still coasting would seek, and stop it again)
-      this.timeline.stopCoast();
-      // while it plays every clip is drawn with its own look; a slider moved meanwhile
-      // changes the whole video's look, not the clip that happened to be under the playhead
-      if (this.project.scope) {
-        this.unscope();
-        this.h.lookChanged();
-      }
-      this.dynCheck = { t: performance.now(), drops: 0, shown: 0, calm: 0 };
-      void this.player.play().then(() => {
-        this.syncPlayButton();
-        this.updateCap();
-      });
+      void this.playNow();
     }
     this.syncPlayButton();
   }
 
+  /** Start playing from the playhead. */
+  private playNow() {
+    // (a flick still coasting would seek, and stop it again)
+    this.timeline.stopCoast();
+    // while it plays every clip is drawn with its own look; a slider moved meanwhile
+    // changes the whole video's look, not the clip that happened to be under the playhead
+    if (this.project.scope) {
+      this.unscope();
+      this.h.lookChanged();
+    }
+    this.dynCheck = { t: performance.now(), drops: 0, shown: 0, calm: 0 };
+    const pl = this.player.play().then(() => {
+      this.syncPlayButton();
+      this.updateCap();
+    });
+    this.syncPlayButton();
+    return pl;
+  }
+
   private syncPlayButton() {
     this.h.setLive(this.player.playing || this.exporting);
-    $('tlPlay').innerHTML = this.player.playing ? ICONS.pause : ICONS.play;
-    $('tlPlay').classList.toggle('on', this.player.playing);
+    const rec = !!this.rec;
+    $('tlPlay').innerHTML = rec ? ICONS.stop : this.player.playing ? ICONS.pause : ICONS.play;
+    $('tlPlay').classList.toggle('on', this.player.playing && !rec);
+    $('tlPlay').classList.toggle('rec', rec);
   }
 
   private lastTextKey = '';
@@ -726,6 +851,14 @@ export class VideoMode {
       $('tlTime').innerHTML = label;
     }
     if (this.rampEd.shown) this.rampEd.draw();
+    // a transition's preview stops just after it
+    if (this.previewUntil && this.player.playing && T >= this.previewUntil) {
+      this.previewUntil = 0;
+      this.player.pause();
+      this.player.seek(this.player.time);
+      this.syncPlayButton();
+    }
+    if (this.rec) this.syncRecBadge();
     if (this.player.playing) {
       // in the playback loop: paint with this frame, not one refresh later
       this.timeline.paintNow();
@@ -759,6 +892,13 @@ export class VideoMode {
     if (s?.kind === 'clip') this.h.openTool('vclip');
     else if (s?.kind === 'text') this.h.openTool('vtext');
     else if (s?.kind === 'music') this.h.openTool('vmusic');
+    else if (s?.kind === 'voice') this.h.openTool('vvoice');
+    else if (s?.kind === 'cut') {
+      // the playhead on the cut, to see what happens there
+      const i = this.selCut();
+      if (i > 0) this.seek(cutTime(layout(this.project), i));
+      this.h.openTool('vtrans');
+    }
     else if (tool === 'vclip') this.h.refreshSection();
     else this.h.refreshSection();
   }
@@ -769,6 +909,15 @@ export class VideoMode {
   private selText() {
     return this.sel?.kind === 'text' ? this.project.texts.find((t) => t.id === this.sel!.id) ?? null : null;
   }
+  private selVoice() {
+    return this.sel?.kind === 'voice' ? this.project.voice?.find((v) => v.id === this.sel!.id) ?? null : null;
+  }
+  /** The selected cut, as the index of the clip after it (-1: none). */
+  private selCut() {
+    if (this.sel?.kind !== 'cut') return -1;
+    const p = this.project, i = p.clips.findIndex((c) => c.id === this.sel!.id) + 1;
+    return i > 0 && i < p.clips.length ? i : -1;
+  }
 
   /** Rebuild the soundtrack in the background a moment after the last edit. */
   private remixTimer = 0;
@@ -778,14 +927,19 @@ export class VideoMode {
     this.remixTimer = window.setTimeout(() => {
       if (this.dead) return;
       const p = this.project;
-      this.audio.keepOnly(new Set([...p.clips.map((c) => c.src), ...(p.music ? [p.music.src] : [])]));
+      this.audio.keepOnly(new Set([...p.clips.map((c) => c.src), ...(p.music ? [p.music.src] : []), ...(p.voice ?? []).map((v) => v.src)]));
       void this.audio.mix(p);
     }, 250);
   }
 
   private changed(commit: boolean) {
-    // titles stay on the shots they were put on
+    // (an edit while recording ends the recording first)
+    if (this.rec) void this.stopVoice();
+    // a transition goes with its cut: where other clips meet now, it's gone
+    cleanTransitions(this.project);
+    // titles and voiceover clips stay on the shots they were put on
     followAnchors(this.project, this.timeline.draggingText());
+    this.syncTrackHeight();
     if (this.player.playing) {
       // the timeline changed under a running playback (its frames and sound were planned
       // for the old one): stop where it is
@@ -832,6 +986,9 @@ export class VideoMode {
     if (this.sel?.kind === 'clip' && !p.clips.some((c) => c.id === this.sel!.id)) this.sel = null;
     if (this.sel?.kind === 'text' && !p.texts.some((t) => t.id === this.sel!.id)) this.sel = null;
     if (this.sel?.kind === 'music' && !p.music) this.sel = null;
+    if (this.sel?.kind === 'voice' && !this.selVoice()) this.sel = null;
+    if (this.sel?.kind === 'cut' && this.selCut() < 0) this.sel = null;
+    this.syncTrackHeight();
     this.ensureFrame();
     this.replace(); // background / framing from the restored state, straight away
     this.player.seek(Math.min(this.player.time, layout(p).total));
@@ -855,6 +1012,7 @@ export class VideoMode {
     if (!at) return;
     const c = p.clips[at.i];
     const local = T - at.start;
+    if (mixAt(p, T)) return this.h.toast('Move the playhead out of the transition to split there');
     if (local < MIN_CLIP || clipLen(c) - local < MIN_CLIP) return this.h.toast('Move the playhead into the clip to split it');
     const b = this.cutAt(at.i, local);
     this.sel = { kind: 'clip', id: b.id };
@@ -874,6 +1032,10 @@ export class VideoMode {
       b.ramp = subRamp(c.ramp, u, 1);
       c.ramp = subRamp(c.ramp, 0, u);
     }
+    // the transition out and the fade out go with the right half, the fade in stays on the left
+    delete c.tr;
+    delete c.fout;
+    delete b.fin;
     c.out = cut;
     p.clips.splice(i + 1, 0, b);
     return b;
@@ -1301,11 +1463,35 @@ export class VideoMode {
     if (before !== p.scope || reloaded || moved) this.h.lookChanged();
   }
 
-  /** The edit as a frame of `clip` at source time s is drawn (its clip's look, animated). */
-  lookState(st: EditState, clip: VClip | null = this.lastClip(), s = this.last?.s ?? 0, live = !this.player.playing): EditState {
+  /**
+   * The edit as a frame of `clip` at source time s is drawn (its clip's look, animated). Across
+   * a transition (`mix`: the other clip, and how much of it shows), eased from one clip's look to
+   * the other's. Without a clip: the frame on screen.
+   */
+  lookState(st: EditState, clip?: VClip | null, s?: number, live = !this.player.playing, mix?: { clip: VClip; s: number; w: number }): EditState {
     if (!st.video) return st;
-    const L = effectiveLook(st, clip, s, live);
-    return L.v === st.v && L.curves === st.curves ? st : { ...st, v: L.v, curves: L.curves };
+    if (clip === undefined) {
+      const m = this.lastMix();
+      if (m) {
+        clip = m.A;
+        s = m.fa.s;
+        mix = { clip: m.B, s: m.fb.s, w: mixWeight(m.mix.kind, m.mix.f) };
+      } else {
+        clip = this.lastClip();
+        s = this.last?.s ?? 0;
+      }
+    }
+    const L = effectiveLook(st, clip, s ?? 0, live);
+    let v = L.v, curves = L.curves;
+    if (mix && mix.w > 0) {
+      const M = effectiveLook(st, mix.clip, mix.s, live);
+      if (M.v !== v || M.curves !== curves) {
+        // (eased like look keyframes; settings that switch, switch half way)
+        v = lookValues({ v, curves, kf: [{ s: 0, v }, { s: 1, v: M.v }] }, mix.w);
+        if (mix.w >= 0.5) curves = M.curves;
+      }
+    }
+    return v === st.v && curves === st.curves ? st : { ...st, v, curves };
   }
 
   /** The look switch at the front of an adjustment section: whole video / this clip, keyframe. */
@@ -1407,7 +1593,7 @@ export class VideoMode {
 
   /** The app's open section changed (null: none). */
   toolShown(id: string | null) {
-    if (id !== 'vclip') this.rampOpen = false;
+    if (id !== 'vclip') this.rampOpen = this.fadeOpen = false;
     this.toolId = id;
     this.syncRampEd();
   }
@@ -1427,12 +1613,18 @@ export class VideoMode {
     if (id === 'vclip') {
       const c = this.selClip();
       if (!c) return [];
+      if (this.fadeOpen) return this.fadeEnd === 'out' ? ['vd.fout', 'vd.fin'] : ['vd.fin', 'vd.fout'];
       const fr = ['vd.zoom', 'vd.px', 'vd.py', 'vd.rot'];
       return c.kind === 'image' ? fr : [...(this.lib.get(c.src)?.audio ? ['vd.speed', 'vd.vol'] : ['vd.speed']), ...fr];
     }
     if (id === 'vcanvas') return this.project.bg === 'blur' || this.project.bg === 'image' ? ['vd.bgblur'] : [];
     if (id === 'vtext') return this.selText() ? ['vd.tsize'] : [];
     if (id === 'vmusic') return this.project.music ? ['vd.mvol', 'vd.min'] : [];
+    if (id === 'vtrans') {
+      const i = this.selCut();
+      return i > 0 && transInto(this.project, i) ? ['vd.trd'] : [];
+    }
+    if (id === 'vvoice') return this.selVoice() ? ['vd.vvol'] : [];
     return [];
   }
 
@@ -1440,6 +1632,11 @@ export class VideoMode {
     if (id === 'vd.min') {
       const m = this.project.music && this.lib.get(this.project.music.src);
       return { ...DEFS[id], max: Math.max(1, (m?.duration ?? 60) - 1) };
+    }
+    if (id === 'vd.fin' || id === 'vd.fout') {
+      // at most half the clip
+      const c = this.selClip();
+      return { ...DEFS[id], max: c ? Math.max(0.1, Math.min(FADE_MAX, Math.floor(clipLen(c) * 5) / 10)) : FADE_MAX };
     }
     return DEFS[id];
   }
@@ -1453,6 +1650,13 @@ export class VideoMode {
       case 'vd.mvol': return (mu?.vol ?? 0.7) * 100;
       case 'vd.min': return mu?.in ?? 0;
       case 'vd.bgblur': return this.project.bgBlur ?? (this.project.bg === 'image' ? 0 : 70);
+      case 'vd.fin': return c?.fin ?? 0;
+      case 'vd.fout': return c?.fout ?? 0;
+      case 'vd.vvol': return (this.selVoice()?.vol ?? 1) * 100;
+      case 'vd.trd': {
+        const i = this.selCut();
+        return (i > 0 && transInto(this.project, i)?.d) || TRANS_LEN.def;
+      }
     }
     if (c && /^vd\.(zoom|px|py|rot)$/.test(id)) {
       const f = framingAt(c, this.sNow(c));
@@ -1475,7 +1679,25 @@ export class VideoMode {
       if (inside) this.player.seek(start + localAt(c, srcT));
       this.changed(false);
     } else if (id === 'vd.vol' && c) c.vol = v / 100;
-    else if (id === 'vd.tsize' && t) {
+    else if ((id === 'vd.fin' || id === 'vd.fout') && c) {
+      const x = Math.round(v * 10) / 10;
+      if (id === 'vd.fin') c.fin = x || undefined;
+      else c.fout = x || undefined;
+      if (!c.fin) delete c.fin;
+      if (!c.fout) delete c.fout;
+      this.h.requestRender();
+    } else if (id === 'vd.vvol') {
+      const vc = this.selVoice();
+      if (vc) vc.vol = v / 100;
+    } else if (id === 'vd.trd') {
+      const i = this.selCut(), tr = i > 0 ? transInto(this.project, i) : null;
+      if (tr) {
+        tr.d = Math.round(v * 10) / 10;
+        this.changed(false);
+        // the playhead on the middle of it, to see it
+        this.player.seek(cutTime(layout(this.project), i));
+      }
+    } else if (id === 'vd.tsize' && t) {
       t.size = v;
       this.h.requestRender();
     } else if (id === 'vd.mvol' && mu) mu.vol = v / 100;
@@ -1492,6 +1714,14 @@ export class VideoMode {
 
   buildSubs(t: ToolDef, row: HTMLElement) {
     const p = this.project;
+    if (t.id === 'vtrans') {
+      const i = this.selCut();
+      if (i < 0) return;
+      const tr = transInto(p, i);
+      this.h.chip(row, { id: 'none', label: 'None' }, !tr, () => this.setTrans(i, null));
+      for (const [k, label] of TRANSITIONS) this.h.chip(row, { id: k, label }, tr?.kind === k, () => this.setTrans(i, k));
+      return;
+    }
     if (t.id === 'vcanvas') {
       const opts: [VAspect, string][] = [['auto', 'Original'], ['9:16', '9:16'], ['4:5', '4:5'], ['1:1', '1:1'], ['16:9', '16:9']];
       for (const [a, label] of opts) {
@@ -1549,6 +1779,34 @@ export class VideoMode {
       this.syncRampEd();
       return;
     }
+    if (t.id === 'vclip' && this.fadeOpen && this.selClip()) {
+      // fades: quick choices, the sliders set the lengths
+      const c = this.selClip()!;
+      this.h.tile(row, ICONS.check, 'Done', '', () => {
+        this.fadeOpen = false;
+        this.h.refreshSection();
+      });
+      sep();
+      const set = (fin: number, fout: number) => {
+        // (the slider goes to the end just chosen)
+        if (!fin !== !fout) this.fadeEnd = fout ? 'out' : 'in';
+        const half = clipLen(c) / 2;
+        if (fin) c.fin = Math.min(fin, half);
+        else delete c.fin;
+        if (fout) c.fout = Math.min(fout, half);
+        else delete c.fout;
+        tick();
+        this.changed(true);
+      };
+      const d = (x: number | undefined) => x || 0.5;
+      this.h.chip(row, { id: 'none', label: 'None' }, !c.fin && !c.fout, () => set(0, 0));
+      this.h.chip(row, { id: 'in', label: 'In' }, !!c.fin && !c.fout, () => set(d(c.fin), 0));
+      this.h.chip(row, { id: 'out', label: 'Out' }, !c.fin && !!c.fout, () => set(0, d(c.fout)));
+      this.h.chip(row, { id: 'both', label: 'Both' }, !!c.fin && !!c.fout, () => set(d(c.fin), d(c.fout)));
+      return;
+    }
+    if (t.id === 'vtrans') return this.transActs(row, sep);
+    if (t.id === 'vvoice') return this.voiceActs(row, sep);
     if (t.id === 'vclip') {
       const c = this.selClip();
       this.h.tile(row, ICONS.plus, 'Add', '', () => this.pickMedia());
@@ -1564,6 +1822,13 @@ export class VideoMode {
       if (c.kind === 'video') this.h.tile(row, ICONS.reverse, 'Reverse', c.reversed ? 'hot' : '', () => void this.reverseClip(c));
       if (c.kind === 'video') this.h.tile(row, ICONS.ramp, 'Ramp', c.ramp ? 'hot' : '', () => {
         this.rampOpen = true;
+        this.fadeOpen = false;
+        this.h.refreshSection();
+      });
+      this.h.tile(row, ICONS.fade, 'Fade', c.fin || c.fout ? 'hot' : '', () => {
+        this.fadeOpen = true;
+        this.fadeEnd = c.fout && !c.fin ? 'out' : 'in';
+        this.rampOpen = false;
         this.h.refreshSection();
       });
       this.h.tile(row, ICONS.key, 'Keyframe', this.keyHere(c) >= 0 ? 'hot' : '', () => this.toggleKey(c));
@@ -1644,9 +1909,255 @@ export class VideoMode {
     }
   }
 
+  // ---- transitions
+
+  /** The cut nearest the playhead (as the index of the clip after it; -1: there's only one clip). */
+  private nearestCut() {
+    const p = this.project, L = layout(p), T = this.player.time;
+    let best = -1;
+    for (let i = 1; i < p.clips.length; i++) if (best < 0 || Math.abs(cutTime(L, i) - T) < Math.abs(cutTime(L, best) - T)) best = i;
+    return best;
+  }
+
+  /** Give the cut before clip i a transition (null: a plain cut), keeping its length, and show it. */
+  private setTrans(i: number, kind: TransKind | null) {
+    const p = this.project, a = p.clips[i - 1], b = p.clips[i];
+    if (!a || !b) return;
+    this.unscope();
+    if (!kind) delete a.tr;
+    else a.tr = { kind, d: a.tr?.to === b.id ? a.tr.d : this.lastTransLen, to: b.id };
+    tick();
+    this.changed(true);
+    if (kind) this.previewTrans(i);
+    else this.player.seek(cutTime(layout(p), i));
+  }
+  /** the length the transitions here already have (a new one starts with it, so they match) */
+  private get lastTransLen() {
+    for (const c of this.project.clips) if (c.tr) return c.tr.d;
+    return TRANS_LEN.def;
+  }
+
+  /** Play the transition before clip i once, from a little before it to a little after. */
+  private previewTrans(i: number) {
+    const L = layout(this.project);
+    const a = Math.max(0, L.starts[i] - 0.6), b = Math.min(L.total, L.starts[i] + L.ov[i] + 0.6);
+    this.player.seek(a);
+    this.onTime();
+    void this.playNow().then(() => {
+      if (this.player.playing) this.previewUntil = b;
+    });
+  }
+
+  private transActs(row: HTMLElement, sep: () => void) {
+    const p = this.project;
+    const i = this.selCut();
+    if (p.clips.length < 2) return this.h.tile(row, ICONS.plus, 'Add clip', 'hot', () => this.pickMedia());
+    const go = (to: number) => {
+      if (to < 1 || to >= p.clips.length) return;
+      this.sel = { kind: 'cut', id: p.clips[to - 1].id };
+      this.player.seek(cutTime(layout(p), to));
+      this.onTime();
+      this.h.refreshSection();
+    };
+    this.h.tile(row, ICONS.stepBack, 'Previous', i > 1 ? '' : 'off', () => go(i - 1));
+    this.h.tile(row, ICONS.stepFwd, 'Next', i > 0 && i < p.clips.length - 1 ? '' : 'off', () => go(i + 1));
+    if (i < 0) return;
+    const tr = transInto(p, i);
+    if (!tr) return;
+    sep();
+    this.h.tile(row, ICONS.play, 'Preview', '', () => this.previewTrans(i));
+    this.h.tile(row, ICONS.duplicate, 'All cuts', '', () => {
+      this.unscope();
+      let n = 0;
+      for (let k = 1; k < p.clips.length; k++) {
+        p.clips[k - 1].tr = { kind: tr.kind, d: tr.d, to: p.clips[k].id };
+        n++;
+      }
+      tick(true);
+      this.changed(true);
+      this.h.toast(`${TRANSITIONS.find((x) => x[0] === tr.kind)?.[1]} on all ${n} cuts`, 1800);
+    });
+    this.h.tile(row, ICONS.trash, 'Remove', 'danger', () => this.setTrans(i, null));
+  }
+
+  // ---- voiceover
+
+  /** The voiceover lane shows once there's a voiceover (or one being recorded). */
+  private syncTrackHeight() {
+    const h = timelineHeight(!!this.project.voice?.length || !!this.rec) + 'px';
+    const el = $('tlTrack');
+    if (el.style.height !== h) {
+      el.style.height = h;
+      this.timeline?.draw();
+    }
+  }
+
+  private voiceActs(row: HTMLElement, sep: () => void) {
+    const p = this.project;
+    if (this.rec) {
+      this.h.tile(row, ICONS.stop, this.rec.phase === 'count' ? 'Cancel' : 'Stop', 'rec on', () => void this.stopVoice());
+      return;
+    }
+    this.h.tile(row, ICONS.record, 'Record', 'rec', () => void this.startVoice());
+    if (p.voice?.length && p.music) this.h.tile(row, ICONS.music, 'Duck music', p.duck !== false ? 'hot' : '', () => {
+      p.duck = p.duck === false ? undefined : false;
+      if (p.duck === undefined) delete p.duck;
+      this.h.toast(p.duck === false ? 'The music stays at its level under the voice' : 'The music dips while the voice speaks', 2000);
+      this.changed(true);
+    });
+    const v = this.selVoice();
+    if (!v) return;
+    sep();
+    this.h.tile(row, v.vol > 0 ? ICONS.sound : ICONS.mute, v.vol > 0 ? 'Mute' : 'Unmute', v.vol > 0 ? '' : 'hot', () => {
+      v.vol = v.vol > 0 ? 0 : 1;
+      tick(true);
+      this.changed(true);
+    });
+    this.h.tile(row, ICONS.trash, 'Delete', 'danger', () => {
+      p.voice = p.voice!.filter((x) => x !== v);
+      if (!p.voice.length) delete p.voice;
+      this.sel = null;
+      tick(true);
+      this.changed(true);
+    });
+  }
+
+  /** The record indicator next to the time: the count-in, then how long it's been recording. */
+  private lastRecLabel = '';
+  private syncRecBadge() {
+    const el = $('tlRec');
+    const r = this.rec;
+    const label = !r ? '' : r.phase === 'count' ? `<i></i>${r.n}` : `<i></i>REC ${fmtTime(Math.max(0, this.player.time - r.startT))}`;
+    if (label === this.lastRecLabel) return;
+    this.lastRecLabel = label;
+    el.hidden = !r;
+    el.classList.toggle('count', r?.phase === 'count');
+    el.innerHTML = label;
+  }
+
+  /** Record a voiceover: a count-in, then the video plays from the playhead while the microphone records. */
+  private async startVoice() {
+    if (this.rec || this.exporting || this.dead) return;
+    const p = this.project;
+    if (!p.clips.length) return this.h.toast('Add a clip first');
+    if (!VoiceRecorder.supported()) return this.h.toast('Recording isn’t possible in this browser', 3000);
+    if (this.player.playing) this.togglePlay();
+    const total = layout(p).total;
+    if (this.player.time >= total - 0.3) this.player.seek(0);
+    const ctx = await this.player.audioCtx();
+    const r = new VoiceRecorder(ctx);
+    const rec = { r, startT: this.player.time, ctxStart: 0, delay: 0, phase: 'count' as 'count' | 'rec', n: 3 };
+    this.rec = rec;
+    this.syncTrackHeight();
+    this.syncPlayButton();
+    this.syncRecBadge();
+    this.h.refreshSection();
+    try {
+      await r.open();
+    } catch (e) {
+      console.warn('microphone', e);
+      r.release();
+      if (this.rec === rec) this.rec = null;
+      this.afterRec();
+      const denied = (e as Error).name === 'NotAllowedError' || (e as Error).name === 'SecurityError';
+      this.h.toast(denied ? 'Lumen needs the microphone to record a voiceover · allow it in the settings' : 'Couldn’t open the microphone', 4000);
+      return;
+    }
+    // a count-in (the microphone is already listening, so the first word isn't clipped)
+    for (let n = 3; n >= 1; n--) {
+      if (this.rec !== rec) return r.release();
+      rec.n = n;
+      this.syncRecBadge();
+      tick(n === 1);
+      await sleep(700);
+    }
+    if (this.rec !== rec || this.dead) return r.release();
+    rec.phase = 'rec';
+    r.reset();
+    this.h.refreshSection();
+    await this.playNow();
+    const ck = this.player.clock();
+    if (this.rec !== rec) return;
+    if (!ck) {
+      // (playback didn't start)
+      this.rec = null;
+      r.release();
+      this.afterRec();
+      return;
+    }
+    rec.startT = ck.startT;
+    rec.ctxStart = ck.ctxStart;
+    // what the microphone hears now was said a little earlier, while the picture shown then was
+    // a little behind the sound being made (the output's delay): both are taken off
+    rec.delay = this.player.outputDelay() + r.inputDelay();
+    this.syncRecBadge();
+  }
+
+  /** Stop recording (or the count-in): the recording becomes a voiceover clip where it was spoken. */
+  private async stopVoice() {
+    const rec = this.rec;
+    if (!rec) return;
+    this.rec = null;
+    const endT = this.player.time;
+    // the output's delay, measured again now it has settled
+    if (rec.phase === 'rec' && this.player.playing) rec.delay = this.player.outputDelay() + rec.r.inputDelay();
+    if (this.player.playing) {
+      this.player.pause();
+      this.player.seek(this.player.time);
+    }
+    if (rec.phase === 'count') {
+      rec.r.release();
+      this.afterRec();
+      return;
+    }
+    const data = await rec.r.close();
+    this.afterRec();
+    if (this.dead) return;
+    const len = endT - rec.startT;
+    const sr = data.sr;
+    const x = assemble(data, rec.startT, len, (f) => rec.startT + f / sr - rec.ctxStart - rec.delay);
+    const span = len >= 0.3 ? speechSpan(x, sr) : null;
+    if (!span) return this.h.toast(len < 0.3 ? 'Too short to keep' : 'Nothing came through the microphone', 3000);
+    const stamp = new Date().toISOString().slice(0, 19).replace(/[T:]/g, '-');
+    try {
+      const m = await this.lib.add(wavFile(x, sr, `Voice ${stamp}.wav`));
+      if (this.dead) return;
+      this.audio.warm(m);
+      const p = this.project;
+      const v: VVoice = { id: uid(), src: m.id, t0: rec.startT + span[0], in: span[0], out: Math.min(span[1], m.duration || span[1]), vol: 1 };
+      v.anchor = anchorAt(p, v.t0);
+      (p.voice ??= []).push(v);
+      this.sel = { kind: 'voice', id: v.id };
+      tick(true);
+      this.changed(true);
+      this.h.toast('Voiceover added · drag it in the timeline to move it', 2400);
+    } catch (e) {
+      console.error(e);
+      this.h.toast('Couldn’t keep the recording: ' + ((e as Error).message || e), 4000);
+    }
+  }
+
+  private afterRec() {
+    this.lastRecLabel = '-';
+    this.syncRecBadge();
+    this.syncPlayButton();
+    this.syncTrackHeight();
+    this.timeline.draw();
+    if (!this.dead) this.h.refreshSection();
+  }
+
   /** Section opened: some need a nudge (nothing selected yet). */
   onOpenTool(id: string) {
     const p = this.project;
+    if (id === 'vtrans' && this.selCut() < 0) {
+      const i = this.nearestCut();
+      if (i > 0) {
+        this.sel = { kind: 'cut', id: p.clips[i - 1].id };
+        this.player.seek(cutTime(layout(p), i));
+        this.onTime();
+      } else this.h.toast('Add another clip to put a transition between them', 2400);
+    }
+    if (id === 'vvoice' && !p.voice?.length && !this.rec) this.h.toast('Tap Record: the video plays from the playhead while you speak', 2800);
     if (id === 'vclip' && !this.selClip() && p.clips.length) {
       const at = clipAt(p, this.player.time);
       if (at) {
@@ -1697,7 +2208,9 @@ export class VideoMode {
     if (id === 'vcanvas') return p.aspect !== 'auto' || p.fit !== 'fit' || p.bg !== 'blur' || (p.bgBlur ?? 70) !== 70;
     if (id === 'vtext') return p.texts.length > 0;
     if (id === 'vmusic') return !!p.music;
-    if (id === 'vclip') return p.clips.some((c) => c.speed !== 1 || !!c.ramp || !!c.kf?.length || !!c.tf || (!!this.lib.get(c.src)?.audio && c.vol !== 1));
+    if (id === 'vtrans') return p.clips.some((_, i) => !!transInto(p, i));
+    if (id === 'vvoice') return !!p.voice?.length;
+    if (id === 'vclip') return p.clips.some((c) => c.speed !== 1 || !!c.ramp || !!c.kf?.length || !!c.tf || !!c.fin || !!c.fout || (!!this.lib.get(c.src)?.audio && c.vol !== 1));
     return false;
   }
 
@@ -1838,15 +2351,31 @@ export class VideoMode {
           this.exportStill = { id: m.id, tex: this.comp.imageTexture(bmp), w: bmp.width, h: bmp.height };
           bmp.close();
         },
-        drawFrame: (clip, m, sample, T) => {
+        drawFrame: (clip, m, sample, T, other?: OtherFrame) => {
           // (looks and framing follow the output frame's own moment, not the source frame's:
           // in slow motion one source frame covers several output frames)
           const s = this.srcTime(clip, T);
-          const look = this.lookState(this.h.state(), clip, s, false);
+          const long = Math.max(w, h);
+          const src = this.srcFor(m, sample, long);
+          const P = st.video!;
+          const mix = other ? mixAt(P, T) : null;
+          let look: EditState;
+          if (mix && other) {
+            // across a transition: both clips, joined
+            const so = this.srcTime(other.clip, T);
+            const srcO = this.srcFor(other.media, other.sample, long, true, undefined, undefined, false, 1);
+            const first = P.clips[mix.a] === clip;
+            const [A, sa, fa, B, sb, fb] = first ? [clip, s, src, other.clip, so, srcO] : [other.clip, so, srcO, clip, s, src];
+            this.comp.placeMix(fa, fb, out, this.placement(A, sa, w, h), this.placement(B, sb, w, h), mix.kind, mix.f);
+            look = this.lookState(this.h.state(), A, sa, false, { clip: B, s: sb, w: mixWeight(mix.kind, mix.f) });
+          } else {
+            look = this.lookState(this.h.state(), clip, s, false);
+            this.comp.place(src, out, this.placement(clip, s, w, h));
+          }
           this.h.pipe.filmFrame = this.film(T, look.v);
-          const src = this.srcFor(m, sample, Math.max(w, h));
-          this.comp.place(src, out, this.placement(clip, s, w, h));
           this.h.renderFull({ tex: out.tex, w, h, linear: false }, w, h, look);
+          const ov = this.overlayAt(T);
+          if (ov) this.comp.overlay(w, h, ov);
           const vis = this.visibleTexts(T);
           this.comp.setText(vis.length ? JSON.stringify([vis, w, h]) : '', w, h, vis.length ? this.paintTexts(vis) : null);
           this.comp.drawText(w, h);
@@ -1892,6 +2421,8 @@ export class VideoMode {
 
   dispose() {
     this.dead = true;
+    this.rec?.r.release();
+    this.rec = null;
     this.life.abort();
     clearTimeout(this.remixTimer);
     clearTimeout(this.capTimer);
@@ -1913,6 +2444,8 @@ export class VideoMode {
     this.audio.dispose();
     this.last = null;
     $('tlTrack').innerHTML = '';
+    $('tlRec').hidden = true;
+    $('tlPlay').classList.remove('rec');
     // handlers on elements that outlive the editor would keep all of it (and its sound) in memory
     for (const id of ['tlPrev', 'tlNext']) {
       const b = $(id);

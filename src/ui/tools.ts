@@ -41,6 +41,12 @@ export const TOOLS: ToolDef[] = [
   {
     id: 'detail', label: 'Detail', icon: ICONS.detail, kind: 'params',
     params: list('sharpen', 'sharpenRadius', 'sharpenMask', 'texture', 'clarity', 'dehaze', 'denoise', 'colorDenoise'),
+    actions: [
+      { id: 'ai:denoise', label: 'AI denoise' },
+      { id: 'ai:up2', label: 'Upscale 2×' },
+      { id: 'ai:up4', label: 'Upscale 4×' },
+      { id: 'ai:orig', label: 'Original pixels' },
+    ],
   },
   {
     id: 'curves', label: 'Curves', icon: ICONS.curves, kind: 'curves', params: () => [],

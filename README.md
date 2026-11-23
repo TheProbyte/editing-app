@@ -196,6 +196,10 @@ Code map:
   personal-use app.
 - **Depth Anything V2 Small** (Apache-2.0; `onnx-community/depth-anything-v2-small`, quantized) for the lens blur,
   fetched from Hugging Face the first time Lens is used.
+- **Real-ESRGAN** `realesr-general-x4v3` and `realesr-general-wdn-x4v3` (Xintao Wang et al., BSD-3-Clause) for AI
+  denoise and upscale: converted to one ONNX file (`public/models/realesr-x4.onnx`, 5 MB, fp16 weights) whose `dn`
+  input blends the two weight sets like the original `-dn` option; ships with the app. Also used by Air and the lens
+  blur: Depth Anything (above).
 - **LibRaw** (via `libraw-wasm`), **MediaPipe Tasks Vision** (Apache-2.0) for subject / people selection,
   **ONNX Runtime Web** (MIT), **fflate** (MIT) for PNG compression, **Mediabunny** (MPL-2.0) for video,
   Pixelify Sans and Silkscreen (OFL).

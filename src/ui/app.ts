@@ -9,6 +9,7 @@ import { makeSpline } from '../curves';
 import { LOOKS, Look, ImgStats, measure } from '../presets';
 import { addCube, cubeList, loadCubes, removeCube } from '../io/cubes';
 import { photoDate } from '../io/photoDate';
+import { Enhancer, enhanceFits, type EnhanceMode } from '../ai/enhance';
 import { loadFile } from '../io/loader';
 import { framed, renderExport, saveOrShare } from '../io/export';
 import { encodeJpegBand } from '../io/jpegEncoder';
@@ -138,6 +139,9 @@ export class App {
   private seg = new Segmenter();
   private neural = new NeuralFill();
   private depthEst = new DepthEstimator();
+  private enhancer = new Enhancer();
+  /** the photo as it was before AI denoise / upscale replaced its pixels (to go back) */
+  private aiOriginal: File | null = null;
   private depthJob: { key: string; p: Promise<void> } | null = null;
   private lookRaf = 0;
   /** the recent-projects entry this edit is saved as */
@@ -428,6 +432,7 @@ export class App {
           saveFile(file);
         }
         if (!keepState) {
+          this.aiOriginal = null;
           this.recentId = recentId ?? Math.random().toString(36).slice(2, 10);
           this.recentFresh = false;
           // a project from the shelf keeps its saved edit and picture until this session saves over them
@@ -1193,6 +1198,69 @@ export class App {
       if (e.target === sheet) sheet.classList.remove('on');
     };
     sheet.classList.add('on');
+  }
+
+  // ---- AI denoise / upscale: the photo's pixels are replaced (the edit stays as it is)
+
+  private async enhance(mode: EnhanceMode | 'orig') {
+    const img = this.img;
+    if (!img || this.video || !this.file) return;
+    if (mode === 'orig') {
+      if (!this.aiOriginal) return this.toast('These are the photo’s own pixels', 1800);
+      const f = this.aiOriginal, tool = this.tool;
+      this.aiOriginal = null;
+      await this.open(f, true);
+      if (tool && this.img) this.setMode(tool);
+      this.recentFresh = true;
+      this.saveRecentSoon();
+      return this.toast('Back to the original pixels', 1800);
+    }
+    const { w, h } = img.full;
+    if (!enhanceFits(mode, w, h)) {
+      const s = mode === 'up4' ? 4 : 2;
+      return this.toast(`Too big for ${s}× (it would be ${w * s} × ${h * s}): try ${mode === 'up4' && enhanceFits('up2', w, h) ? '2×' : 'cropping first or a smaller photo'}`, 3500);
+    }
+    const job = this.cancellable();
+    const before = this.file;
+    try {
+      this.busy(mode === 'denoise' ? 'Denoising' : 'Upscaling');
+      await new Promise((r) => setTimeout(r, 30));
+      // the photo as it came, at full size, before any edit (the edit is applied to the result)
+      const st = defaultState();
+      const rgba = new Uint8ClampedArray(this.pipe.renderPixels(img.full, st, w, h).buffer);
+      const out = await this.enhancer.run(rgba, w, h, mode, mode === 'denoise' ? 0.9 : 0.5, (m) => this.busy(m), job.signal);
+      if (this.img !== img) return;
+      this.busy('Saving');
+      const c = document.createElement('canvas');
+      c.width = out.w;
+      c.height = out.h;
+      c.getContext('2d')!.putImageData(new ImageData(out.px, out.w, out.h), 0, 0);
+      const blob = await new Promise<Blob | null>((r) => c.toBlob(r, 'image/jpeg', 0.96));
+      c.width = c.height = 0;
+      if (!blob) throw new Error('The result couldn’t be saved');
+      const base = before.name.replace(/\.[^.]+$/, '').replace(/ \((AI denoised|AI \d×)\)$/, '');
+      const name = `${base} (${mode === 'denoise' ? 'AI denoised' : `AI ${mode === 'up4' ? 4 : 2}×`}).jpg`;
+      const file = new File([blob], name, { type: 'image/jpeg', lastModified: before.lastModified });
+      this.aiOriginal ??= before;
+      job.done();
+      const tool = this.tool;
+      await this.open(file, true);
+      // (opening closes the section: back to where you were)
+      if (tool && this.img) this.setMode(tool);
+      // the project keeps the new pixels
+      this.recentFresh = true;
+      this.saveRecentSoon();
+      this.toast(mode === 'denoise' ? 'Denoised · “Original pixels” goes back' : `Now ${out.w} × ${out.h} · “Original pixels” goes back`, 3200);
+    } catch (e) {
+      if (isAbortError(e)) this.toast('Stopped', 1500);
+      else {
+        console.error(e);
+        this.toast('AI ' + (mode === 'denoise' ? 'denoise' : 'upscale') + ' failed: ' + ((e as Error).message || 'unknown error'), 4500);
+      }
+    } finally {
+      job.done();
+      this.busy(null);
+    }
   }
 
   /** Name, pin or delete a recent project (held on the home screen). */
@@ -4576,6 +4644,9 @@ export class App {
           dream: { halation: 55, halThreshold: 45, halRadius: 70, halHue: 18, halSat: 70, glow: 20 },
         }[arg]!);
         break;
+      case 'ai':
+        void this.enhance(arg as EnhanceMode | 'orig');
+        return;
       case 'frame':
         if (arg === 'stamp') v.stamp = v.stamp > 0 ? 0 : 90;
         else {

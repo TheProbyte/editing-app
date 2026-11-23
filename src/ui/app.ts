@@ -41,6 +41,9 @@ import { canonical } from '../video/looks';
 
 /** photo tools that don't apply to video */
 const VIDEO_HIDDEN = new Set(['heal', 'masks', 'double', 'air']);
+/** video tools that don't apply to photos (a photo's people have the People masks) */
+const PHOTO_HIDDEN = new Set(['person']);
+const PHOTO_TOOLS = TOOLS.filter((t) => !PHOTO_HIDDEN.has(t.id));
 /** Grain for video: the same grain, moving, plus flicker, gate weave, dust and film presets. */
 const VIDEO_GRAIN = (t: ToolDef): ToolDef => ({
   ...t,
@@ -1791,7 +1794,7 @@ export class App {
   }
 
   private toolList(): ToolDef[] {
-    if (!this.video) return TOOLS;
+    if (!this.video) return PHOTO_TOOLS;
     return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t.id === 'blur' ? { ...t, subs: t.subs?.filter((x) => x.id !== '3') } : t.id === 'leak' ? { ...t, params: (s: string) => [...t.params(s), 'lkMotion'] } : t.id === 'frame' ? { ...t, params: (s: string) => [...t.params(s), 'cineRate'] } : t))];
   }
 
@@ -4663,6 +4666,14 @@ export class App {
           // a tape look comes with its date in the corner
           if (arg === '4' && !v.stamp) v.stamp = 90;
         }
+        break;
+      case 'person':
+        setMany({
+          spot: { pplExp: 0, pplSat: 0, pplBgExp: -45, pplBgSat: -30 },
+          pop: { pplExp: 0, pplSat: 0, pplBgExp: 0, pplBgSat: -100 },
+          bright: { pplExp: 25, pplSat: 10, pplBgExp: 0, pplBgSat: 0 },
+          off: { pplExp: 0, pplSat: 0, pplBgExp: 0, pplBgSat: 0 },
+        }[arg]!);
         break;
       case 'air':
         setMany({

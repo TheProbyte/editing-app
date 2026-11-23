@@ -31,6 +31,8 @@ import { REVERSE_MAX } from './reverse';
 import { effectiveLook, lookKeyAt, lookValues, newLook, sameValues, unscopeState, upsertKey } from './looks';
 import { VoiceRecorder, assemble, speechSpan, wavFile } from './voice';
 import { Captioner, CAPTIONS_MB, splitCaptions, type Caption } from '../ai/captions';
+import { PeopleTracker, PEOPLE_SIZE } from '../ai/people';
+import { defaultState } from '../params';
 
 export interface VideoHost {
   g: GL;
@@ -171,6 +173,7 @@ export class VideoMode {
       time: () => this.player.time,
       scrub: (T) => {
         this.interactive();
+        this.people?.reset();
         this.player.seek(T, true);
         this.syncPlayButton();
         this.onTime();
@@ -555,6 +558,7 @@ export class VideoMode {
 
   /** Place the last frame (both clips' across a transition) into `dst`. */
   private placeLast(dst: Target) {
+    this.placeVer++;
     const m = this.lastMix();
     if (m) {
       this.comp.placeMix(m.fa.src, m.fb.src, dst, this.placement(m.A, m.fa.s, dst.w, dst.h), this.placement(m.B, m.fb.s, dst.w, dst.h), m.mix.kind, m.mix.f);
@@ -802,6 +806,122 @@ export class VideoMode {
     if (ov) this.comp.overlay(w, h, ov);
     this.textLayer(T, w, h);
     this.comp.drawText(w, h);
+    this.personTick();
+  }
+
+  // ---- Person: the look's person / background settings (pplExp, pplSat, pplBgExp, pplBgSat)
+  // need a mask of the people in the frame (see ai/people.ts). Paused, the frame showing gets
+  // one (a newer frame meanwhile: the result is dropped and asked for again); playing, one is
+  // asked for a few times a second, never two at once, and the picture uses the latest.
+
+  private people: PeopleTracker | null = null;
+  private ppl = { state: 'off' as 'off' | 'loading' | 'ready' | 'failed', on: false, busy: false, at: 0, cost: 0, shown: -1 };
+  /** counts frames placed in the project frame (what a mask is for) */
+  private placeVer = 0;
+
+  /** Do these settings use the person mask? */
+  private personOn(v: EditState['v']) {
+    return !!(v.pplExp || v.pplSat || v.pplBgExp || v.pplBgSat);
+  }
+
+  /** After each preview render: keep a mask for the frame on screen while the effect is on. */
+  private personTick() {
+    const P = this.ppl;
+    if (!this.personOn(this.lookState(this.h.state()).v)) {
+      if (P.on) {
+        P.on = false;
+        P.shown = -1;
+        this.h.pipe.setPerson(null);
+        this.people?.reset();
+      }
+      // (switched on again after a failed load: it tries again)
+      if (P.state === 'failed') P.state = 'off';
+      return;
+    }
+    P.on = true;
+    if (P.state === 'off') return void this.loadPeople();
+    if (P.state !== 'ready' || P.busy || !this.frameT || !this.last || P.shown === this.placeVer) return;
+    // playing: a few times a second, and less often where a mask takes long (it holds up the page)
+    if (this.player.playing && performance.now() - P.at < Math.max(200, P.cost * 3)) return;
+    P.busy = true;
+    P.at = performance.now();
+    // (after this frame is on the screen)
+    setTimeout(() => void this.requestMask(), 0);
+  }
+
+  /** Load the people model (downloaded once): the effect starts once it's there. */
+  private pplLoad: Promise<boolean> | null = null;
+  private loadPeople() {
+    return (this.pplLoad ??= this.loadPeopleNow().finally(() => (this.pplLoad = null)));
+  }
+  private async loadPeopleNow() {
+    const P = this.ppl;
+    P.state = 'loading';
+    this.people ??= new PeopleTracker();
+    const job = this.h.cancellable();
+    this.h.busy('Loading the people model');
+    try {
+      await this.people.ready((f) => this.h.busy(`Downloading the people model ${Math.round(f * 100)}%`), job.signal);
+      if (this.dead) return false;
+      P.state = 'ready';
+      this.h.requestRender();
+    } catch (e) {
+      P.state = 'failed';
+      if ((e as Error).name === 'AbortError') this.h.toast('Person needs the people model · move a Person slider to try again', 3200);
+      else {
+        console.error(e);
+        this.h.toast('Person couldn’t load the people model: ' + ((e as Error).message || e), 4500);
+      }
+    } finally {
+      job.done();
+      this.h.busy(null);
+    }
+    return P.state === 'ready';
+  }
+
+  /** A small copy (long side PEOPLE_SIZE) of a frame, top row first, for the people model. */
+  private smallFrame(t: Target) {
+    const k = PEOPLE_SIZE / Math.max(t.w, t.h);
+    const w = Math.max(8, Math.round(t.w * k)), h = Math.max(8, Math.round(t.h * k));
+    const r = this.h.pipe.geometryRegion({ tex: t.tex, w: t.w, h: t.h, linear: false }, defaultState(), w, h, { x: 0, y: 0, w, h });
+    return { px: r.px, w: r.w, h: r.h };
+  }
+
+  /** Which shot a frame is of, for the tracker (it eases masks within one shot): a transition's two clips count as one. */
+  private shotKey() {
+    const L = this.last!;
+    return L.other ? `${L.clip}|${L.other.clip}` : L.clip;
+  }
+
+  private async requestMask() {
+    const P = this.ppl, ver = this.placeVer;
+    try {
+      if (this.dead || this.exporting || !P.on || !this.frameT || !this.last || !this.people) return;
+      const fr = this.smallFrame(this.frameT);
+      const t0 = performance.now();
+      const m = await this.people.mask(fr.px, fr.w, fr.h, this.last.T ?? this.player.time, this.shotKey());
+      P.cost = performance.now() - t0;
+      if (this.dead || this.exporting || !P.on) return;
+      // paused on another frame meanwhile: this one's out of date (the next render asks again)
+      if (!this.player.playing && ver !== this.placeVer) return;
+      this.h.pipe.setPerson(m);
+      P.shown = ver;
+      this.h.pipe.invalidate();
+      if (!this.player.playing) this.h.requestRender();
+    } catch (e) {
+      console.warn('person mask', e);
+    } finally {
+      P.busy = false;
+      if (!this.player.playing && P.on && P.shown !== this.placeVer) this.h.requestRender();
+    }
+  }
+
+  /** Does any look in the project use the person settings (the whole video's, or a clip's own)? */
+  private personAnywhere() {
+    const st = this.h.state(), p = this.project;
+    const looks = [p.scope && p.base ? p.base.v : st.v, ...(p.scope ? [st.v] : [])];
+    for (const c of p.clips) if (c.look) looks.push(c.look.v, ...(c.look.kf ?? []).map((k) => k.v));
+    return looks.some((v) => this.personOn(v));
   }
 
   // -----------------------------------------------------------------------------------
@@ -908,6 +1028,8 @@ export class VideoMode {
 
 
   seek(T: number) {
+    // (a jump: the person is found afresh)
+    this.people?.reset();
     this.player.seek(T);
     this.onTime();
     this.syncPlayButton();
@@ -2601,6 +2723,12 @@ export class VideoMode {
   }
 
   private async doExport() {
+    // Person in the look: a mask for every frame, so the model has to be there first
+    const usePpl = this.personAnywhere();
+    if (usePpl && this.ppl.state !== 'ready' && !(await this.loadPeople())) return this.h.toast('The export needs the people model for Person', 3500);
+    if (usePpl) this.people!.reset();
+    /** what the last mask was for (a picture held by the cine rate keeps its mask) */
+    let maskKey = '';
     const { w, h } = this.dims(this.ex.res);
     const st = this.h.state();
     this.exporting = true;
@@ -2645,7 +2773,7 @@ export class VideoMode {
           this.exportStill = { id: m.id, tex: this.comp.imageTexture(bmp), w: bmp.width, h: bmp.height };
           bmp.close();
         },
-        drawFrame: (clip, m, sample, T, other?: OtherFrame) => {
+        drawFrame: async (clip, m, sample, T, other?: OtherFrame) => {
           // (looks and framing follow the output frame's own moment, not the source frame's:
           // in slow motion one source frame covers several output frames)
           const s = this.picTime(clip, T);
@@ -2654,6 +2782,7 @@ export class VideoMode {
           const P = st.video!;
           const mix = other ? mixAt(P, T) : null;
           let look: EditState;
+          let key = `${clip.id}:${s}`, shot = clip.id;
           if (mix && other) {
             // across a transition: both clips, joined
             const so = this.picTime(other.clip, T);
@@ -2662,9 +2791,18 @@ export class VideoMode {
             const [A, sa, fa, B, sb, fb] = first ? [clip, s, src, other.clip, so, srcO] : [other.clip, so, srcO, clip, s, src];
             this.comp.placeMix(fa, fb, out, this.placement(A, sa, w, h), this.placement(B, sb, w, h), mix.kind, mix.f);
             look = this.lookState(this.h.state(), A, sa, false, { clip: B, s: sb, w: mixWeight(mix.kind, mix.f) });
+            // (a transition: the people of the mixed frame)
+            shot = `${A.id}|${B.id}`;
+            key = `${shot}:${sa}:${sb}:${mix.f}`;
           } else {
             look = this.lookState(this.h.state(), clip, s, false);
             this.comp.place(src, out, this.placement(clip, s, w, h));
+          }
+          // the people in this very frame, before it's drawn
+          if (usePpl && this.personOn(look.v) && key !== maskKey) {
+            maskKey = key;
+            const fr = this.smallFrame(out);
+            this.h.pipe.setPerson(await this.people!.mask(fr.px, fr.w, fr.h, T, shot));
           }
           // (t: what moves smoothly with the video's time, like a drifting light leak)
           this.h.pipe.filmFrame = { ...this.film(T, look.v), t: T };
@@ -2700,6 +2838,12 @@ export class VideoMode {
       canvas.width = keep.w;
       canvas.height = keep.h;
       this.h.busy(null);
+      // the person mask is the export's last frame's: the preview asks for its own again
+      if (usePpl) {
+        this.h.pipe.setPerson(null);
+        this.ppl.shown = -1;
+        this.people?.reset();
+      }
       this.h.pipe.invalidate();
       // the raw frame now holds the export's last frame: show the playhead's frame again
       this.player.seek(this.player.time);
@@ -2716,6 +2860,9 @@ export class VideoMode {
 
   dispose() {
     this.dead = true;
+    this.h.pipe.setPerson(null);
+    this.people?.dispose();
+    this.people = null;
     this.rec?.r.release();
     this.rec = null;
     this.life.abort();

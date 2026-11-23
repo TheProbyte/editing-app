@@ -141,6 +141,17 @@ export const TOOLS: ToolDef[] = [
   },
   { id: 'film', label: 'Film', icon: ICONS.film, kind: 'params', params: list('fade', 'fadeWarmth', 'ca', 'distortion') },
   {
+    // video only: follows the people in each frame (see src/video/mode.ts, Person)
+    id: 'person', label: 'Person', icon: ICONS.person, kind: 'params',
+    params: list('pplExp', 'pplSat', 'pplBgExp', 'pplBgSat'),
+    actions: [
+      { id: 'person:spot', label: 'Spotlight' },
+      { id: 'person:pop', label: 'Color pop' },
+      { id: 'person:bright', label: 'Bright subject' },
+      { id: 'person:off', label: 'Off' },
+    ],
+  },
+  {
     id: 'crop', label: 'Crop', icon: ICONS.crop, kind: 'crop',
     params: list('straighten', 'perspV', 'perspH'),
     subs: [

@@ -31,7 +31,7 @@ export interface VideoExportOptions {
   /** before a clip's frames are drawn (e.g. to read a still at full size) */
   prepare?: (clip: VClip, media: Media) => Promise<void>;
   /** draw the finished frame for timeline time T onto the canvas (w×h); inside a transition, with the other clip's frame */
-  drawFrame: (clip: VClip, media: Media, sample: VideoSample | null, T: number, other?: OtherFrame) => void;
+  drawFrame: (clip: VClip, media: Media, sample: VideoSample | null, T: number, other?: OtherFrame) => void | Promise<void>;
   progress: (f: number, stage: string) => void;
   cancelled: () => boolean;
 }
@@ -178,7 +178,7 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
           for (let j = 0; j < times.length; j++) {
             if (o.cancelled()) throw new DOMException('cancelled', 'AbortError');
             const T = times[j];
-            o.drawFrame(clip, m, null, T, await otherAt(j));
+            await o.drawFrame(clip, m, null, T, await otherAt(j));
             await video.add(T, 1 / o.fps);
             o.progress(++n / frames, 'Exporting');
           }
@@ -201,7 +201,7 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
             // of a clip its first frame, rather than whatever the previous clip left
             if (!s && !last) last = await sink.getSample(await m.video.getFirstTimestamp()).catch(() => null);
             const use = s ?? last;
-            o.drawFrame(clip, m, use, T, await otherAt(j));
+            await o.drawFrame(clip, m, use, T, await otherAt(j));
             j++;
             if (s) {
               if (last && last !== s) last.close();

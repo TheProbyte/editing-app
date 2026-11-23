@@ -1,9 +1,11 @@
 // Export: every output frame is decoded exactly (Mediabunny), put through the same GPU
 // pipeline as the preview at full size and handed to the hardware encoder straight from the
-// canvas. Audio (clips at their speed and volume, plus the music) is mixed offline first.
+// canvas. Audio (clips at their speed and volume, plus the music) is mixed offline first. The
+// file is written to the site's private storage as it's made (a long export would not fit in
+// memory), and handed back as that file.
 import {
   AudioBufferSource, BufferTarget, CanvasSource, Mp4OutputFormat, Output, QUALITY_HIGH, QUALITY_VERY_HIGH,
-  getFirstEncodableAudioCodec, getFirstEncodableVideoCodec, type VideoSample,
+  StreamTarget, getFirstEncodableAudioCodec, getFirstEncodableVideoCodec, type VideoSample,
 } from 'mediabunny';
 import type { Media, MediaLib } from './media';
 import { MIX_RATE, type AudioEngine } from './audio';
@@ -28,6 +30,35 @@ export interface VideoExportOptions {
   cancelled: () => boolean;
 }
 
+/** the folder (in the site's private storage) exports are written into */
+const DIR = 'lumen-exports';
+
+/**
+ * A new file for an export in the site's private storage. What earlier exports left there goes
+ * first (the last one stays until then: it may still be being saved). Null where there's no such
+ * storage (older WebViews): the export is then built in memory, as before.
+ */
+async function diskFile() {
+  try {
+    const root = await navigator.storage?.getDirectory?.();
+    if (!root) return null;
+    const dir = await root.getDirectoryHandle(DIR, { create: true });
+    const old: string[] = [];
+    for await (const name of (dir as unknown as { keys(): AsyncIterable<string> }).keys()) old.push(name);
+    for (const name of old) await dir.removeEntry(name).catch(() => {});
+    const name = `export-${Date.now()}.mp4`;
+    const fh = await dir.getFileHandle(name, { create: true });
+    const drop = () => dir.removeEntry(name).catch(() => {});
+    if (typeof fh.createWritable !== 'function') {
+      await drop();
+      return null;
+    }
+    return { fh, writable: await fh.createWritable(), drop };
+  } catch (e) {
+    console.warn('no private storage for the export: building it in memory', e);
+    return null;
+  }
+}
 
 export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
   const p = o.project;
@@ -38,7 +69,13 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
   const hasAudio = p.clips.some((c) => c.vol > 0 && o.lib.get(c.src)?.audio) || !!(p.music && o.lib.get(p.music.src)?.audio && p.music.vol > 0);
   const acodec = hasAudio ? await getFirstEncodableAudioCodec(['aac', 'opus'], { numberOfChannels: 2, sampleRate: MIX_RATE }) : null;
 
-  const output = new Output({ format: new Mp4OutputFormat({ fastStart: 'in-memory' }), target: new BufferTarget() });
+  const disk = await diskFile();
+  // on disk the index goes at the end, written once everything's length is known (a plain MP4
+  // every player and gallery reads); only in memory can it go at the front
+  const output = new Output({
+    format: new Mp4OutputFormat({ fastStart: disk ? false : 'in-memory' }),
+    target: disk ? new StreamTarget(disk.writable, { chunked: true, chunkSize: 4 * 2 ** 20 }) : new BufferTarget(),
+  });
   // bits per pixel per frame, capped at what phones record at
   const bitrate = Math.round(Math.min(80e6, o.w * o.h * o.fps * (o.quality === 'max' ? 0.3 : 0.16) * (o.boost ?? 1)));
   const video = new CanvasSource(o.canvas, { codec: vcodec, bitrate: bitrate || (o.quality === 'max' ? QUALITY_VERY_HIGH : QUALITY_HIGH), keyFrameInterval: 2 });
@@ -113,11 +150,19 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
     video.close();
     o.progress(1, 'Finishing');
     await output.finalize();
+    if (disk) {
+      // the file itself (read from disk when it's saved), not a copy of it in memory
+      const f = await disk.fh.getFile();
+      if (!f.size) throw new Error('The video came out empty');
+      return new File([f], f.name, { type: 'video/mp4' });
+    }
     const buf = (output.target as BufferTarget).buffer;
     if (!buf) throw new Error('The video came out empty');
     return new Blob([buf], { type: 'video/mp4' });
   } catch (e) {
     await output.cancel().catch(() => {});
+    // a cancelled or failed export leaves no file behind
+    await disk?.drop();
     throw e;
   }
 }

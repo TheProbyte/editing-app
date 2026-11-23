@@ -109,6 +109,8 @@ export const PARAMS: ParamDef[] = [
   // Film frame: the gate and perforations of a film scan (or a tape / instant print look) and a date stamp
   p('frameStyle', 'Frame', 0, 5, 0, { fmt: (v) => FRAME_STYLES[Math.round(v)] ?? '' }),
   p('frameSize', 'Border', 0, 100, 50),
+  // video: the picture held to a film-like rate (the sound and the video's own rate stay as they are)
+  p('cineRate', 'Motion', 0, 3, 0, { fmt: (v) => ['Normal', '18 fps cine', '12 fps', '8 fps'][Math.round(v)] ?? '' }),
   p('stamp', 'Date stamp', 0, 100, 0),
   // Perspective (Crop): + widens the top / the right side, to stand converging lines up straight
   p('perspV', 'Vertical'),

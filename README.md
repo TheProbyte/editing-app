@@ -7,7 +7,13 @@ home screen like an app. Everything runs on-device on the GPU — photos never l
 
 - **Open media**: one photo opens the photo editor; a video (or several files) opens the **video editor**.
   **Take photo** shoots RAW/DNG in the Android app. The home button returns to the start page.
-- **Tool bar**: tap a tool, or **swipe up** on the bar for a grid of every tool.
+- **Tool bar**: tap a tool, or **swipe up** on the bar for a grid of every tool. Tools and sections you've
+  changed carry a yellow dot.
+- **Home**: recent projects with their names (and a video's length); **hold** one to rename it, pin it to the
+  front or delete it. **Open with / Share to Lumen** from Google Photos and other apps.
+- **⋯ menu**: Settings (export format and quality, AI remove model, haptics, tips), Storage (what's kept on the
+  phone, a size limit for recent projects), a Performance readout, before/after **split** view (the button on
+  the photo).
 - In a section: **swipe ↔ on the photo** or **drag the slider** to change the value (it sticks at 0 for a
   moment so it's easy to land back on it; double-tap the slider to reset). **Swipe ↕** to pick the adjustment.
   **✓** keeps it, **Back** (or the Android back gesture) drops the section's changes.
@@ -44,6 +50,10 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Text:** titles with Pixel / Sans / Serif type, colours and a box; drag them on the video, and drag or
   trim their bar in the timeline to set when they show.
 - **Music:** add a song (fades in/out), set its volume and where in the song to start.
+- **Freeze & Reverse:** Freeze holds the frame at the playhead for 2 s; Reverse plays a clip backwards
+  (picture and sound), and again to go back. Frame-step buttons beside play; drags snap to cuts and
+  keyframes; titles stay with the moment of their clip.
+- **Light leaks that move:** Leaks in a video get **Motion** (drift, turn, breathing light).
 - **Film grain that moves:** in Grain, video adds **Motion** (Still / 12 fps / 24 fps / every frame),
   **Flicker**, **Gate weave** (the picture drifting in the projector gate) and **Dust & scratches**, plus
   **8mm / 16mm / 35mm / Clean** presets. Everything is keyed to the film frame, so the export matches the
@@ -129,7 +139,15 @@ from the photo editor applies to the whole video; the timeline sits above the to
 - **Glow / Diffusion:** bloom and mist-filter softness.
 - **Vignette:** Amount, Size, Feather, Roundness, highlight protection.
 - **Film & Lens:** Fade (with warmth), color fringing, lens distortion.
-- **Crop & rotate:** free or fixed aspect ratios, straighten, rotate 90°, flip.
+- **Crop & rotate:** free or fixed aspect ratios, straighten, rotate 90°, flip, and **perspective**
+  (Vertical / Horizontal) to stand converging building lines up straight.
+- **Air:** haze that builds with distance (from the depth map: near things stay clear) and the sky's
+  brightness, color and warmth; presets Morning mist, Far hills, Bluer sky, Warm sky.
+- **Frame:** film gates with perforations — Super 16, 35mm, Super 8 — plus VHS and Instant print, with a
+  glowing **date stamp** (the photo's own date from its EXIF). Works on video too.
+- **AI denoise / upscale (Detail):** Real-ESRGAN on the phone (5 MB, ships with the app): AI denoise keeps the
+  size, Upscale 2× / 4× up to 36 MP; **Original pixels** goes back; the edit carries over.
+- **LUTs:** import `.cube` files in Looks (**LUT**): they become looks with a strength; hold one to delete it.
 - Undo/redo with a history list (tap any step to jump there), histogram, copy/paste edits, **full-resolution export** (JPEG/PNG, tiled rendering
   plus a streaming JPEG encoder, so even 40+ MP files export on a phone), saves straight to the phone on Android (Downloads), Share sheet on iPhone.
 - Works offline once loaded (the whole app, video editor included, is saved ahead; the big decoders

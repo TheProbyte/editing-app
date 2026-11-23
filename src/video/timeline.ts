@@ -33,6 +33,8 @@ export interface TimelineHost {
   peaks(src: string): Float32Array | null;
   /** a voiceover being recorded: from where, to where it's got */
   recording(): { t0: number; t1: number } | null;
+  /** the music's beats on the timeline (times, and strengths 0…1), once they're found */
+  beats(): { t: number[]; s: number[] } | null;
 }
 
 const PEAK_RATE = 100;
@@ -112,6 +114,9 @@ export class Timeline {
     });
     for (const t of p.texts) if (t.id !== skipText) pts.push(t.t0, t.t1);
     for (const v of p.voice ?? []) if (v.id !== skipText) pts.push(v.t0, v.t0 + voiceLen(v));
+    // the music's beats
+    const bt = this.h.beats();
+    if (bt) for (const t of bt.t) if (Math.abs(t - T) < SNAP_PX / this.pps) pts.push(t);
     if (!playhead) pts.push(this.h.time());
     const reach = SNAP_PX / this.pps;
     let best: number | null = null;
@@ -270,6 +275,21 @@ export class Timeline {
       ctx.clip();
       ctx.fillText('♪ ' + p.music.name.toUpperCase(), Math.max(x0, 0) + 4, MUSIC_Y + 2);
       ctx.restore();
+      // the beats: ticks rising from the bottom of the lane (the strong ones taller); zoomed far
+      // out, only the strong ones
+      const bt = this.h.beats();
+      if (bt?.t.length) {
+        const gap = bt.t.length > 1 ? ((bt.t[bt.t.length - 1] - bt.t[0]) / (bt.t.length - 1)) * this.pps : 99;
+        const minS = gap < 4 ? 0.75 : gap < 7 ? 0.45 : 0;
+        ctx.fillStyle = on ? 'rgba(20,20,20,0.85)' : 'rgba(242,239,232,0.8)';
+        for (let k = 0; k < bt.t.length; k++) {
+          if (bt.s[k] < minS) continue;
+          const x = Math.round(this.x(bt.t[k]));
+          if (x < 0 || x > W) continue;
+          const hh = 4 + Math.round(bt.s[k] * 6);
+          ctx.fillRect(x - 1, MUSIC_Y + LANE_H - hh, 2, hh);
+        }
+      }
     }
     // voiceover lane
     const rec = this.h.recording();

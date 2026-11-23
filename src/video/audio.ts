@@ -26,6 +26,16 @@ interface Piece {
   len: number;
   buf: AudioBuffer;
 }
+/** A piece of the sound given for captions: at `at` seconds in it, `len` seconds of file `id` from file time `src`, of a clip or a voiceover clip. */
+export interface SpeechSeg {
+  at: number;
+  id: string;
+  src: number;
+  len: number;
+  clip?: string;
+  voice?: string;
+}
+
 /** A piece (being) decoded for file times lo…hi. */
 interface Part {
   lo: number;
@@ -163,6 +173,69 @@ export class AudioEngine {
   /** The mix if it's ready for this exact project, else null. */
   ready(p: VideoProject) {
     return this.key(p) === this.mixKey ? this.mixBuf : null;
+  }
+
+  /**
+   * What's said, for captions: the sound of each clip (that isn't muted or reversed) and each
+   * voiceover clip, as recorded (at its own speed: speech sped up or slowed down is much harder
+   * to make out), one after another with a short pause between, mono at 16 kHz. `segs` says
+   * where each piece is in it and which part of which file it is, so the captions' times can be
+   * put back on the timeline (see VideoMode.makeCaptions).
+   */
+  async speech(p: VideoProject): Promise<{ pcm: Float32Array; segs: SpeechSeg[] } | null> {
+    const GAP = 0.6, RATE = 16000;
+    const want: Omit<SpeechSeg, 'at'>[] = [];
+    for (const c of p.clips) if (c.vol > 0 && !c.reversed && this.lib.get(c.src)?.audio) want.push({ id: c.src, src: c.in, len: c.out - c.in, clip: c.id });
+    for (const v of p.voice ?? []) if (v.vol > 0 && voiceLen(v) > 0 && this.lib.get(v.src)?.audio) want.push({ id: v.src, src: v.in, len: voiceLen(v), voice: v.id });
+    if (!want.length) return null;
+    const use = new Map<string, Part[]>();
+    const parts = want.map((w) => this.part(this.lib.get(w.id)!, Math.max(0, w.src - PAD), w.src + w.len + PAD, use));
+    // (kept alongside what the mix keeps)
+    for (const [id, list] of use) this.parts.set(id, [...new Set([...(this.parts.get(id) ?? []), ...list])]);
+    const total = want.reduce((t, w) => t + w.len + GAP, 0);
+    const ctx = new OfflineAudioContext(1, Math.max(1, Math.ceil(total * RATE)), RATE);
+    const segs: SpeechSeg[] = [];
+    let at = 0;
+    for (let k = 0; k < want.length; k++) {
+      const w = want[k], pc = await parts[k].p;
+      if (pc) {
+        const s = ctx.createBufferSource();
+        s.buffer = pc.buf;
+        s.connect(ctx.destination);
+        s.start(at, Math.max(0, w.src - pc.at), Math.max(0, Math.min(w.len, pc.at + pc.len - w.src)));
+        segs.push({ ...w, at });
+      }
+      at += w.len + GAP;
+    }
+    const out = await ctx.startRendering();
+    return { pcm: out.getChannelData(0).slice(), segs };
+  }
+
+  /**
+   * A file's sound as one channel (for finding beats: a quarter of the memory of a 48 kHz stereo
+   * decode), from lo to hi seconds of the file. Rates above 48 kHz are halved (the beat finder
+   * works in blocks of samples, so a lower rate would make its beats coarser).
+   */
+  async monoRange(m: Media, lo: number, hi: number): Promise<{ x: Float32Array; sr: number } | null> {
+    let x = new Float32Array(0), k = 1, sr = 0, from = 0;
+    const end = await walk(m, lo, hi, (rate, _ch, a, b) => {
+      k = Math.max(1, Math.floor(rate / 48000));
+      sr = rate / k;
+      from = a;
+      x = new Float32Array(Math.ceil((b - a) / k));
+    }, (b, skip, at, n) => {
+      const C = b.numberOfChannels;
+      const ch = Array.from({ length: C }, (_, c) => b.getChannelData(c));
+      for (let i = 0; i < n; i++) {
+        const o = Math.floor((at - from + i) / k);
+        if (o >= x.length) break;
+        let v = 0;
+        for (let c = 0; c < C; c++) v += ch[c][skip + i];
+        x[o] += v / (C * k);
+      }
+    });
+    if (!sr || end <= from) return null;
+    return { x: x.subarray(0, Math.ceil((end - from) / k)), sr };
   }
 
   private async render(p: VideoProject): Promise<AudioBuffer | null> {

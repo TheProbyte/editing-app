@@ -881,6 +881,24 @@ const A = {
     ###......#./
     .##.....#../
     ...#####...`,
+  captions: `
+    ############/
+    #..........#/
+    #.###..###.#/
+    #.#....#...#/
+    #.#....#...#/
+    #.###..###.#/
+    #..........#/
+    ############`,
+  beat: `
+    #...#...#.../
+    #...#...#.../
+    #...#...#..#/
+    #.#.#.#.#..#/
+    #.#.#.#.#.##/
+    ###.###.####/
+    ###.###.####/
+    ############`,
   transition: `
     #........#/
     ##......##/
@@ -1025,6 +1043,8 @@ export const ICONS = {
   fade: pix(A.fade),
   key: pix(A.key),
   kenburns: pix(A.kenburns),
+  captions: pix(A.captions),
+  beat: pix(A.beat),
   transition: pix(A.transition),
   mic: pix(A.mic),
   record: pix(A.record),

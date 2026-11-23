@@ -13,7 +13,7 @@ import {
 } from 'mediabunny';
 import type { Media, MediaLib } from './media';
 import { MIX_RATE, type AudioEngine } from './audio';
-import { cutTime, layout, mixAt, srcAt, voiceLen, type VClip, type VideoProject } from './project';
+import { cutTime, heldLocal, layout, mixAt, srcAt, voiceLen, type VClip, type VideoProject } from './project';
 
 export interface VideoExportOptions {
   lib: MediaLib;
@@ -26,6 +26,8 @@ export interface VideoExportOptions {
   quality: 'high' | 'max';
   /** extra bitrate for pictures that are hard to compress (moving film grain), 1 = none */
   boost?: number;
+  /** the cine frame rate a clip's picture is held to (0: none; see heldLocal) */
+  cine?: (clip: VClip) => number;
   /** before a clip's frames are drawn (e.g. to read a still at full size) */
   prepare?: (clip: VClip, media: Media) => Promise<void>;
   /** draw the finished frame for timeline time T onto the canvas (w×h); inside a transition, with the other clip's frame */
@@ -166,7 +168,7 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
         if (!mj) return null;
         let fd = feeds.get(j);
         if (!fd) feeds.set(j, (fd = new OtherFeed(c, mj, o.lib)));
-        fd.times.push(Math.min(c.out - 1e-4, Math.max(c.in, srcAt(c, T - starts[j]))));
+        fd.times.push(Math.min(c.out - 1e-4, Math.max(c.in, srcAt(c, heldLocal(T - starts[j], o.cine?.(c) ?? 0)))));
         return fd;
       });
       const otherAt = (j: number) => others[j]?.next();
@@ -183,7 +185,9 @@ export async function exportVideo(o: VideoExportOptions): Promise<Blob> {
           continue;
         }
         const sink = o.lib.videoSink(m)!;
-        const srcTimes = times.map((T) => Math.min(clip.out - 1e-4, Math.max(clip.in, srcAt(clip, T - start))));
+        // (held to a cine rate: the same frame for several output frames)
+        const fps = o.cine?.(clip) ?? 0;
+        const srcTimes = times.map((T) => Math.min(clip.out - 1e-4, Math.max(clip.in, srcAt(clip, heldLocal(T - start, fps)))));
         let j = 0;
         let last: VideoSample | null = null;
         try {

@@ -18,18 +18,19 @@ import { Player, type Frame } from './player';
 import { Compositor, type FrameSource, type GpuFrame, type Overlay, type Placement } from './compose';
 import { Timeline, timelineHeight, type Sel } from './timeline';
 import { exportVideo, type OtherFrame } from './exporter';
-import { AudioEngine } from './audio';
+import { AudioEngine, type SpeechSeg } from './audio';
 import {
   IMAGE_SECONDS, MIN_CLIP, clipAt, clipLen, fmtTime, frameAspect, frameSize, layout, localAt, newProject, speedAt, srcAt, subRamp, uid,
   framingAt, GRADIENTS, BG_COLORS, NO_FRAMING, RAMPS, RAMP_CUSTOM, anchorAt, followAnchors, flipClip, type Framing,
   type VAspect, type VClip, type VText, type VideoProject,
-  TRANSITIONS, TRANS_LEN, FADE_MAX, cleanTransitions, cutTime, fadeAt, mixAt, transInto, type TransKind, type VVoice,
+  TRANSITIONS, TRANS_LEN, FADE_MAX, cleanTransitions, cineFps, heldLocal, cutTime, fadeAt, mixAt, transInto, type TransKind, type VVoice,
 } from './project';
 import type { VideoSample } from 'mediabunny';
 import { RampEditor } from './rampEditor';
 import { REVERSE_MAX } from './reverse';
 import { effectiveLook, lookKeyAt, lookValues, newLook, sameValues, unscopeState, upsertKey } from './looks';
 import { VoiceRecorder, assemble, speechSpan, wavFile } from './voice';
+import { Captioner, CAPTIONS_MB, splitCaptions, type Caption } from '../ai/captions';
 
 export interface VideoHost {
   g: GL;
@@ -58,6 +59,12 @@ export interface VideoHost {
   /** the picture is changing every frame (playing, exporting): the bars over it drop their blur */
   setLive(on: boolean): void;
   save(blob: Blob, name: string): Promise<void>;
+  /** ask before going ahead (the confirm sheet) */
+  confirm(title: string, text: string, yes: () => void, o?: { yes?: string; no?: string; onNo?: () => void }): void;
+  /** a job the busy screen's Cancel (or Back) stops: call done() when it ends */
+  cancellable(): { signal: AbortSignal; done(): void };
+  /** speech to text, for auto captions */
+  captions: Captioner;
 }
 
 const PREVIEW_LONG = 1280;
@@ -142,6 +149,7 @@ export class VideoMode {
     // playback copies each decoded frame to the GPU the moment it arrives
     this.player.upload = (vf, ring) => this.comp.uploadRing(vf, vf.displayWidth, vf.displayHeight, ring);
     this.player.stillMoves = () => this.stillMoves();
+    this.player.cine = (c) => this.cineOf(c);
     this.player.onFrame = (f) => this.showFrame(f);
     this.player.onTime = () => this.onTime();
     this.rampEd = new RampEditor($('curveWrap').parentElement!, () => this.rampView(), (pts, commit) => {
@@ -179,6 +187,7 @@ export class VideoMode {
       select: (s) => this.select(s),
       selection: () => this.sel,
       recording: () => (this.rec?.phase === 'rec' ? { t0: this.rec.startT, t1: Math.max(this.rec.startT, this.player.time) } : null),
+      beats: () => this.timelineBeats(),
     }, this.lib);
     this.syncTrackHeight();
     this.lib.onThumbs = () => this.timeline.thumbsChanged();
@@ -478,6 +487,26 @@ export class VideoMode {
   }
 
   /** Source time of `clip` at timeline time T. */
+  /** The cine frame rate clip's picture is held to (its look's, or the whole video's), 0: none. */
+  private cineOf(clip: VClip) {
+    const st = this.h.state();
+    const v = (st.v.cineRate ?? 0) === 0 && !clip.look && !st.video?.scope ? st.v : effectiveLook(st, clip, clip.in, false).v;
+    return cineFps(v.cineRate);
+  }
+
+  /** Source time of the picture of `clip` at timeline time T (held to its cine rate). */
+  private picTime(clip: VClip, T: number) {
+    return Math.min(clip.out, Math.max(clip.in, srcAt(clip, heldLocal(T - this.startOf(clip), this.cineOf(clip)))));
+  }
+
+  /** The cine rate changed: the frame showing (and a playback under way) follow it. */
+  cineChanged() {
+    if (this.player.playing) {
+      this.player.pause();
+      void this.playNow();
+    } else this.player.seek(this.player.time);
+  }
+
   private srcTime(clip: VClip, T: number) {
     return Math.min(clip.out, Math.max(clip.in, srcAt(clip, T - this.startOf(clip))));
   }
@@ -548,12 +577,12 @@ export class VideoMode {
     // frame that follows has it)
     const quality = !this.player.playing && !f.fast;
     const src = this.srcFor(f.media, f.sample, this.previewLong(), quality, f.bitmap, f.pre, f.upright);
-    const s = f.sample?.timestamp ?? f.ts ?? (f.t !== undefined ? this.srcTime(f.clip, f.t) : f.clip.in);
+    const s = f.sample?.timestamp ?? f.ts ?? (f.t !== undefined ? this.picTime(f.clip, f.t) : f.clip.in);
     f.sample?.close();
     this.last = { src, media: f.media.id, clip: f.clip.id, s, T: f.t, solo: f.solo };
     const o = f.other;
     if (o) {
-      const so = o.sample?.timestamp ?? o.ts ?? (f.t !== undefined ? this.srcTime(o.clip, f.t) : o.clip.in);
+      const so = o.sample?.timestamp ?? o.ts ?? (f.t !== undefined ? this.picTime(o.clip, f.t) : o.clip.in);
       this.last.other = { src: this.srcFor(o.media, o.sample, this.previewLong(), quality, o.bitmap, o.pre, o.upright, 1), clip: o.clip.id, s: so };
       o.sample?.close();
     }
@@ -788,7 +817,9 @@ export class VideoMode {
     const m = c && this.lib.get(c.src);
     const fps = m?.kind === 'video' ? m.fps || 30 : this.ex.fps || 30;
     // one source frame, as long as it lasts on the timeline at the speed there
-    const dt = c && m?.kind === 'video' ? 1 / fps / Math.max(0.05, speedAt(c, this.sNow(c))) : 1 / fps;
+    // (held to a cine rate: one held picture)
+    const cf = c ? this.cineOf(c) : 0;
+    const dt = cf ? 1 / cf : c && m?.kind === 'video' ? 1 / fps / Math.max(0.05, speedAt(c, this.sNow(c))) : 1 / fps;
     const to = Math.max(0, Math.min(total - 1e-3, T + dir * dt));
     if (to === T) return;
     tick();
@@ -929,6 +960,8 @@ export class VideoMode {
       const p = this.project;
       this.audio.keepOnly(new Set([...p.clips.map((c) => c.src), ...(p.music ? [p.music.src] : []), ...(p.voice ?? []).map((v) => v.src)]));
       void this.audio.mix(p);
+      // (the music's beats, if the song or the part of it used changed)
+      this.songBeats();
     }, 250);
   }
 
@@ -1594,6 +1627,7 @@ export class VideoMode {
   /** The app's open section changed (null: none). */
   toolShown(id: string | null) {
     if (id !== 'vclip') this.rampOpen = this.fadeOpen = false;
+    if (id !== 'vmusic') this.beatOpen = false;
     this.toolId = id;
     this.syncRampEd();
   }
@@ -1874,6 +1908,7 @@ export class VideoMode {
     } else if (t.id === 'vtext') {
       const tx = this.selText();
       this.h.tile(row, ICONS.plus, 'Add', tx ? '' : 'hot', () => this.editText(null));
+      this.h.tile(row, ICONS.captions, 'Captions', p.texts.some((x) => x.auto) ? 'hot' : '', () => void this.autoCaptions());
       if (!tx) return;
       sep();
       this.h.tile(row, ICONS.text, 'Edit', '', () => this.editText(tx));
@@ -1887,6 +1922,16 @@ export class VideoMode {
         tick(true);
         this.changed(true);
       });
+    } else if (t.id === 'vmusic' && this.beatOpen && p.music) {
+      // cut to the beat: every 1, 2 or 4 beats
+      this.h.tile(row, ICONS.check, 'Done', '', () => {
+        this.beatOpen = false;
+        this.h.refreshSection();
+      });
+      sep();
+      for (const n of [1, 2, 4] as const) {
+        this.h.chip(row, { id: 'b' + n, label: n === 1 ? 'Every beat' : `Every ${n}` }, this.beatEvery === n, () => void this.cutToBeat(n));
+      }
     } else if (t.id === 'vmusic') {
       this.h.tile(row, ICONS.music, p.music ? 'Replace' : 'Choose', p.music ? '' : 'hot', () => {
         const i = $<HTMLInputElement>('fileAudio');
@@ -1900,6 +1945,13 @@ export class VideoMode {
         mu.fade = !mu.fade;
         this.changed(true);
       });
+      if (p.clips.length > 1) this.h.tile(row, ICONS.beat, 'Cut to beat', '', () => {
+        this.beatOpen = true;
+        this.beatEvery = 0;
+        this.beatBase = null;
+        this.songBeats();
+        this.h.refreshSection();
+      });
       this.h.tile(row, ICONS.trash, 'Remove', 'danger', () => {
         p.music = null;
         this.sel = null;
@@ -1907,6 +1959,247 @@ export class VideoMode {
         this.changed(true);
       });
     }
+  }
+
+  // ---- the music's beats (see beats.ts): found for the part of the song the video uses (and a
+  // good margin either side, so moving its start a little doesn't mean finding them again), off
+  // the main thread, and kept per song
+
+  private beatCache = new Map<string, { lo: number; hi: number; t: number[]; s: number[]; bpm: number }>();
+  private beatJob: { id: string; lo: number; hi: number; p: Promise<void> } | null = null;
+  /** Cut to beat's choices are showing (Music), the one picked, and the clips before it was first picked */
+  private beatOpen = false;
+  private beatEvery: 0 | 1 | 2 | 4 = 0;
+  private beatBase: { clips: string; after: string } | null = null;
+
+  /** The song's beats (song times) for the music as placed now; starts finding them when they're not known yet. */
+  private songBeats() {
+    const p = this.project, mu = p.music, m = mu && this.lib.get(mu.src);
+    if (!mu || !m?.audio) return null;
+    const total = layout(p).total;
+    const a = Math.max(0, mu.in - 0.5), b = Math.min(m.duration, mu.in + total + 0.5);
+    const c = this.beatCache.get(m.id);
+    if (c && c.lo <= a + 1e-3 && c.hi >= b - 1e-3) return c;
+    if (!this.beatJob || this.beatJob.id !== m.id || this.beatJob.lo > a || this.beatJob.hi < b) {
+      const lo = Math.max(0, a - 20), hi = Math.min(m.duration, b + 60, lo + 15 * 60);
+      const job = { id: m.id, lo, hi, p: this.findBeats(m, lo, hi) };
+      this.beatJob = job;
+      void job.p.finally(() => {
+        if (this.beatJob === job) this.beatJob = null;
+      });
+    }
+    // (meanwhile the song's beats found earlier, for another part of it, are still its beats)
+    return c ?? null;
+  }
+
+  private async findBeats(m: Media, lo: number, hi: number) {
+    try {
+      const snd = await this.audio.monoRange(m, lo, hi);
+      if (!snd || this.dead) return;
+      const wk = new Worker(new URL('./beatsWorker.ts', import.meta.url), { type: 'module' });
+      const r = await new Promise<{ bpm: number; times: number[]; strength: number[] }>((res, rej) => {
+        wk.onmessage = (e) => (e.data.error ? rej(new Error(e.data.error)) : res(e.data.beats));
+        wk.onerror = (e) => rej(new Error(e.message || 'beat finder failed'));
+        wk.postMessage({ x: snd.x, sr: snd.sr }, [snd.x.buffer]);
+      }).finally(() => wk.terminate());
+      if (this.dead) return;
+      this.beatCache.set(m.id, { lo, hi, t: r.times.map((t) => lo + t), s: r.strength, bpm: r.bpm });
+      this.tlBeats = null;
+      this.timeline.draw();
+    } catch (e) {
+      console.warn('beats', e);
+    }
+  }
+
+  /** The beats on the timeline (where the music plays), worked out once per change. */
+  private tlBeats: { key: string; v: { t: number[]; s: number[] } } | null = null;
+  private timelineBeats() {
+    const p = this.project, mu = p.music;
+    const c = mu && this.beatCache.get(mu.src);
+    if (!mu || !c) return null;
+    const total = layout(p).total;
+    const key = `${mu.src}:${mu.in}:${total}:${c.t.length}:${c.lo}`;
+    if (this.tlBeats?.key !== key) {
+      const t: number[] = [], st: number[] = [];
+      c.t.forEach((x, k) => {
+        const T = x - mu.in;
+        if (T >= -1e-6 && T <= total + 1e-6) {
+          t.push(T);
+          st.push(c.s[k]);
+        }
+      });
+      this.tlBeats = { key, v: { t, s: st } };
+    }
+    return this.tlBeats.v;
+  }
+
+  /**
+   * Cut to the beat: each cut in turn (from the first) moves to the nearest chosen beat after the
+   * one before, by trimming the end of the clip before it (or letting more of it play, never
+   * past the end of its footage). Every n-th beat, counted from whichever beat of the bar is the
+   * strongest. Picking again starts from the clips as they were before the first pick.
+   */
+  private async cutToBeat(n: 1 | 2 | 4) {
+    const p = this.project;
+    if (!p.music || p.clips.length < 2) return;
+    if (!this.songBeats()) {
+      this.h.busy('Finding the beats');
+      try {
+        while (this.beatJob && !this.dead) await this.beatJob.p;
+      } finally {
+        this.h.busy(null);
+      }
+    }
+    const all = this.timelineBeats();
+    if (this.dead) return;
+    if (!all || all.t.length < 2) return this.h.toast('No beat found in this song', 2400);
+    this.unscope();
+    // picked again (nothing else done since): from the clips as they were
+    const now = JSON.stringify(p.clips);
+    if (this.beatBase && this.beatBase.after === now) p.clips = JSON.parse(this.beatBase.clips);
+    else this.beatBase = { clips: now, after: '' };
+    let phase = 0, best = -1;
+    for (let k = 0; k < n; k++) {
+      let sum = 0;
+      for (let i = k; i < all.s.length; i += n) sum += all.s[i];
+      if (sum > best) [best, phase] = [sum, k];
+    }
+    const grid = all.t.filter((_, i) => i % n === phase);
+    let prev = 0, moved = 0;
+    for (let i = 1; i < p.clips.length; i++) {
+      const c = cutTime(layout(p), i);
+      const cands = grid.filter((b) => b > prev + MIN_CLIP).sort((x, y) => Math.abs(x - c) - Math.abs(y - c)).slice(0, 6);
+      let done = false;
+      for (const b of cands) {
+        if (this.fitCut(i, b)) {
+          done = true;
+          break;
+        }
+      }
+      prev = cutTime(layout(p), i);
+      if (done) moved++;
+    }
+    this.beatEvery = n;
+    tick(true);
+    this.changed(true);
+    this.beatBase.after = JSON.stringify(p.clips);
+    const bpm = this.beatCache.get(p.music.src)?.bpm;
+    this.h.toast(`${moved} of ${p.clips.length - 1} cuts on the beat${bpm ? ` · ${Math.round(bpm)} BPM` : ''}`, 2200);
+  }
+
+  /** Make cut i land on timeline time b by changing where the clip before it ends (false: it can't). */
+  private fitCut(i: number, b: number) {
+    const p = this.project, a = p.clips[i - 1], m = this.lib.get(a.src);
+    if (!m) return false;
+    const out0 = a.out;
+    const lo = a.in + MIN_CLIP * a.speed, hi = m.kind === 'image' ? 600 : m.duration;
+    // (a transition's overlap and a ramp make the cut move a little less, or more, than the
+    // clip's end: a few steps settle it)
+    for (let k = 0; k < 8; k++) {
+      const err = b - cutTime(layout(p), i);
+      if (Math.abs(err) < 1e-3) return true;
+      a.out = Math.max(lo, Math.min(hi, a.out + err * speedAt(a, a.out)));
+    }
+    if (Math.abs(b - cutTime(layout(p), i)) < 1 / 120) return true;
+    a.out = out0;
+    return false;
+  }
+
+  // ---- auto captions
+
+  /** Captions from what's said in the clips (and the voiceover), as titles; asks before the model's one-time download. */
+  private async autoCaptions() {
+    const p = this.project;
+    const speech = p.clips.some((c) => c.vol > 0 && this.lib.get(c.src)?.audio) || !!p.voice?.some((v) => v.vol > 0);
+    if (!speech) return this.h.toast('No sound in the clips to make captions from', 2600);
+    if (this.player.playing) this.togglePlay();
+    if (await Captioner.ready()) return void this.makeCaptions();
+    this.h.confirm('Auto captions', `Captions need a one-time ${CAPTIONS_MB} MB download. It stays on this phone for next time.`, () => void this.makeCaptions(), { yes: 'Download' });
+  }
+
+  private async makeCaptions() {
+    const job = this.h.cancellable();
+    this.h.busy('Getting the sound ready');
+    try {
+      const sp = await this.audio.speech(this.project);
+      if (!sp || this.dead) return;
+      if (job.signal.aborted) throw new DOMException('cancelled', 'AbortError');
+      const list = await this.h.captions.transcribe(sp.pcm, (s) => this.h.busy(s), job.signal);
+      if (this.dead) return;
+      // each caption back from the sound given to its moment on the timeline (through its
+      // clip's speed and place, or its voiceover clip's)
+      const p = this.project, L = layout(p);
+      const at = (x: number, seg: SpeechSeg) => {
+        const f = seg.src + Math.min(seg.len, Math.max(0, x - seg.at));
+        if (seg.voice) {
+          const v = p.voice?.find((y) => y.id === seg.voice);
+          return v ? v.t0 + (f - v.in) : null;
+        }
+        const i = p.clips.findIndex((c) => c.id === seg.clip);
+        return i < 0 ? null : L.starts[i] + localAt(p.clips[i], Math.min(p.clips[i].out, Math.max(p.clips[i].in, f)));
+      };
+      const placed: Caption[] = [];
+      for (const c of splitCaptions(list, 40)) {
+        // (the piece the caption starts in; one running on past its end stops there)
+        const seg = sp.segs.filter((g) => g.at <= c.start + 0.25).pop();
+        if (!seg) continue;
+        const a = at(c.start, seg), b = at(Math.min(c.end, seg.at + seg.len), seg);
+        if (a !== null && b !== null && b > a) placed.push({ start: a, end: b, text: c.text });
+      }
+      placed.sort((x, y) => x.start - y.start);
+      const n = this.placeCaptions(placed);
+      this.h.toast(n ? `${n} captions · tap one to change it` : 'No speech found', 2600);
+    } catch (e) {
+      if ((e as Error).name === 'AbortError') this.h.toast('Captions cancelled');
+      else {
+        console.error(e);
+        this.h.toast('Couldn’t make captions: ' + ((e as Error).message || e), 4500);
+      }
+    } finally {
+      job.done();
+      this.h.busy(null);
+    }
+  }
+
+  /**
+   * Captions (timeline times, in order, split to a readable length) as titles in a caption style, each anchored to its shot like any
+   * title; earlier auto captions are replaced, typed titles kept. Each starts no earlier than the
+   * one before ends (phrases can overlap a little) and stays up at least 0.7 s.
+   */
+  placeCaptions(list: Caption[]) {
+    this.unscope();
+    const p = this.project;
+    const total = layout(p).total;
+    p.texts = p.texts.filter((t) => !t.auto);
+    // sized for a phone: a little smaller on tall frames, where the height is greater
+    const { w, h } = this.dims(1000);
+    const size = h > w * 1.2 ? 3.6 : h > w * 0.9 ? 4.6 : 6;
+    // two short lines rather than one long one
+    const wrap = (s: string) => {
+      if (s.length <= 24) return s;
+      const mid = s.length / 2;
+      let at = -1;
+      for (let i = 0; i < s.length; i++) if (s[i] === ' ' && (at < 0 || Math.abs(i - mid) < Math.abs(at - mid))) at = i;
+      return at > 0 ? s.slice(0, at) + '\n' + s.slice(at + 1) : s;
+    };
+    let prevEnd = 0, n = 0;
+    for (const c of list) {
+      const text = c.text.trim();
+      if (!text) continue;
+      const t0 = Math.max(c.start, prevEnd);
+      const t1 = Math.min(total, Math.max(c.end, t0 + 0.7));
+      if (t1 - t0 < 0.3) continue;
+      prevEnd = t1;
+      p.texts.push({
+        id: uid(), text: wrap(text), t0, t1, x: 0.5, y: h > w ? 0.8 : 0.86, size, color: '#ffffff', font: 'sans', box: true,
+        anchor: anchorAt(p, t0), auto: true,
+      });
+      n++;
+    }
+    this.sel = null;
+    tick(true);
+    this.changed(true);
+    return n;
   }
 
   // ---- transitions
@@ -2341,6 +2634,7 @@ export class VideoMode {
       const out = this.exportT;
       const blob = await exportVideo({
         lib: this.lib, audio: this.audio, project: st.video!, canvas, w, h, fps: this.ex.fps, quality: this.ex.q, boost: this.grainBoost(),
+        cine: (c) => this.cineOf(c),
         prepare: async (_clip, m) => {
           // a still bigger than the one kept for the preview: read it at the export's size
           this.dropExportStill();
@@ -2354,7 +2648,7 @@ export class VideoMode {
         drawFrame: (clip, m, sample, T, other?: OtherFrame) => {
           // (looks and framing follow the output frame's own moment, not the source frame's:
           // in slow motion one source frame covers several output frames)
-          const s = this.srcTime(clip, T);
+          const s = this.picTime(clip, T);
           const long = Math.max(w, h);
           const src = this.srcFor(m, sample, long);
           const P = st.video!;
@@ -2362,7 +2656,7 @@ export class VideoMode {
           let look: EditState;
           if (mix && other) {
             // across a transition: both clips, joined
-            const so = this.srcTime(other.clip, T);
+            const so = this.picTime(other.clip, T);
             const srcO = this.srcFor(other.media, other.sample, long, true, undefined, undefined, false, 1);
             const first = P.clips[mix.a] === clip;
             const [A, sa, fa, B, sb, fb] = first ? [clip, s, src, other.clip, so, srcO] : [other.clip, so, srcO, clip, s, src];
@@ -2372,7 +2666,8 @@ export class VideoMode {
             look = this.lookState(this.h.state(), clip, s, false);
             this.comp.place(src, out, this.placement(clip, s, w, h));
           }
-          this.h.pipe.filmFrame = this.film(T, look.v);
+          // (t: what moves smoothly with the video's time, like a drifting light leak)
+          this.h.pipe.filmFrame = { ...this.film(T, look.v), t: T };
           this.h.renderFull({ tex: out.tex, w, h, linear: false }, w, h, look);
           const ov = this.overlayAt(T);
           if (ov) this.comp.overlay(w, h, ov);

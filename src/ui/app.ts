@@ -582,7 +582,8 @@ export class App {
   private isNeutral(st: EditState) {
     const D = App.DEF_V, v = st.v;
     for (const k in v) {
-      if (v[k] !== D[k] && !/^((dx|lk)(Brush|Hard)|healSize|vigX|vigY|blurX|blurY)$/.test(k)) return false;
+      // (settings that change nothing in the picture by themselves: the cine rate only picks which frames)
+      if (v[k] !== D[k] && !/^((dx|lk)(Brush|Hard)|healSize|vigX|vigY|blurX|blurY|cineRate|lkMotion)$/.test(k)) return false;
     }
     const g = st.geo;
     if (g.quarter || g.flipH || g.flipV || g.crop.w < 0.9999 || g.crop.h < 0.9999) return false;
@@ -1425,6 +1426,8 @@ export class App {
       return;
     }
     if (id === 'filmWeave' && this.video) queueMicrotask(() => this.video?.refreshFrame());
+    // the picture is held to another rate: the frame showing (or the playback) follows
+    if (id === 'cineRate' && this.video && Math.round(v) !== Math.round(this.state.v.cineRate ?? 0)) queueMicrotask(() => this.video?.cineChanged());
     if (id === 'lookAmt') {
       this.look.amt = v;
       if (this.look.base && this.look.idx >= 0) this.applyLookValues();
@@ -1769,6 +1772,9 @@ export class App {
       },
       // the video is playing or exporting (the canvas changes every frame): the glass over it goes plain
       setLive: (on) => this.appEl.classList.toggle('live', on),
+      confirm: (title, text, yes, o) => this.confirm(title, text, yes, o),
+      cancellable: () => this.cancellable(),
+      captions: this.captions,
     };
   }
 
@@ -1786,7 +1792,7 @@ export class App {
 
   private toolList(): ToolDef[] {
     if (!this.video) return TOOLS;
-    return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t.id === 'blur' ? { ...t, subs: t.subs?.filter((x) => x.id !== '3') } : t.id === 'leak' ? { ...t, params: (s: string) => [...t.params(s), 'lkMotion'] } : t))];
+    return [...this.video.tools, ...TOOLS.filter((t) => !VIDEO_HIDDEN.has(t.id)).map((t) => (t.id === 'grain' ? VIDEO_GRAIN(t) : t.id === 'blur' ? { ...t, subs: t.subs?.filter((x) => x.id !== '3') } : t.id === 'leak' ? { ...t, params: (s: string) => [...t.params(s), 'lkMotion'] } : t.id === 'frame' ? { ...t, params: (s: string) => [...t.params(s), 'cineRate'] } : t))];
   }
 
   pickPhoto() {
@@ -5742,6 +5748,8 @@ function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditStat
     return r === 'Split' || r === 'Copy' || r === 'Freeze frame' ? r : 'Clip deleted';
   }
   if (j(a.clips.map((c) => c.id)) !== j(b.clips.map((c) => c.id))) return 'Clips moved';
+  // several clips' ends moved at once: only Cut to beat does that
+  if (b.clips.filter((y, i) => y.out !== a.clips[i].out && y.speed === a.clips[i].speed).length > 1) return 'Cut to beat';
   for (let i = 0; i < b.clips.length; i++) {
     const x = a.clips[i], y = b.clips[i];
     if (!!x.reversed !== !!y.reversed) return y.reversed ? 'Reverse' : 'Forwards again';
@@ -5767,6 +5775,11 @@ function videoChange(a: NonNullable<EditState['video']>, b: NonNullable<EditStat
     if (x.fin !== y.fin || x.fout !== y.fout) return 'Fade';
   }
   if (a.bg !== b.bg || a.bgColor !== b.bgColor || a.bgGrad !== b.bgGrad || a.bgImg !== b.bgImg || a.bgBlur !== b.bgBlur) return 'Background';
+  // auto captions made (or made again): a new set of them, typed titles as they were
+  const autoA = a.texts.filter((t) => t.auto).map((t) => t.id), autoB = b.texts.filter((t) => t.auto).map((t) => t.id);
+  if (j(autoA) !== j(autoB) && !autoB.some((id) => autoA.includes(id)) && j(a.texts.filter((t) => !t.auto)) === j(b.texts.filter((t) => !t.auto))) {
+    return 'Captions';
+  }
   if (j(a.texts) !== j(b.texts)) return b.texts.length > a.texts.length ? 'Text added' : b.texts.length < a.texts.length ? 'Text deleted' : 'Text';
   if (j(a.music) !== j(b.music)) return !a.music ? 'Music added' : !b.music ? 'Music removed' : 'Music';
   if (j(a.voice) !== j(b.voice)) {

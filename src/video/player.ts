@@ -12,7 +12,7 @@ import { CanvasSink, EncodedPacketSink, type VideoSample, type VideoSampleSink }
 import type { Media, MediaLib } from './media';
 import type { AudioEngine } from './audio';
 import type { GpuFrame } from './compose';
-import { clipAt, clipLen, layout, localAt, mixAt, srcAt, type VClip, type VideoProject } from './project';
+import { clipAt, clipLen, heldLocal, layout, localAt, mixAt, srcAt, type VClip, type VideoProject } from './project';
 
 export interface Frame {
   clip: VClip;
@@ -101,6 +101,8 @@ export class Player {
   private lastTime = 0;
   /** true when stills need redrawing while playing (moving grain, flicker…) */
   stillMoves: () => boolean = () => false;
+  /** the cine frame rate a clip's picture is held to (0: its own), see heldLocal */
+  cine: (clip: VClip) => number = () => 0;
   /** copies a decoded frame to the GPU, into a lane's ring (set by the video editor) */
   upload: (vf: VideoFrame, ring: number) => GpuFrame = () => {
     throw new Error('no uploader');
@@ -350,7 +352,7 @@ export class Player {
     if (m.kind === 'image') return { clip, media: m, sample: null, t: T };
     const sink = this.vSink(m);
     if (!sink) return null;
-    const t = Math.min(clip.out - 1e-4, Math.max(clip.in, srcAt(clip, T - start)), m.duration - 1e-3);
+    const t = Math.min(clip.out - 1e-4, Math.max(clip.in, srcAt(clip, heldLocal(T - start, this.cine(clip)))), m.duration - 1e-3);
     if (fast && this.speed > 1.5) {
       // dragging quickly: the nearest cached key frame will do
       let best: { ts: number; bmp: ImageBitmap } | null = null;
@@ -626,6 +628,9 @@ export class Player {
         const clip = p.clips[at.i];
         const m = this.lib.get(clip.src);
         if (!m) continue;
+        // (the picture held to a cine rate: the frame of the moment the hold began)
+        const fps = this.cine(clip);
+        if (fps) at = { ...at, src: Math.min(clip.out - 1e-4, Math.max(clip.in, srcAt(clip, heldLocal(Math.max(0, T - at.start), fps)))) };
         // inside a transition: the other clip's frame goes along with this one's
         const mix = si >= 0 ? null : mixAt(p, T, L);
         const oi = mix ? (mix.a === at.i ? mix.b : mix.a) : -1;
@@ -845,7 +850,7 @@ export class Player {
       const last = runs[runs.length - 1], prev = last?.parts[last.parts.length - 1].clip;
       // clips that carry straight on in the same file (the halves of a split) play as one run,
       // through one decoder: no restart at the cut (unless a transition overlaps them there)
-      if (prev && !L.ov[i] && prev.kind === 'video' && c.kind === 'video' && prev.src === c.src && Math.abs(c.in - prev.out) < 1e-3) {
+      if (prev && !L.ov[i] && prev.kind === 'video' && c.kind === 'video' && prev.src === c.src && Math.abs(c.in - prev.out) < 1e-3 && this.cine(prev) === this.cine(c)) {
         last.parts.push({ clip: c, start });
         last.end = end;
       } else {
@@ -887,6 +892,7 @@ export class Player {
       }
       const sink = this.vSink(m);
       if (!sink) return;
+      if (this.cine(parts[0].clip)) return await this.produceHeld(token, lane, m, sink, room);
       let it = sink.samples(from, parts[parts.length - 1].clip.out);
       let lastTl = -Infinity, pi = 0, first = true;
       try {
@@ -945,6 +951,54 @@ export class Player {
       lane.done = true;
       // the next lane can start now
       this.feed(token);
+    }
+  }
+
+  /**
+   * A run held to a cine rate: only the frames it shows are asked for, one per held moment
+   * (each the frame at that moment exactly, like the export's), shown at the moment.
+   */
+  private async produceHeld(token: number, lane: Lane, m: Media, sink: VideoSampleSink, room: () => Promise<void>) {
+    const { parts, from } = lane.run;
+    const want: { clip: VClip; tl: number; src: number }[] = [];
+    parts.forEach(({ clip, start }, pi) => {
+      const fps = this.cine(clip), len = clipLen(clip);
+      const l0 = pi === 0 && from > clip.in ? localAt(clip, from) : 0;
+      for (let k = Math.floor(l0 * fps + 1e-6); k / fps < len - 1e-6; k++) {
+        want.push({ clip, tl: start + k / fps, src: Math.min(clip.out - 1e-4, srcAt(clip, k / fps)) });
+      }
+    });
+    let held: VideoSample | null = null, first = true, j = 0;
+    try {
+      for await (const s of sink.samplesAtTimestamps(want.map((w) => w.src))) {
+        const w = want[j++];
+        if (!this.alive(token)) {
+          if (s !== held) s?.close();
+          return;
+        }
+        // (the same frame again, for slow motion: the copy kept)
+        if (s && s !== held) {
+          held?.close();
+          held = s;
+        }
+        if (!held) continue;
+        if (!first && this.time - w.tl > 0.08) {
+          this.drops++;
+          continue;
+        }
+        first = false;
+        const vf = held.toVideoFrame();
+        let pre: GpuFrame;
+        try {
+          pre = this.upload(vf, lane.ring);
+        } finally {
+          vf.close();
+        }
+        lane.queue.push({ clip: w.clip, media: m, tl: w.tl, pre });
+        await room();
+      }
+    } finally {
+      held?.close();
     }
   }
 

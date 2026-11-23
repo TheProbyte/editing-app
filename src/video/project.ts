@@ -248,6 +248,17 @@ export const GRADIENTS: [string, string, number][] = [
 ];
 export const BG_COLORS = ['#000000', '#ffffff', '#141414', '#f2efe8', '#ffc83d', '#ff5a4a', '#5aa8ff', '#7fe0a0', '#c38bff', '#ff9ec7'];
 
+/** The cine frame rates (the look's cineRate setting: Normal, 18, 12, 8 fps): 0 = the footage's own. */
+export const CINE_FPS = [0, 18, 12, 8];
+export const cineFps = (v: number | undefined) => CINE_FPS[Math.round(v ?? 0)] ?? 0;
+
+/**
+ * Where in a clip its picture comes from, `local` timeline seconds into it: held to the cine
+ * rate, counted from the clip's own start (so every cut stays where it is and is sharp). The
+ * sound isn't held, and an export's frame rate stays its own (it repeats frames).
+ */
+export const heldLocal = (local: number, fps: number) => (fps > 0 ? Math.floor(local * fps + 1e-6) / fps : local);
+
 export interface VText {
   id: string;
   text: string;
@@ -267,6 +278,8 @@ export interface VText {
    * moving earlier clips, or a speed change, moves the title with its shot.
    */
   anchor?: { clip: string; s: number };
+  /** made by Auto captions (making them again replaces these, not titles typed in) */
+  auto?: boolean;
 }
 
 /** Where a title starting at timeline time t0 is anchored (the clip under it, and its moment). */

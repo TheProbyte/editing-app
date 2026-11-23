@@ -1,7 +1,7 @@
 // Neural object removal in a worker. Two models:
 //  * LaMa — best quality, 208 MB, downloaded once from Hugging Face and kept on the device
 //  * MI-GAN — small (28 MB), ships with the app, used when LaMa isn't downloaded or can't run
-import { fetchModel, isModelCached } from './segment';
+import { abortError, abortable, fetchModel, isAbortError, isModelCached } from './segment';
 
 export type NeuralKind = 'lama' | 'migan';
 
@@ -23,28 +23,33 @@ export class NeuralFill {
   }
 
   /** The model's bytes: downloaded the first time (LaMa), from the device after that. */
-  private async bytes(kind: NeuralKind, stage: (s: string) => void) {
+  private async bytes(kind: NeuralKind, stage: (s: string) => void, signal?: AbortSignal) {
     const name = kind === 'lama' ? 'LaMa' : 'AI model';
     const downloading = !(await NeuralFill.available(kind));
     stage(`${downloading ? 'Downloading' : 'Loading'} ${name}`);
-    return fetchModel(url(kind), (f) => stage(`${downloading ? 'Downloading' : 'Loading'} ${name} ${Math.round(f * 100)}%`));
+    return fetchModel(url(kind), (f) => stage(`${downloading ? 'Downloading' : 'Loading'} ${name} ${Math.round(f * 100)}%`), signal);
   }
 
-  private async start(kind: NeuralKind, bytes: Uint8Array, stage: (s: string) => void, threads: number) {
+  private async start(kind: NeuralKind, bytes: Uint8Array, stage: (s: string) => void, threads: number, signal?: AbortSignal) {
+    if (signal?.aborted) throw abortError();
     stage(`Starting ${kind === 'lama' ? 'LaMa' : 'AI model'}`);
     const wk = new Worker(new URL('./neuralWorker.ts', import.meta.url), { type: 'module' });
     await new Promise<void>((res, rej) => {
       // a worker that didn't start is no use to anyone: don't leave it (and the model in it) behind
       const fail = (e: Error) => {
         clearTimeout(t);
+        signal?.removeEventListener('abort', cancel);
         wk.terminate();
         rej(e);
       };
+      const cancel = () => fail(abortError());
+      signal?.addEventListener('abort', cancel, { once: true });
       const t = setTimeout(() => fail(new Error('The AI model took too long to start')), 120_000);
       wk.onmessage = (e) => {
         if (e.data.log) console.info('[lumen]', e.data.log);
         else if (e.data.ready) {
           clearTimeout(t);
+          signal?.removeEventListener('abort', cancel);
           // (from here on each run sets its own handlers)
           wk.onmessage = wk.onerror = null;
           res();
@@ -64,22 +69,22 @@ export class NeuralFill {
     this.loaded = kind;
   }
 
-  private async load(kind: NeuralKind, stage: (s: string) => void, threads: number) {
+  private async load(kind: NeuralKind, stage: (s: string) => void, threads: number, signal?: AbortSignal) {
     if (this.loaded === kind && this.worker) return;
     this.worker?.terminate();
     this.worker = null;
     this.loaded = null;
     // a download that fails is reported as it is; only a model that's here but won't start gets
     // a second try
-    const bytes = await this.bytes(kind, stage);
+    const bytes = await this.bytes(kind, stage, signal);
     try {
-      await this.start(kind, bytes, stage, threads);
+      await this.start(kind, bytes, stage, threads, signal);
     } catch (e) {
-      if (threads <= 1 || /took too long/i.test(String((e as Error).message))) throw e;
+      if (threads <= 1 || isAbortError(e) || /took too long/i.test(String((e as Error).message))) throw e;
       // threads can fail to start in some WebViews: try once more on a single thread (the bytes
       // went to the first worker, so they're read again: from the device now, not the network)
       console.warn('Threaded start failed, retrying on one thread', e);
-      await this.start(kind, await this.bytes(kind, stage), stage, 1);
+      await this.start(kind, await this.bytes(kind, stage, signal), stage, 1, signal);
     }
   }
 
@@ -93,8 +98,14 @@ export class NeuralFill {
     this.loadingKind = null;
   }
 
-  /** Fill the masked pixels (mask 1 = remove). Returns RGBA with a soft alpha around the fill. */
-  async fill(kind: NeuralKind, rgba: Uint8ClampedArray, w: number, h: number, mask: Uint8Array, stage: (s: string) => void): Promise<Uint8ClampedArray> {
+  /**
+   * Fill the masked pixels (mask 1 = remove). Returns RGBA with a soft alpha around the fill.
+   * `signal` cancels it (rejects with an AbortError): a download stops, and a model starting or
+   * running is stopped too, so the next fill starts clean.
+   */
+  async fill(kind: NeuralKind, rgba: Uint8ClampedArray, w: number, h: number, mask: Uint8Array, stage: (s: string) => void, signal?: AbortSignal): Promise<Uint8ClampedArray> {
+    // (before anything else: a fill cancelled before it began shouldn't stop a model that's ready)
+    if (signal?.aborted) throw abortError();
     const cores = navigator.hardwareConcurrency || 2;
     const want = new URLSearchParams(location.search).get('ortThreads');
     const threads = want ? Number(want) : self.crossOriginIsolated ? Math.max(1, Math.min(4, cores - 1)) : 1;
@@ -104,14 +115,15 @@ export class NeuralFill {
       if (this.loaded !== kind || !this.worker) {
         if (!this.loading || this.loadingKind !== kind) {
           this.loadingKind = kind;
-          this.loading = this.load(kind, stage, threads);
+          this.loading = this.load(kind, stage, threads, signal);
         }
-        await this.loading;
+        await abortable(this.loading, signal);
       }
       stage(kind === 'lama' ? 'Removing · LaMa is thorough, this takes a moment' : 'Removing');
       const wk = this.worker;
       if (!wk) throw new Error('The AI model stopped');
-      return await new Promise<Uint8ClampedArray>((res, rej) => {
+      // a run can't be stopped part way: a cancel stops waiting, and the worker is let go below
+      return await abortable(new Promise<Uint8ClampedArray>((res, rej) => {
         wk.onmessage = (e) => {
           if (e.data.log) console.info('[lumen]', e.data.log);
           else if (e.data.done) res(e.data.done);
@@ -119,7 +131,7 @@ export class NeuralFill {
         };
         wk.onerror = (e) => rej(new Error(e.message || 'AI fill failed'));
         wk.postMessage({ type: 'run', rgba, w, h, mask }, [rgba.buffer, mask.buffer]);
-      });
+      }), signal);
     } catch (e) {
       // start clean next time: a model that failed to load or mid-run may not run again
       this.dispose();

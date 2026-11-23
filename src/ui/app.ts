@@ -26,7 +26,7 @@ import { drawHistogram } from './histogram';
 import { tick } from './haptics';
 import { Camera } from './camera';
 import { isNative, Native, fileFromPath } from '../native';
-import { Segmenter, PEOPLE_PARTS, refineMask } from '../ai/segment';
+import { Segmenter, PEOPLE_PARTS, refineMask, isAbortError } from '../ai/segment';
 import { NeuralFill, LAMA_MB, type NeuralKind } from '../ai/neural';
 import { DepthEstimator } from '../ai/depth';
 import { PerfReadout } from './perf';
@@ -2886,10 +2886,15 @@ export class App {
     const people = ai.part !== undefined;
     const hasInput = people || ai.strokes.some((s) => s.pts.length >= 2);
     let shown = false;
-    const progress = (f: number) => {
+    let job: ReturnType<App['cancellable']> | null = null;
+    // (Cancel only shows once the busy screen does: a quick result needs neither)
+    const showBusy = (msg: string) => {
       shown = true;
-      this.busy(`Downloading AI model ${Math.round(f * 100)}%`);
+      job ??= this.cancellable();
+      this.busy(msg);
     };
+    const ac = new AbortController();
+    const progress = (f: number) => showBusy(`Downloading AI model ${Math.round(f * 100)}%`);
     try {
       if (!hasInput) {
         const c = document.createElement('canvas');
@@ -2901,13 +2906,13 @@ export class App {
       const F = this.frameImage();
       const slow = !this.seg.warm(people ? 'people' : 'subject', F.key);
       if (slow) {
-        shown = true;
-        this.busy(people ? 'Finding people' : 'Looking at your photo');
+        showBusy(people ? 'Finding people' : 'Looking at your photo');
         await new Promise((r) => setTimeout(r, 30));
       }
+      const signal = (job as ReturnType<App['cancellable']> | null)?.signal ?? ac.signal;
       const md = people
-        ? await this.seg.peopleMask(F.canvas, F.key, PEOPLE_PARTS[ai.part!].cats, progress)
-        : await this.seg.subjectMask(F.canvas, F.key, ai.strokes, progress);
+        ? await this.seg.peopleMask(F.canvas, F.key, PEOPLE_PARTS[ai.part!].cats, progress, signal)
+        : await this.seg.subjectMask(F.canvas, F.key, ai.strokes, progress, signal);
       if (shown) this.busy('Refining edges');
       const q = refineMask(md, F.px, F.w, F.h);
       const c = document.createElement('canvas');
@@ -2933,10 +2938,14 @@ export class App {
       // keep the cache small: rasters are ~1 MP each
       while (this.bases.size > 24) this.bases.delete(this.bases.keys().next().value!);
     } catch (e) {
-      console.error(e);
       this.baseFailed.add(key);
-      this.toast('AI selection failed: ' + ((e as Error).message || 'unknown error') + (navigator.onLine ? '' : ' (the model needs internet once)'), 5000);
+      if (isAbortError(e)) this.toast('Selection stopped · paint again to try once more', 2600);
+      else {
+        console.error(e);
+        this.toast('AI selection failed: ' + ((e as Error).message || 'unknown error') + (navigator.onLine ? '' : ' (the model needs internet once)'), 5000);
+      }
     } finally {
+      (job as ReturnType<App['cancellable']> | null)?.done();
       this.baseJobs.delete(key);
       if (shown) this.busy(null);
       this.requestRender();
@@ -4138,6 +4147,7 @@ export class App {
     if (!this.img) return;
     this.fillJob = key;
     const img = this.img;
+    const job = this.cancellable();
     try {
       this.busy('Filling');
       await new Promise((r) => setTimeout(r, 30));
@@ -4174,9 +4184,11 @@ export class App {
       for (const kind of first === 'lama' ? (['lama', 'migan'] as const) : (['migan'] as const)) {
         try {
           // each attempt gets its own copies, so a failed one doesn't use up the pixels
-          out = await this.neural.fill(kind, rgba.slice(), W, H, mask.slice(), (m) => this.busy(m));
+          out = await this.neural.fill(kind, rgba.slice(), W, H, mask.slice(), (m) => this.busy(m), job.signal);
           break;
         } catch (err) {
+          // cancelled: no second model, no classic fill
+          if (isAbortError(err)) throw err;
           console.warn(`${kind} fill failed`, err);
           if (kind === 'lama') this.toast(`LaMa couldn’t run (${(err as Error).message}) — using the built-in model`, 4500);
         }
@@ -4211,10 +4223,14 @@ export class App {
       while (this.fillCache.length > 4) gl.deleteTexture(this.fillCache.shift()!.tex);
       this.pipe.invalidate();
     } catch (e) {
-      console.error(e);
-      this.toast('Fill failed: ' + ((e as Error).message || 'unknown error'), 4000);
+      if (isAbortError(e)) this.toast('Removal stopped', 1800);
+      else {
+        console.error(e);
+        this.toast('Fill failed: ' + ((e as Error).message || 'unknown error'), 4000);
+      }
       this.state.fills = (this.state.fills ?? []).filter((f) => fills.some((q) => q === f) === false);
     } finally {
+      job.done();
       this.fillJob = '';
       this.busy(null);
       const w = this.fillWaiters.splice(0);
@@ -4766,6 +4782,7 @@ export class App {
     const key = this.depthKey();
     if (this.pipe.depth?.id === key) return Promise.resolve();
     if (this.depthJob?.key === key) return this.depthJob.p;
+    const job = this.cancellable();
     const p = (async () => {
       this.busy('Finding depth');
       await new Promise((r) => setTimeout(r, 30));
@@ -4786,22 +4803,43 @@ export class App {
         rgba[i + 2] = lut[r.px[i + 2]];
         rgba[i + 3] = 255;
       }
-      const map = await this.depthEst.estimate(rgba, r.w, r.h, (s) => this.busy(s));
+      const map = await this.depthEst.estimate(rgba, r.w, r.h, (s) => this.busy(s), job.signal);
       if (this.img !== img) return;
       this.pipe.setDepth(map, key, img.preview.w, img.preview.h);
       this.requestRender();
     })()
       .catch((e) => {
-        console.error(e);
         this.depthFailed = key;
+        if (isAbortError(e)) return this.toast('Lens blur stopped · pick Lens again to carry on', 2600);
+        console.error(e);
         this.toast('Lens blur needs the depth model: ' + ((e as Error).message || e), 4500);
       })
       .finally(() => {
+        job.done();
         this.busy(null);
         if (this.depthJob?.key === key) this.depthJob = null;
       });
     this.depthJob = { key, p };
     return p;
+  }
+
+  /** A job the busy screen can cancel (its Cancel button, or Back): call done() when it ends. */
+  private cancellable() {
+    const ac = new AbortController();
+    const b = $<HTMLButtonElement>('busyCancel');
+    const prev = b.onclick;
+    b.hidden = false;
+    b.onclick = () => {
+      b.hidden = true;
+      ac.abort();
+    };
+    return {
+      signal: ac.signal,
+      done: () => {
+        b.hidden = true;
+        b.onclick = prev;
+      },
+    };
   }
 
   // ---- opened from another app (Share / Open with)

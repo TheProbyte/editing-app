@@ -53,33 +53,63 @@ export async function isModelCached(url: string) {
   }
 }
 
-export async function fetchModel(url: string, progress: (f: number) => void): Promise<Uint8Array> {
+/** What a cancelled download or AI job rejects with. */
+export const abortError = () => new DOMException('Cancelled', 'AbortError');
+export const isAbortError = (e: unknown) => (e as Error | null)?.name === 'AbortError';
+
+/** Stop waiting for `p` once `signal` fires (the work itself may go on: use this where it can't be stopped). */
+export function abortable<T>(p: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.reject(abortError());
+  return new Promise<T>((res, rej) => {
+    const stop = () => rej(abortError());
+    signal.addEventListener('abort', stop, { once: true });
+    p.then(res, rej).finally(() => signal.removeEventListener('abort', stop));
+  });
+}
+
+export async function fetchModel(url: string, progress: (f: number) => void, signal?: AbortSignal): Promise<Uint8Array> {
+  if (signal?.aborted) throw abortError();
   let cache: Cache | null = null;
   try {
     cache = await caches.open(CACHE);
     const hit = await cache.match(url);
-    if (hit) return new Uint8Array(await hit.arrayBuffer());
-  } catch {
+    if (hit) return new Uint8Array(await abortable(hit.arrayBuffer(), signal));
+  } catch (e) {
+    if (isAbortError(e)) throw e;
     cache = null;
   }
-  const r = await fetch(url, { mode: 'cors' });
+  let r: Response;
+  try {
+    r = await fetch(url, { mode: 'cors', signal });
+  } catch (e) {
+    // (whatever reason the signal carries, a cancel is reported the same way)
+    throw signal?.aborted ? abortError() : e;
+  }
   if (!r.ok || !r.body) throw new Error(`Model download failed (${r.status})`);
   const total = +(r.headers.get('content-length') ?? 0);
   const reader = r.body.getReader();
   // with a known size, fill one buffer as the data arrives (no second copy of a 200 MB file)
   let buf = new Uint8Array(total || 1 << 26);
   let got = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (got + value.length > buf.length) {
-      const bigger = new Uint8Array(Math.max(buf.length * 2, got + value.length));
-      bigger.set(buf.subarray(0, got));
-      buf = bigger;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (signal?.aborted) throw abortError();
+      if (done) break;
+      if (got + value.length > buf.length) {
+        const bigger = new Uint8Array(Math.max(buf.length * 2, got + value.length));
+        bigger.set(buf.subarray(0, got));
+        buf = bigger;
+      }
+      buf.set(value, got);
+      got += value.length;
+      if (total) progress(got / total);
     }
-    buf.set(value, got);
-    got += value.length;
-    if (total) progress(got / total);
+  } catch (e) {
+    // a download cut short never reaches the cache below: only a whole file is kept
+    reader.cancel().catch(() => {});
+    throw signal?.aborted ? abortError() : e;
   }
   const out = got === buf.length ? buf : buf.subarray(0, got);
   // a model that ships with the app is already on the device (the app's own offline cache, or
@@ -111,8 +141,8 @@ export class Segmenter {
     return kind === 'subject' ? !!this.subject && this.subjectKey === key : this.peopleCache?.key === key;
   }
 
-  private async create<T>(make: (buf: Uint8Array, delegate: 'GPU' | 'CPU') => Promise<T>, url: string, progress: (f: number) => void, onDelegate?: (d: 'GPU' | 'CPU') => void) {
-    const buf = await fetchModel(url, progress);
+  private async create<T>(make: (buf: Uint8Array, delegate: 'GPU' | 'CPU') => Promise<T>, url: string, progress: (f: number) => void, onDelegate?: (d: 'GPU' | 'CPU') => void, signal?: AbortSignal) {
+    const buf = await fetchModel(url, progress, signal);
     // the GPU delegate is much faster, but not every WebView gives MediaPipe a usable context
     try {
       if (this.forceCpu || (window as unknown as { LUMEN_CPU?: boolean }).LUMEN_CPU) throw new Error('CPU requested');
@@ -126,21 +156,25 @@ export class Segmenter {
     }
   }
 
-  private getSubject(progress: (f: number) => void) {
-    this.subject ??= lib().then((mp) =>
+  private getSubject(progress: (f: number) => void, signal?: AbortSignal) {
+    if (this.subject) return abortable(this.subject, signal);
+    const p = (this.subject = lib().then((mp) =>
       this.create(
         (buf, delegate) => mp.InteractiveSegmenter.createFromOptions(fileset(), { baseOptions: { modelAssetBuffer: buf, delegate } }),
         MODELS.subject,
         progress,
         (d) => (this.subjectDelegate = d),
+        signal,
       ),
-    );
-    this.subject.catch(() => (this.subject = null));
-    return this.subject;
+    ));
+    p.catch(() => this.subject === p && (this.subject = null));
+    dropOnAbort(p, signal, () => this.subject === p && (this.subject = null));
+    return abortable(p, signal);
   }
 
-  private getPeople(progress: (f: number) => void) {
-    this.people ??= lib().then((mp) =>
+  private getPeople(progress: (f: number) => void, signal?: AbortSignal) {
+    if (this.people) return abortable(this.people, signal);
+    const p = (this.people = lib().then((mp) =>
       this.create(
         // small model: the CPU is quick enough, and reading GPU-side masks back gives
         // empty results on some phones
@@ -152,15 +186,18 @@ export class Segmenter {
         }),
         MODELS.people,
         progress,
+        undefined,
+        signal,
       ),
-    );
-    this.people.catch(() => (this.people = null));
-    return this.people;
+    ));
+    p.catch(() => this.people === p && (this.people = null));
+    dropOnAbort(p, signal, () => this.people === p && (this.people = null));
+    return abortable(p, signal);
   }
 
   /** Mask from include/exclude strokes. `key` identifies the image, so the encoder runs once per photo. */
-  async subjectMask(image: HTMLCanvasElement, key: string, strokes: AiStroke[], progress: (f: number) => void): Promise<MaskData> {
-    const seg = await this.getSubject(progress);
+  async subjectMask(image: HTMLCanvasElement, key: string, strokes: AiStroke[], progress: (f: number) => void, signal?: AbortSignal): Promise<MaskData> {
+    const seg = await this.getSubject(progress, signal);
     if (this.subjectKey !== key) {
       seg.setImage(image);
       this.subjectKey = key;
@@ -187,15 +224,15 @@ export class Segmenter {
       this.forceCpu = true;
       this.subject = null;
       this.subjectKey = '';
-      return this.subjectMask(image, key, strokes, progress);
+      return this.subjectMask(image, key, strokes, progress, signal);
     }
     return out;
   }
 
   /** People parts (union of the given selfie-multiclass categories). */
-  async peopleMask(image: HTMLCanvasElement, key: string, cats: number[], progress: (f: number) => void): Promise<MaskData> {
+  async peopleMask(image: HTMLCanvasElement, key: string, cats: number[], progress: (f: number) => void, signal?: AbortSignal): Promise<MaskData> {
     if (this.peopleCache?.key !== key) {
-      const seg = await this.getPeople(progress);
+      const seg = await this.getPeople(progress, signal);
       const r = seg.segment(image);
       try {
         const ms = r.confidenceMasks ?? [];
@@ -223,6 +260,22 @@ export class Segmenter {
 }
 
 const clamp01 = (x: number) => Math.min(1, Math.max(0, x));
+
+/**
+ * A model load that a cancel drops: if the signal fires before it's ready, `forget` runs (so the
+ * next call starts over) — the download stops, and a model already being set up, which can't be
+ * stopped, is closed once it's ready.
+ */
+function dropOnAbort<T extends { close(): void }>(p: Promise<T>, signal: AbortSignal | undefined, forget: () => void) {
+  if (!signal) return;
+  let done = false;
+  p.then(() => (done = true), () => (done = true));
+  signal.addEventListener('abort', () => {
+    if (done) return;
+    forget();
+    p.then((m) => m.close(), () => {});
+  }, { once: true });
+}
 
 /**
  * Snap a soft mask to the photo's edges (guided filter, grayscale guide). The models work

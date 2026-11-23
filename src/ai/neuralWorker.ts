@@ -4,9 +4,11 @@
 //    once on request.
 //  * MI-GAN (Picsart AI Research, MIT): the small "pipeline" model that ships with the app: uint8
 //    image + uint8 mask (255 = keep, 0 = fill), any size.
-// Both get a crop around the hole (with context) and the result is pasted back with a soft edge.
+// Both get a crop around each area of the hole (with context) and the results are pasted back
+// with a soft edge.
 import * as ort from 'onnxruntime-web/wasm';
 import { dilate, featherAlpha } from './inpaint';
+import { LAMA, MIGAN_MAX, labelHoles, planWindows } from './holes';
 
 type Kind = 'lama' | 'migan';
 let session: ort.InferenceSession | null = null;
@@ -67,42 +69,25 @@ function crop(rgba: Uint8ClampedArray, grown: Uint8Array, w: number, x0: number,
   return { x0, y0, rw, rh, img, mask };
 }
 
-/** Paste the filled crop back: new pixels inside the hole, a soft edge around it. */
-function paste(out: Uint8ClampedArray, w: number, roi: Roi, filled: Uint8ClampedArray, original: Uint8ClampedArray) {
-  const alpha = featherAlpha(roi.mask, roi.rw, roi.rh);
+/**
+ * Paste the filled crop back: new pixels inside this window's part of the hole (`own`), a soft
+ * edge around it. Where windows overlap the stronger edge wins, and pixels another window
+ * filled (or will fill) are left to it.
+ */
+function paste(out: Uint8ClampedArray, w: number, roi: Roi, own: Uint8Array, alpha: Float32Array, filled: Uint8ClampedArray, base: Uint8ClampedArray, left: Uint8Array) {
   for (let y = 0; y < roi.rh; y++) {
     for (let x = 0; x < roi.rw; x++) {
       const li = y * roi.rw + x;
-      if (!roi.mask[li] && alpha[li] <= 0.001) continue;
       const gi = (roi.y0 + y) * w + roi.x0 + x;
-      for (let c = 0; c < 3; c++) out[gi * 4 + c] = roi.mask[li] ? filled[li * 4 + c] : original[gi * 4 + c];
-      out[gi * 4 + 3] = Math.round(Math.min(1, alpha[li]) * 255);
+      if (!own[li] && (alpha[li] <= 0.001 || left[gi])) continue;
+      for (let c = 0; c < 3; c++) out[gi * 4 + c] = own[li] ? filled[li * 4 + c] : base[gi * 4 + c];
+      out[gi * 4 + 3] = Math.max(out[gi * 4 + 3], Math.round(Math.min(1, alpha[li]) * 255));
     }
   }
 }
 
-function holeBox(grown: Uint8Array, w: number, h: number) {
-  let x0 = w, y0 = h, x1 = -1, y1 = -1;
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (grown[y * w + x]) {
-        if (x < x0) x0 = x;
-        if (x > x1) x1 = x;
-        if (y < y0) y0 = y;
-        if (y > y1) y1 = y;
-      }
-    }
-  }
-  return x1 < 0 ? null : { x0, y0, x1, y1 };
-}
-
-async function runMigan(rgba: Uint8ClampedArray, w: number, h: number, grown: Uint8Array, box: NonNullable<ReturnType<typeof holeBox>>) {
-  // plenty of surroundings for the network to learn the scene from
-  const m = Math.max(64, Math.round(Math.max(box.x1 - box.x0, box.y1 - box.y0) * 0.9));
-  const x0 = Math.max(0, box.x0 - m), y0 = Math.max(0, box.y0 - m);
-  const x1 = Math.min(w - 1, box.x1 + m), y1 = Math.min(h - 1, box.y1 + m);
-  const roi = crop(rgba, grown, w, x0, y0, x1 - x0 + 1, y1 - y0 + 1);
-  const k = Math.min(1, 1100 / Math.max(roi.rw, roi.rh));
+async function runMigan(roi: Roi) {
+  const k = Math.min(1, MIGAN_MAX / Math.max(roi.rw, roi.rh));
   const pw = Math.max(32, Math.round(roi.rw * k)), ph = Math.max(32, Math.round(roi.rh * k));
   const img = k < 1 ? resizeRGBA(roi.img, roi.rw, roi.rh, pw, ph) : roi.img;
   const msk = k < 1 ? resizeMask(roi.mask, roi.rw, roi.rh, pw, ph) : roi.mask;
@@ -125,20 +110,12 @@ async function runMigan(rgba: Uint8ClampedArray, w: number, h: number, grown: Ui
     outp[i * 4 + 2] = d[2 * ow * oh + i];
     outp[i * 4 + 3] = 255;
   }
-  return { roi, filled: ow === roi.rw && oh === roi.rh ? outp : resizeRGBA(outp, ow, oh, roi.rw, roi.rh) };
+  return ow === roi.rw && oh === roi.rh ? outp : resizeRGBA(outp, ow, oh, roi.rw, roi.rh);
 }
 
-const LAMA = 512;
-
-async function runLama(rgba: Uint8ClampedArray, w: number, h: number, grown: Uint8Array, box: NonNullable<ReturnType<typeof holeBox>>) {
-  // a square window around the hole with room around it, run at LaMa's fixed 512x512
-  const bw = box.x1 - box.x0 + 1, bh = box.y1 - box.y0 + 1;
-  let side = Math.round(Math.max(bw, bh) * 2.4);
-  side = Math.min(Math.min(w, h), Math.max(side, Math.min(LAMA, Math.min(w, h))));
-  const cx = (box.x0 + box.x1) / 2, cy = (box.y0 + box.y1) / 2;
-  const x0 = Math.min(w - side, Math.max(0, Math.round(cx - side / 2)));
-  const y0 = Math.min(h - side, Math.max(0, Math.round(cy - side / 2)));
-  const roi = crop(rgba, grown, w, x0, y0, side, side);
+async function runLama(roi: Roi) {
+  // a square window around the hole (see lamaWindow), run at LaMa's fixed 512x512
+  const side = roi.rw;
   const img = side === LAMA ? roi.img : resizeRGBA(roi.img, side, side, LAMA, LAMA);
   const msk = side === LAMA ? roi.mask : resizeMask(roi.mask, side, side, LAMA, LAMA);
   const n = LAMA * LAMA;
@@ -162,17 +139,46 @@ async function runLama(rgba: Uint8ClampedArray, w: number, h: number, grown: Uin
     outp[i * 4 + 2] = d[2 * n + i] * s;
     outp[i * 4 + 3] = 255;
   }
-  return { roi, filled: side === LAMA ? outp : resizeRGBA(outp, LAMA, LAMA, side, side) };
+  return side === LAMA ? outp : resizeRGBA(outp, LAMA, LAMA, side, side);
 }
 
 async function run(rgba: Uint8ClampedArray, w: number, h: number, mask: Uint8Array) {
   if (!session) throw new Error('Model not loaded');
   const grown = dilate(mask, w, h, 3);
-  const box = holeBox(grown, w, h);
+  const { labels, boxes } = labelHoles(grown, w, h);
   const out = new Uint8ClampedArray(w * h * 4);
-  if (!box) return out;
-  const r = kind === 'lama' ? await runLama(rgba, w, h, grown, box) : await runMigan(rgba, w, h, grown, box);
-  paste(out, w, r.roi, r.filled, rgba);
+  if (!boxes.length) return out;
+  // each separate area gets its own window (nearby ones share), see holes.ts
+  const { windows, tiled } = planWindows(boxes, w, h, kind);
+  if (windows.length > 1) post({ log: `${kind}: ${boxes.length} area(s) in ${windows.length} windows` });
+  if (tiled) post({ log: `${kind}: ${tiled} area(s) wider than the photo's short side, filled in overlapping tiles (less detail)` });
+  // windows run one after another on the same pixels: what one fills, the next sees as known
+  // (`rgba` becomes the photo with the fills so far, `left` the holes still to do)
+  const left = grown.slice();
+  const mine = new Uint8Array(boxes.length + 1);
+  for (const win of windows) {
+    const roi = crop(rgba, left, w, win.x0, win.y0, win.rw, win.rh);
+    const filled = kind === 'lama' ? await runLama(roi) : await runMigan(roi);
+    mine.fill(0);
+    for (const id of win.ids) mine[id] = 1;
+    const own = new Uint8Array(roi.rw * roi.rh), hole = new Uint8Array(roi.rw * roi.rh);
+    for (let y = 0; y < roi.rh; y++) {
+      for (let x = 0; x < roi.rw; x++) {
+        const li = y * roi.rw + x, gi = (roi.y0 + y) * w + roi.x0 + x;
+        hole[li] = grown[gi];
+        const c = win.lim?.axis === 'y' ? roi.y0 + y : roi.x0 + x;
+        own[li] = roi.mask[li] && mine[labels[gi]] && (!win.lim || c < win.lim.max) ? 1 : 0;
+      }
+    }
+    // the soft edge comes from the whole hole, so it's the same whichever window a pixel is in
+    paste(out, w, roi, own, featherAlpha(hole, roi.rw, roi.rh), filled, rgba, left);
+    for (let li = 0; li < own.length; li++) {
+      if (!own[li]) continue;
+      const gi = (roi.y0 + Math.floor(li / roi.rw)) * w + roi.x0 + (li % roi.rw);
+      left[gi] = 0;
+      for (let c = 0; c < 3; c++) rgba[gi * 4 + c] = filled[li * 4 + c];
+    }
+  }
   return out;
 }
 

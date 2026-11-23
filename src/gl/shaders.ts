@@ -667,6 +667,9 @@ uniform float uFrameK;     // its border scale (0.5 … 1.5)
 uniform float uStamp;      // date stamp brightness (0 = off)
 uniform int uStampN;       // characters: 0-9 digits, 10 apostrophe, 11 dot, 12 space
 uniform int uStampC[12];
+uniform sampler2D uPerson; // people in the frame (video, Person tool): .r 0 … 1
+uniform int uPersonOn;
+uniform vec4 uPpl;        // person stops, person saturation, background stops, background saturation
 uniform sampler2D uAtmo;  // depth in frame space (0 far … 1 near) for Air
 uniform int uAtmoOn;
 uniform vec4 uHaze;       // density, distance it starts at, unused, unused
@@ -764,6 +767,14 @@ void main() {
       c = mix(c, texture(uBlur1, gUv).rgb, smoothstep(0.0, 0.55, w));
       c = mix(c, texture(uBlur2, gUv).rgb, smoothstep(0.45, 1.0, w));
     }
+  }
+
+  if (uPersonOn == 1) {
+    // the person and the background each get their own brightness and color
+    float m = smoothstep(0.25, 0.75, texture(uPerson, gUv).r);
+    c *= exp2(mix(uPpl.z, uPpl.x, m) * 1.5);
+    float y = luma(c);
+    c = max(y + (c - y) * (1.0 + mix(uPpl.w, uPpl.y, m)), 0.0);
   }
 
   if (uAtmoOn == 1) {

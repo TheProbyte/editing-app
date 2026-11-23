@@ -45,6 +45,17 @@ function fileset() {
 }
 
 /** Is this model already stored on the device (so using it needs no download)? */
+/** A people segmenter of its own (for following people through a video, frame after frame). */
+export async function peopleSegmenter(progress: (f: number) => void, signal?: AbortSignal) {
+  const [mp, buf] = await Promise.all([lib(), fetchModel(MODELS.people, progress, signal)]);
+  return mp.ImageSegmenter.createFromOptions(fileset(), {
+    baseOptions: { modelAssetBuffer: buf, delegate: 'CPU' },
+    runningMode: 'IMAGE',
+    outputConfidenceMasks: true,
+    outputCategoryMask: false,
+  });
+}
+
 export async function isModelCached(url: string) {
   try {
     return !!(await (await caches.open(CACHE)).match(url));

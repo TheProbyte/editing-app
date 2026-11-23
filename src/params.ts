@@ -112,6 +112,11 @@ export const PARAMS: ParamDef[] = [
   // video: the picture held to a film-like rate (the sound and the video's own rate stay as they are)
   p('cineRate', 'Motion', 0, 3, 0, { fmt: (v) => ['Normal', '18 fps cine', '12 fps', '8 fps'][Math.round(v)] ?? '' }),
   p('stamp', 'Date stamp', 0, 100, 0),
+  // Person (video): the people the AI follows through the video, and everything else
+  p('pplExp', 'Person brightness'),
+  p('pplSat', 'Person color'),
+  p('pplBgExp', 'Background brightness'),
+  p('pplBgSat', 'Background color'),
   // Perspective (Crop): + widens the top / the right side, to stand converging lines up straight
   p('perspV', 'Vertical'),
   p('perspH', 'Horizontal'),

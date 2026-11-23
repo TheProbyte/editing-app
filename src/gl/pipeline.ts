@@ -165,6 +165,32 @@ export class Pipeline {
     return [out, dF] as const;
   }
 
+  /** The people in the current video frame (Person tool), as an 8-bit mask; null = none found yet. */
+  person: { tex: WebGLTexture; w: number; h: number } | null = null;
+  setPerson(m: { data: Uint8Array; w: number; h: number } | null) {
+    const gl = this.g.gl;
+    if (!m) {
+      if (this.person) gl.deleteTexture(this.person.tex);
+      this.person = null;
+      return;
+    }
+    if (!this.person || this.person.w !== m.w || this.person.h !== m.h) {
+      if (this.person) gl.deleteTexture(this.person.tex);
+      const tex = gl.createTexture()!;
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.texStorage2D(gl.TEXTURE_2D, 1, gl.R8, m.w, m.h);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      this.person = { tex, w: m.w, h: m.h };
+    }
+    gl.bindTexture(gl.TEXTURE_2D, this.person.tex);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, m.w, m.h, gl.RED, gl.UNSIGNED_BYTE, m.data);
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 4);
+  }
+
   /** The date the stamp shows (the photo's own, when it's known). */
   stampDate = new Date();
   /** 'YY MM DD, or MM.DD.YYYY for tape, as character codes for the shader. */
@@ -733,6 +759,10 @@ export class Pipeline {
       u1('uStamp', (v.stamp || 0) / 100);
       gl.uniform1i(p.loc('uStampN'), st.length);
       gl.uniform1iv(p.loc('uStampC'), Int32Array.from({ length: 12 }, (_, i) => st[i] ?? 12));
+      const pplOn = !!this.person && !!(v.pplExp || v.pplSat || v.pplBgExp || v.pplBgSat);
+      this.g.bindTex(p, 'uPerson', pplOn ? this.person!.tex : this.black);
+      gl.uniform1i(p.loc('uPersonOn'), pplOn ? 1 : 0);
+      gl.uniform4f(p.loc('uPpl'), (v.pplExp || 0) / 100, (v.pplSat || 0) / 100, (v.pplBgExp || 0) / 100, (v.pplBgSat || 0) / 100);
       this.g.bindTex(p, 'uAtmo', fx.atmo ? fx.atmo.tex : this.black);
       gl.uniform1i(p.loc('uAtmoOn'), fx.atmo ? 1 : 0);
       // density, and from how far it starts (0 … 3: the map's nearest thing is 0, a thing 4× as far is 3)
